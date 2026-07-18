@@ -3,6 +3,7 @@ module github.com/moooyo/5gpn/cmd/5gpn-intercept
 go 1.26.5
 
 require (
+	github.com/andybalholm/brotli v1.2.2
 	github.com/dlclark/regexp2/v2 v2.2.1
 	github.com/dop251/goja v0.0.0-20260701091749-b07b74453ea9
 	github.com/quic-go/quic-go v0.60.0

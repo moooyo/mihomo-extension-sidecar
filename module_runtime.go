@@ -80,6 +80,7 @@ type scriptResult struct {
 	Body           []byte
 	StatusCode     int
 	Synthetic      bool
+	Abort          bool
 	ChangedURL     bool
 	ChangedBody    bool
 	ChangedHeaders bool
@@ -108,19 +109,29 @@ func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMe
 	vm := goja.New()
 	result := scriptResult{}
 	doneCalled := false
+	doneHadArgument := false
 	var doneValue goja.Value
 	if err := vm.Set("$done", func(call goja.FunctionCall) goja.Value {
 		doneCalled = true
+		doneHadArgument = len(call.Arguments) > 0
 		doneValue = call.Argument(0)
 		return goja.Undefined()
 	}); err != nil {
 		return scriptResult{}, err
 	}
-	if err := vm.Set("$request", scriptMessageObject(request)); err != nil {
+	requestObject, err := scriptMessageObject(vm, request, rule.BinaryBody)
+	if err != nil {
+		return scriptResult{}, err
+	}
+	if err := vm.Set("$request", requestObject); err != nil {
 		return scriptResult{}, err
 	}
 	if response != nil {
-		if err := vm.Set("$response", scriptMessageObject(*response)); err != nil {
+		responseObject, objectErr := scriptMessageObject(vm, *response, rule.BinaryBody)
+		if objectErr != nil {
+			return scriptResult{}, objectErr
+		}
+		if err := vm.Set("$response", responseObject); err != nil {
 			return scriptResult{}, err
 		}
 	}
@@ -129,14 +140,8 @@ func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMe
 		argument = module.Argument
 	}
 	_ = vm.Set("$argument", argument)
-	_ = vm.Set("$environment", map[string]any{
-		"system": "5gpn", "system-version": version, "language": "zh-Hans",
-	})
-	_ = vm.Set("$script", map[string]any{"name": module.Name, "type": rule.Phase})
-	if module.Format == "loon" {
-		_ = vm.Set("$loon", "5gpn")
-	}
-	r.installPersistentAPI(vm, module.ID)
+	_ = vm.Set("$loon", "5gpn")
+	r.installPersistentAPI(vm, module)
 	installConsoleAPI(vm, module.ID, rule.ID)
 	installDeniedNetworkAPI(vm)
 
@@ -148,6 +153,10 @@ func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMe
 	vm.ClearInterrupt()
 	if runErr != nil {
 		return scriptResult{}, fmt.Errorf("module %s rule %s: %w", module.ID, rule.ID, runErr)
+	}
+	if doneCalled && !doneHadArgument {
+		result.Abort = true
+		return result, nil
 	}
 	if !doneCalled || doneValue == nil || goja.IsUndefined(doneValue) || goja.IsNull(doneValue) {
 		return result, nil
@@ -179,11 +188,11 @@ func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMe
 		result.ChangedURL = true
 	}
 	if raw, exists := object["body"]; exists {
-		value, ok := raw.(string)
-		if !ok {
-			return scriptResult{}, errors.New("$done.body must be a string")
+		value, err := exportedBody(raw)
+		if err != nil {
+			return scriptResult{}, err
 		}
-		result.Body = []byte(value)
+		result.Body = value
 		result.ChangedBody = true
 	}
 	if raw, exists := object["headers"]; exists {
@@ -225,11 +234,18 @@ func (r *scriptRuntime) program(rule ScriptRule) (*goja.Program, error) {
 	return program, nil
 }
 
-func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, moduleID string) {
+func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, module Module) {
+	parameterDefaults := make(map[string]string, len(module.Parameters))
+	for _, parameter := range module.Parameters {
+		parameterDefaults[parameter.Key] = parameter.Value
+	}
 	read := func(call goja.FunctionCall) goja.Value {
 		key := call.Argument(0).String()
+		if value, exists := parameterDefaults[key]; exists {
+			return vm.ToValue(value)
+		}
 		r.mu.Lock()
-		value, exists := r.persistent[moduleID][key]
+		value, exists := r.persistent[module.ID][key]
 		r.mu.Unlock()
 		if !exists {
 			return goja.Null()
@@ -239,14 +255,17 @@ func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, moduleID string) 
 	write := func(call goja.FunctionCall) goja.Value {
 		value := call.Argument(0).String()
 		key := call.Argument(1).String()
+		if _, configured := parameterDefaults[key]; configured {
+			return vm.ToValue(false)
+		}
 		if len(key) == 0 || len(key) > 256 || len(value) > 64<<10 {
 			return vm.ToValue(false)
 		}
 		r.mu.Lock()
-		bucket := r.persistent[moduleID]
+		bucket := r.persistent[module.ID]
 		if bucket == nil {
 			bucket = make(map[string]string)
-			r.persistent[moduleID] = bucket
+			r.persistent[module.ID] = bucket
 		}
 		if len(bucket) >= 256 {
 			if _, exists := bucket[key]; !exists {
@@ -271,7 +290,7 @@ func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, moduleID string) 
 	remove := func(call goja.FunctionCall) goja.Value {
 		key := call.Argument(0).String()
 		r.mu.Lock()
-		bucket := r.persistent[moduleID]
+		bucket := r.persistent[module.ID]
 		previous, existed := bucket[key]
 		delete(bucket, key)
 		if err := r.savePersistentLocked(); err != nil {
@@ -286,10 +305,10 @@ func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, moduleID string) 
 	}
 	removeAll := func(goja.FunctionCall) goja.Value {
 		r.mu.Lock()
-		previous := r.persistent[moduleID]
-		delete(r.persistent, moduleID)
+		previous := r.persistent[module.ID]
+		delete(r.persistent, module.ID)
 		if err := r.savePersistentLocked(); err != nil {
-			r.persistent[moduleID] = previous
+			r.persistent[module.ID] = previous
 			r.mu.Unlock()
 			return vm.ToValue(false)
 		}
@@ -299,13 +318,9 @@ func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, moduleID string) 
 	store := vm.NewObject()
 	_ = store.Set("read", read)
 	_ = store.Set("write", write)
+	_ = store.Set("remove", remove)
+	_ = store.Set("removeAll", removeAll)
 	_ = vm.Set("$persistentStore", store)
-	prefs := vm.NewObject()
-	_ = prefs.Set("valueForKey", read)
-	_ = prefs.Set("setValueForKey", write)
-	_ = prefs.Set("removeValueForKey", remove)
-	_ = prefs.Set("removeAllValues", removeAll)
-	_ = vm.Set("$prefs", prefs)
 }
 
 func (r *scriptRuntime) loadPersistent() error {
@@ -398,7 +413,6 @@ func installConsoleAPI(vm *goja.Runtime, moduleID, ruleID string) {
 	notify := func(call goja.FunctionCall) goja.Value {
 		return logger(call)
 	}
-	_ = vm.Set("$notify", notify)
 	notification := vm.NewObject()
 	_ = notification.Set("post", notify)
 	_ = vm.Set("$notification", notification)
@@ -424,16 +438,25 @@ func installDeniedNetworkAPI(vm *goja.Runtime) {
 		_ = client.Set(method, denied)
 	}
 	_ = vm.Set("$httpClient", client)
-	task := vm.NewObject()
-	_ = task.Set("fetch", denied)
-	_ = vm.Set("$task", task)
 }
 
-func scriptMessageObject(message scriptMessage) map[string]any {
+func scriptMessageObject(vm *goja.Runtime, message scriptMessage, binary bool) (map[string]any, error) {
 	object := map[string]any{
 		"url":     message.URL,
 		"headers": flatHeaders(message.Headers),
-		"body":    string(message.Body),
+	}
+	if binary {
+		constructor, ok := goja.AssertConstructor(vm.Get("Uint8Array"))
+		if !ok {
+			return nil, errors.New("Uint8Array constructor is unavailable")
+		}
+		value, err := constructor(nil, vm.ToValue(vm.NewArrayBuffer(append([]byte(nil), message.Body...))))
+		if err != nil {
+			return nil, err
+		}
+		object["body"] = value
+	} else {
+		object["body"] = string(message.Body)
 	}
 	if message.Method != "" {
 		object["method"] = message.Method
@@ -442,7 +465,30 @@ func scriptMessageObject(message scriptMessage) map[string]any {
 		object["status"] = message.StatusCode
 		object["statusCode"] = message.StatusCode
 	}
-	return object
+	return object, nil
+}
+
+func exportedBody(value any) ([]byte, error) {
+	switch typed := value.(type) {
+	case string:
+		return []byte(typed), nil
+	case []byte:
+		return append([]byte(nil), typed...), nil
+	case goja.ArrayBuffer:
+		return append([]byte(nil), typed.Bytes()...), nil
+	case []any:
+		out := make([]byte, len(typed))
+		for index, item := range typed {
+			number, ok := item.(int64)
+			if !ok || number < 0 || number > 255 {
+				return nil, errors.New("$done.body contains a non-byte value")
+			}
+			out[index] = byte(number)
+		}
+		return out, nil
+	default:
+		return nil, errors.New("$done.body must be a string or Uint8Array")
+	}
 }
 
 func flatHeaders(headers http.Header) map[string]string {

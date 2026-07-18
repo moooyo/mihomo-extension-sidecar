@@ -472,7 +472,7 @@ func (c *socksServerPacketConn) targetAllowed(target socksTarget) bool {
 		return false
 	}
 	cfg, err := c.config.Current()
-	return err == nil && allowedInboundSOCKSTarget(cfg, target)
+	return err == nil && target.Port == 443 && allowedInboundSOCKSTarget(cfg, target)
 }
 
 func (c *socksServerPacketConn) WriteTo(buffer []byte, address net.Addr) (int, error) {

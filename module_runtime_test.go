@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -54,14 +55,55 @@ func TestScriptRuntimeRequestStatusCreatesSyntheticResponse(t *testing.T) {
 	}
 }
 
-func TestScriptRuntimePersistentAliases(t *testing.T) {
+func TestScriptRuntimeBinaryBodyAndAbort(t *testing.T) {
+	t.Parallel()
+	runtime := newScriptRuntime()
+	rule := runtimeRule(`$done({body: new Uint8Array([$response.body[2], $response.body[1], $response.body[0]])});`)
+	rule.BinaryBody = true
+	result, err := runtime.execute(
+		Module{ID: "mod-1234567890abcdef"},
+		rule,
+		scriptMessage{},
+		&scriptMessage{Body: []byte{1, 2, 3}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ChangedBody || !bytes.Equal(result.Body, []byte{3, 2, 1}) {
+		t.Fatalf("binary result = %+v", result)
+	}
+	aborted, err := runtime.execute(Module{ID: "mod-1234567890abcdef"}, runtimeRule(`$done();`), scriptMessage{}, nil)
+	if err != nil || !aborted.Abort {
+		t.Fatalf("abort result=%+v err=%v", aborted, err)
+	}
+}
+
+func TestModuleParametersAndHostMappings(t *testing.T) {
+	t.Parallel()
+	module := Module{
+		ID: "mod-1234567890abcdef", Enabled: true,
+		Parameters:   []ModuleParameter{{Key: "mode", Kind: "select", Options: []string{"clean", "full"}, Value: "clean"}},
+		HostMappings: []HostMapping{{Pattern: "api.example.com", Target: "origin.example.net"}},
+	}
+	runtime := newScriptRuntime()
+	result, err := runtime.execute(module, runtimeRule(`$done({body: $persistentStore.read("mode")});`), scriptMessage{}, nil)
+	if err != nil || string(result.Body) != "clean" {
+		t.Fatalf("parameter result=%q err=%v", result.Body, err)
+	}
+	cfg := Config{Modules: []Module{module}}
+	if got := mappedInterceptTarget(cfg, "api.example.com"); got != "origin.example.net" {
+		t.Fatalf("mapped target = %q", got)
+	}
+}
+
+func TestScriptRuntimePersistentStore(t *testing.T) {
 	t.Parallel()
 	runtime := newScriptRuntime()
 	module := Module{ID: "mod-1234567890abcdef"}
 	if _, err := runtime.execute(module, runtimeRule(`$persistentStore.write("value", "key"); $done();`), scriptMessage{}, nil); err != nil {
 		t.Fatal(err)
 	}
-	result, err := runtime.execute(module, runtimeRule(`$done({body: $prefs.valueForKey("key")});`), scriptMessage{}, nil)
+	result, err := runtime.execute(module, runtimeRule(`$done({body: $persistentStore.read("key")});`), scriptMessage{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +147,7 @@ func TestScriptRuntimeTimeoutAndNetworkDenial(t *testing.T) {
 	if time.Since(started) > time.Second {
 		t.Fatal("script timeout did not interrupt promptly")
 	}
-	if _, err := runtime.execute(Module{ID: "mod-1234567890abcdef"}, runtimeRule(`$task.fetch("https://example.com/");`), scriptMessage{}, nil); err == nil || !strings.Contains(err.Error(), "network access is disabled") {
+	if _, err := runtime.execute(Module{ID: "mod-1234567890abcdef"}, runtimeRule(`$httpClient.get("https://example.com/", function() {});`), scriptMessage{}, nil); err == nil || !strings.Contains(err.Error(), "network access is disabled") {
 		t.Fatalf("network denial error = %v", err)
 	}
 }
@@ -156,6 +198,25 @@ func TestModuleHeaderRewriteAppliesBeforeUpstream(t *testing.T) {
 	}
 	if outbound.Header.Get("Cookie") != "" || outbound.Header.Get("User-Agent") != "5gpn-test" {
 		t.Fatalf("rewritten headers = %v", outbound.Header)
+	}
+}
+
+func TestPlainHTTPRequestKeepsHTTPUpstreamScheme(t *testing.T) {
+	t.Parallel()
+	cfg := Config{Modules: []Module{{ID: "mod-1234567890abcdef", Enabled: true, Hosts: []string{"api.example.com"}}}}
+	request := httptest.NewRequest(http.MethodGet, "http://api.example.com/path", nil)
+	proxy := &interceptProxy{scripts: newScriptRuntime()}
+	outbound, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), request, cfg, "api.example.com")
+	if err != nil || handled {
+		t.Fatalf("prepare request handled=%v err=%v", handled, err)
+	}
+	if outbound.URL.Scheme != "http" || outbound.URL.Hostname() != "api.example.com" {
+		t.Fatalf("plain HTTP outbound URL = %s", outbound.URL)
+	}
+	if !allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 80}) ||
+		!allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 443}) ||
+		allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 8080}) {
+		t.Fatal("SOCKS target port boundary is not limited to HTTP/HTTPS")
 	}
 }
 

@@ -8,9 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
-	"strings"
 )
 
 const maxModuleHTTPBody = int64(64 << 20)
@@ -22,13 +20,17 @@ type transformedResponse struct {
 }
 
 func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg Config, host string) (*http.Request, bool, error) {
-	requestURL := "https://" + host + incoming.URL.RequestURI()
+	scheme := "http"
+	if incoming.TLS != nil || incoming.ProtoMajor == 3 {
+		scheme = "https"
+	}
+	requestURL := scheme + "://" + host + incoming.URL.RequestURI()
 	for _, matched := range matchingRewriteRules(cfg, requestURL) {
 		switch matched.Rule.Action {
-		case "reject":
+		case "reject", "reject-drop":
 			http.Error(w, "request rejected by interception module", http.StatusForbidden)
 			return nil, true, nil
-		case "reject-200", "reject-dict", "reject-array":
+		case "reject-200", "reject-dict", "reject-array", "reject-img":
 			body := []byte(nil)
 			if matched.Rule.Action == "reject-dict" {
 				body = []byte("{}")
@@ -36,6 +38,9 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 			} else if matched.Rule.Action == "reject-array" {
 				body = []byte("[]")
 				w.Header().Set("Content-Type", "application/json")
+			} else if matched.Rule.Action == "reject-img" {
+				body = []byte{71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 0, 0, 0, 255, 255, 255, 33, 249, 4, 1, 0, 0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59}
+				w.Header().Set("Content-Type", "image/gif")
 			}
 			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			w.WriteHeader(http.StatusOK)
@@ -53,6 +58,13 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 			w.Header().Set("Location", location)
 			w.WriteHeader(status)
 			return nil, true, nil
+		case "rewrite":
+			location := matched.RE.ReplaceAllString(requestURL, matched.Rule.Replacement)
+			parsed, err := url.Parse(location)
+			if err != nil || parsed.User != nil || !activeInterceptHost(cfg, parsed.Hostname()) {
+				return nil, false, fmt.Errorf("module %s produced an unsafe URL rewrite", matched.Module.ID)
+			}
+			requestURL = parsed.String()
 		}
 	}
 
@@ -64,20 +76,22 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 		if err != nil {
 			return nil, false, err
 		}
+		requestBody, err = decodeContentBody(requestBody, incoming.Header.Get("Content-Encoding"), maxModuleHTTPBody)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	requestHeaders := cloneProxyHeaders(incoming.Header)
+	requestHeaders.Del("Content-Encoding")
+	requestHeaders.Del("Content-Length")
 	for _, matched := range matchingHeaderRules(cfg, requestURL) {
 		switch matched.Rule.Operation {
 		case "delete":
 			requestHeaders.Del(matched.Rule.Header)
+		case "add":
+			requestHeaders.Add(matched.Rule.Header, matched.Rule.Value)
 		case "replace":
 			requestHeaders.Set(matched.Rule.Header, matched.Rule.Value)
-		case "replace-regex":
-			valuePattern, err := regexp.Compile(matched.Rule.ValuePattern)
-			if err != nil {
-				return nil, false, fmt.Errorf("module %s header expression is invalid", matched.Module.ID)
-			}
-			requestHeaders.Set(matched.Rule.Header, valuePattern.ReplaceAllString(requestHeaders.Get(matched.Rule.Header), matched.Rule.Replacement))
 		}
 	}
 	message := scriptMessage{
@@ -94,6 +108,9 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 		if err != nil {
 			return nil, false, err
 		}
+		if result.Abort {
+			panic(http.ErrAbortHandler)
+		}
 		if result.Synthetic {
 			status := result.StatusCode
 			if status == 0 {
@@ -109,8 +126,8 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 		}
 		if result.ChangedURL {
 			parsed, err := url.Parse(result.URL)
-			if err != nil || parsed.Scheme != "https" || parsed.User != nil || !activeInterceptHost(cfg, parsed.Hostname()) {
-				return nil, false, errors.New("request script attempted to leave the active HTTPS module allowlist")
+			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || !activeInterceptHost(cfg, parsed.Hostname()) {
+				return nil, false, errors.New("request script attempted to leave the active module allowlist")
 			}
 			message.URL = parsed.String()
 		}
@@ -127,7 +144,6 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 	}
 	outbound := incoming.Clone(incoming.Context())
 	outbound.URL = parsedURL
-	outbound.URL.Scheme = "https"
 	outbound.Host = parsedURL.Hostname()
 	outbound.RequestURI = ""
 	outbound.Header = cloneProxyHeaders(message.Headers)
@@ -167,16 +183,15 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 		return nil, err
 	}
 	header := cloneProxyHeaders(response.Header)
-	encoding := strings.ToLower(strings.TrimSpace(header.Get("Content-Encoding")))
-	if encoding == "gzip" || (encoding == "" && isGzip(body)) {
-		body, err = gunzipBounded(body, limit)
-		if err != nil {
-			return nil, err
-		}
-		header.Del("Content-Encoding")
-	} else if encoding != "" && encoding != "identity" {
-		return nil, fmt.Errorf("content encoding %q is unsupported for a transformed response", encoding)
+	encoding := header.Get("Content-Encoding")
+	if encoding == "" && isGzip(body) {
+		encoding = "gzip"
 	}
+	body, err = decodeContentBody(body, encoding, limit)
+	if err != nil {
+		return nil, err
+	}
+	header.Del("Content-Encoding")
 	if wloc {
 		target := wlocTarget{Longitude: *cfg.WLOC.Longitude, Latitude: *cfg.WLOC.Latitude, Accuracy: cfg.WLOC.Accuracy}
 		patched, stats, patchErr := patchWLOCBody(body, target, cfg.WLOC.MaxBodyBytes)
@@ -215,6 +230,9 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 		result, err := p.scripts.execute(matched.Module, matched.Rule, requestMessage, &responseMessage)
 		if err != nil {
 			return nil, err
+		}
+		if result.Abort {
+			panic(http.ErrAbortHandler)
 		}
 		if result.ChangedURL {
 			return nil, fmt.Errorf("module %s attempted an unsupported response URL mutation", matched.Module.ID)

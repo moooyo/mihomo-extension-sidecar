@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -135,8 +136,8 @@ func TestConfigValidatesImmutableModuleSnapshotsAndJavaScript(t *testing.T) {
 		UpstreamProxy: ProxyConfig{Address: "127.0.0.1:17890", Username: "upstream-user-123", Password: "upstream-password-12345678"},
 		WLOC:          WLOCSettings{Longitude: &longitude, Latitude: &latitude, Accuracy: 25, FailClosed: true, MaxBodyBytes: 8 << 20},
 		Modules: []Module{{
-			ID: "mod-1234567890abcdef", Name: "Fixture", Format: "surge", ImportedAt: time.Now().UTC().Format(time.RFC3339),
-			Source: ModuleSource{Digest: digestText(source), Body: source, FetchProfile: "standard"}, Hosts: []string{"api.example.com"},
+			ID: "mod-1234567890abcdef", Name: "Fixture", ImportedAt: time.Now().UTC().Format(time.RFC3339),
+			Source: ModuleSource{Digest: digestText(source), Body: source}, Hosts: []string{"api.example.com"},
 			Scripts: []ScriptRule{{ID: "script-001", Phase: "response", Pattern: `^https://api\.example\.com/`, ScriptURL: "https://modules.example.test/script.js", ScriptDigest: digestText(script), ScriptBody: script, TimeoutMS: 1000, MaxBodyBytes: 1 << 20}},
 		}},
 	}
@@ -150,6 +151,29 @@ func TestConfigValidatesImmutableModuleSnapshotsAndJavaScript(t *testing.T) {
 	}
 }
 
+func TestConfigBlocksUnconfiguredOrUnsafeEnabledModule(t *testing.T) {
+	t.Parallel()
+	source := "#!name=Fixture\n"
+	script := `$done({});`
+	module := Module{
+		ID: "mod-1234567890abcdef", Name: "Fixture", Enabled: true,
+		ImportedAt: time.Now().UTC().Format(time.RFC3339),
+		Source:     ModuleSource{Digest: digestText(source), Body: source},
+		Hosts:      []string{"api.example.com"},
+		Parameters: []ModuleParameter{{Key: "mode", Kind: "select", Options: []string{"clean", "full"}}},
+		Scripts:    []ScriptRule{{ID: "script-001", Phase: "response", Pattern: `^https://api\.example\.com/`, ScriptURL: "https://modules.example.test/script.js", ScriptDigest: digestText(script), ScriptBody: script, TimeoutMS: 1000, MaxBodyBytes: 1 << 20}},
+	}
+	cfg := Config{Modules: []Module{module}}
+	if err := validateModules(cfg.Modules); err == nil || !strings.Contains(err.Error(), "parameters") {
+		t.Fatalf("unconfigured module error = %v", err)
+	}
+	cfg.Modules[0].Parameters[0].Value = "clean"
+	cfg.Modules[0].HostMappings = []HostMapping{{Pattern: "api.example.com", Target: "127.0.0.1"}}
+	if err := validateModules(cfg.Modules); err == nil || !strings.Contains(err.Error(), "host mapping") {
+		t.Fatalf("unsafe host mapping error = %v", err)
+	}
+}
+
 func TestCertificateConfigPathDoesNotCompileModuleJavaScript(t *testing.T) {
 	t.Parallel()
 	cfg := Config{
@@ -158,7 +182,7 @@ func TestCertificateConfigPathDoesNotCompileModuleJavaScript(t *testing.T) {
 		UpstreamProxy: ProxyConfig{Address: "127.0.0.1:17890", Username: "upstream-user-123", Password: "upstream-password-12345678"},
 		WLOC:          WLOCSettings{Accuracy: 25, FailClosed: true, MaxBodyBytes: 8 << 20},
 		Modules: []Module{{
-			ID: "mod-1234567890abcdef", Name: "Fixture", Format: "surge", Enabled: true,
+			ID: "mod-1234567890abcdef", Name: "Fixture", Enabled: true,
 			ImportedAt: time.Now().UTC().Format(time.RFC3339), Hosts: []string{"api.example.com"},
 			Scripts: []ScriptRule{{ScriptBody: "function ("}},
 		}},

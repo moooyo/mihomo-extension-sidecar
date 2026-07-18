@@ -54,11 +54,9 @@ type WLOCSettings struct {
 }
 
 type ModuleSource struct {
-	URL          string `json:"url,omitempty"`
-	Digest       string `json:"digest"`
-	Body         string `json:"body"`
-	FetchProfile string `json:"fetch_profile"`
-	Referer      string `json:"referer,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Digest string `json:"digest"`
+	Body   string `json:"body"`
 }
 
 type ScriptRule struct {
@@ -69,9 +67,22 @@ type ScriptRule struct {
 	ScriptDigest string `json:"script_digest"`
 	ScriptBody   string `json:"script_body"`
 	RequiresBody bool   `json:"requires_body"`
+	BinaryBody   bool   `json:"binary_body"`
 	TimeoutMS    int    `json:"timeout_ms"`
 	MaxBodyBytes int64  `json:"max_body_bytes"`
 	Argument     string `json:"argument,omitempty"`
+}
+
+type ModuleParameter struct {
+	Key     string   `json:"key"`
+	Kind    string   `json:"kind"`
+	Options []string `json:"options,omitempty"`
+	Value   string   `json:"value,omitempty"`
+}
+
+type HostMapping struct {
+	Pattern string `json:"pattern"`
+	Target  string `json:"target"`
 }
 
 type RewriteRule struct {
@@ -82,30 +93,30 @@ type RewriteRule struct {
 }
 
 type HeaderRule struct {
-	ID           string `json:"id"`
-	Pattern      string `json:"pattern"`
-	Operation    string `json:"operation"`
-	Header       string `json:"header"`
-	Value        string `json:"value,omitempty"`
-	ValuePattern string `json:"value_pattern,omitempty"`
-	Replacement  string `json:"replacement,omitempty"`
+	ID        string `json:"id"`
+	Pattern   string `json:"pattern"`
+	Operation string `json:"operation"`
+	Header    string `json:"header"`
+	Value     string `json:"value,omitempty"`
 }
 
 type Module struct {
-	ID             string        `json:"id"`
-	Name           string        `json:"name"`
-	Description    string        `json:"description,omitempty"`
-	Format         string        `json:"format"`
-	Enabled        bool          `json:"enabled"`
-	Argument       string        `json:"argument,omitempty"`
-	ImportedAt     string        `json:"imported_at"`
-	Source         ModuleSource  `json:"source"`
-	Hosts          []string      `json:"hosts"`
-	Scripts        []ScriptRule  `json:"scripts,omitempty"`
-	Rewrites       []RewriteRule `json:"rewrites,omitempty"`
-	Headers        []HeaderRule  `json:"headers,omitempty"`
-	Unsupported    []string      `json:"unsupported,omitempty"`
-	PartialAllowed bool          `json:"partial_allowed"`
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Description    string            `json:"description,omitempty"`
+	Enabled        bool              `json:"enabled"`
+	Argument       string            `json:"argument,omitempty"`
+	ImportedAt     string            `json:"imported_at"`
+	Source         ModuleSource      `json:"source"`
+	Hosts          []string          `json:"hosts"`
+	HostMappings   []HostMapping     `json:"host_mappings,omitempty"`
+	Parameters     []ModuleParameter `json:"parameters,omitempty"`
+	Scripts        []ScriptRule      `json:"scripts,omitempty"`
+	Rewrites       []RewriteRule     `json:"rewrites,omitempty"`
+	Headers        []HeaderRule      `json:"headers,omitempty"`
+	Unsupported    []string          `json:"unsupported,omitempty"`
+	Incompatible   []string          `json:"incompatible,omitempty"`
+	PartialAllowed bool              `json:"partial_allowed"`
 }
 
 func loadConfig(path string) (Config, error) {
@@ -360,7 +371,7 @@ func canonicalHost(value string) string {
 }
 
 func allowedInboundSOCKSTarget(cfg Config, target socksTarget) bool {
-	if target.Port != 443 {
+	if target.Port != 80 && target.Port != 443 {
 		return false
 	}
 	return activeInterceptHost(cfg, target.Host) || net.ParseIP(target.Host) != nil
@@ -389,6 +400,27 @@ func activeHostPatterns(cfg Config) []string {
 	return uniqueSorted(patterns)
 }
 
+func mappedInterceptTarget(cfg Config, host string) string {
+	host = canonicalHost(host)
+	bestPattern := ""
+	target := host
+	for _, module := range cfg.Modules {
+		if !module.Enabled {
+			continue
+		}
+		for _, mapping := range module.HostMappings {
+			if !matchHostPattern(mapping.Pattern, host) {
+				continue
+			}
+			if mapping.Pattern == host || len(mapping.Pattern) > len(bestPattern) {
+				bestPattern = mapping.Pattern
+				target = mapping.Target
+			}
+		}
+	}
+	return target
+}
+
 func certificateHostPatterns(cfg Config) []string {
 	patterns := append([]string(nil), builtInWLOCHosts...)
 	for _, module := range cfg.Modules {
@@ -412,6 +444,7 @@ func validateModules(modules []Module) error {
 		return errors.New("at most 64 interception modules are allowed")
 	}
 	ids := make(map[string]struct{}, len(modules))
+	activeMappings := make(map[string]string)
 	for index, module := range modules {
 		if !validModuleID(module.ID) {
 			return fmt.Errorf("module %d has an invalid id", index)
@@ -420,9 +453,6 @@ func validateModules(modules []Module) error {
 			return fmt.Errorf("duplicate module id %q", module.ID)
 		}
 		ids[module.ID] = struct{}{}
-		if module.Format != "surge" && module.Format != "loon" {
-			return fmt.Errorf("module %q has an invalid format", module.ID)
-		}
 		if _, err := time.Parse(time.RFC3339, module.ImportedAt); err != nil {
 			return fmt.Errorf("module %q imported_at is invalid", module.ID)
 		}
@@ -432,28 +462,42 @@ func validateModules(modules []Module) error {
 		if len(module.Source.Body) == 0 || len(module.Source.Body) > 2<<20 || module.Source.Digest != digestText(module.Source.Body) {
 			return fmt.Errorf("module %q source snapshot digest is invalid", module.ID)
 		}
-		if module.Source.FetchProfile != "standard" && module.Source.FetchProfile != "quantumult-x" {
-			return fmt.Errorf("module %q fetch profile is invalid", module.ID)
-		}
-		if len(module.Source.URL) > 4096 || len(module.Source.Referer) > 4096 {
-			return fmt.Errorf("module %q source URL or Referer is too long", module.ID)
+		if len(module.Source.URL) > 4096 {
+			return fmt.Errorf("module %q source URL is too long", module.ID)
 		}
 		if module.Source.URL != "" && !validSnapshotURL(module.Source.URL) {
 			return fmt.Errorf("module %q source URL is invalid", module.ID)
 		}
-		if module.Source.Referer != "" && !validSnapshotURL(module.Source.Referer) {
-			return fmt.Errorf("module %q source Referer is invalid", module.ID)
-		}
-		if len(module.Hosts) == 0 || len(module.Hosts) > 256 {
-			return fmt.Errorf("module %q must declare 1 to 256 hosts", module.ID)
+		if len(module.Hosts) > 256 {
+			return fmt.Errorf("module %q exceeds 256 hosts", module.ID)
 		}
 		for _, host := range module.Hosts {
 			if !validHostPattern(host) {
 				return fmt.Errorf("module %q has an invalid host %q", module.ID, host)
 			}
 		}
-		if len(module.Scripts)+len(module.Rewrites)+len(module.Headers) == 0 || len(module.Scripts)+len(module.Rewrites)+len(module.Headers) > 256 {
+		if len(module.Scripts)+len(module.Rewrites)+len(module.Headers) > 256 {
 			return fmt.Errorf("module %q has an invalid action count", module.ID)
+		}
+		if err := validateModuleParameters(module.Parameters); err != nil {
+			return fmt.Errorf("module %q: %w", module.ID, err)
+		}
+		if err := validateHostMappings(module.HostMappings); err != nil {
+			return fmt.Errorf("module %q: %w", module.ID, err)
+		}
+		if len(module.Unsupported) > 64 || len(module.Incompatible) > 64 {
+			return fmt.Errorf("module %q compatibility report is too large", module.ID)
+		}
+		if module.Enabled {
+			if len(module.Hosts) == 0 || len(module.Scripts)+len(module.Rewrites)+len(module.Headers) == 0 {
+				return fmt.Errorf("module %q has no runnable interception actions", module.ID)
+			}
+			if len(module.Incompatible) > 0 {
+				return fmt.Errorf("module %q is incompatible", module.ID)
+			}
+			if !moduleParametersReady(module.Parameters) {
+				return fmt.Errorf("module %q parameters are not configured", module.ID)
+			}
 		}
 		total := 0
 		for _, rule := range module.Scripts {
@@ -487,8 +531,11 @@ func validateModules(modules []Module) error {
 			if _, err := regexp.Compile(rule.Pattern); err != nil {
 				return fmt.Errorf("module %q rewrite pattern is invalid: %w", module.ID, err)
 			}
-			if rule.Action != "reject" && rule.Action != "reject-200" && rule.Action != "reject-dict" && rule.Action != "reject-array" && rule.Action != "redirect-302" && rule.Action != "redirect-307" {
+			if rule.Action != "reject" && rule.Action != "reject-200" && rule.Action != "reject-dict" && rule.Action != "reject-array" && rule.Action != "reject-img" && rule.Action != "reject-drop" && rule.Action != "rewrite" && rule.Action != "redirect-302" && rule.Action != "redirect-307" {
 				return fmt.Errorf("module %q rewrite action is invalid", module.ID)
+			}
+			if (rule.Action == "rewrite" || rule.Action == "redirect-302" || rule.Action == "redirect-307") && strings.TrimSpace(rule.Replacement) == "" {
+				return fmt.Errorf("module %q rewrite replacement is missing", module.ID)
 			}
 		}
 		for _, rule := range module.Headers {
@@ -497,13 +544,9 @@ func validateModules(modules []Module) error {
 			}
 			switch rule.Operation {
 			case "delete":
-			case "replace":
+			case "add", "replace":
 				if strings.ContainsAny(rule.Value, "\r\n") {
 					return fmt.Errorf("module %q header value is invalid", module.ID)
-				}
-			case "replace-regex":
-				if _, err := regexp.Compile(rule.ValuePattern); err != nil || strings.ContainsAny(rule.Replacement, "\r\n") {
-					return fmt.Errorf("module %q header value expression is invalid", module.ID)
 				}
 			default:
 				return fmt.Errorf("module %q header operation is invalid", module.ID)
@@ -512,8 +555,98 @@ func validateModules(modules []Module) error {
 		if module.Enabled && len(module.Unsupported) > 0 && !module.PartialAllowed {
 			return fmt.Errorf("module %q needs partial compatibility acknowledgement", module.ID)
 		}
+		if module.Enabled {
+			for _, mapping := range module.HostMappings {
+				if target, exists := activeMappings[mapping.Pattern]; exists && target != mapping.Target {
+					return fmt.Errorf("enabled modules conflict on host mapping %q", mapping.Pattern)
+				}
+				activeMappings[mapping.Pattern] = mapping.Target
+			}
+		}
 	}
 	return nil
+}
+
+func validateModuleParameters(parameters []ModuleParameter) error {
+	seen := make(map[string]struct{}, len(parameters))
+	for _, parameter := range parameters {
+		if !validParameterKey(parameter.Key) || len(parameter.Value) > 4096 {
+			return fmt.Errorf("parameter %q is invalid", parameter.Key)
+		}
+		if _, duplicate := seen[parameter.Key]; duplicate {
+			return fmt.Errorf("parameter %q is duplicated", parameter.Key)
+		}
+		seen[parameter.Key] = struct{}{}
+		switch parameter.Kind {
+		case "input":
+			if len(parameter.Options) != 0 {
+				return fmt.Errorf("input parameter %q has options", parameter.Key)
+			}
+		case "select":
+			if len(parameter.Options) == 0 || len(parameter.Options) > 64 {
+				return fmt.Errorf("select parameter %q has invalid options", parameter.Key)
+			}
+			found := parameter.Value == ""
+			for _, option := range parameter.Options {
+				if option == "" || len(option) > 256 {
+					return fmt.Errorf("select parameter %q has an invalid option", parameter.Key)
+				}
+				if option == parameter.Value {
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("select parameter %q value is invalid", parameter.Key)
+			}
+		default:
+			return fmt.Errorf("parameter %q has an invalid kind", parameter.Key)
+		}
+	}
+	return nil
+}
+
+func validParameterKey(value string) bool {
+	if len(value) == 0 || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func moduleParametersReady(parameters []ModuleParameter) bool {
+	for _, parameter := range parameters {
+		if strings.TrimSpace(parameter.Value) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func validateHostMappings(mappings []HostMapping) error {
+	seen := make(map[string]struct{}, len(mappings))
+	for _, mapping := range mappings {
+		if !validHostPattern(mapping.Pattern) || !validHostTarget(mapping.Target) {
+			return fmt.Errorf("host mapping %q is invalid", mapping.Pattern)
+		}
+		if _, duplicate := seen[mapping.Pattern]; duplicate {
+			return fmt.Errorf("host mapping %q is duplicated", mapping.Pattern)
+		}
+		seen[mapping.Pattern] = struct{}{}
+	}
+	return nil
+}
+
+func validHostTarget(value string) bool {
+	value = canonicalHost(value)
+	if ip := net.ParseIP(value); ip != nil {
+		return ip.To4() != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+	}
+	return !strings.HasPrefix(value, "*.") && value != "localhost" && !strings.HasSuffix(value, ".local") && validHostPattern(value)
 }
 
 func validModuleID(id string) bool {

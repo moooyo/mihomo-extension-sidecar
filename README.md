@@ -4,8 +4,9 @@
 enabled interception modules. It is not an open proxy and does not fetch module
 or script content at runtime.
 
-The service accepts authenticated SOCKS5 on `127.0.0.1:18080`. TCP CONNECT is
-terminated as TLS with HTTP/1.1 and HTTP/2 support. An authenticated UDP
+The service accepts authenticated SOCKS5 on `127.0.0.1:18080`. TCP CONNECT on
+port 80 serves plain HTTP; port 443 terminates TLS with HTTP/1.1 and HTTP/2.
+An authenticated UDP
 ASSOCIATE receives a private ephemeral loopback socket and is terminated as
 QUIC v1/v2 with HTTP/3. A hostname target and the eventual TLS/QUIC SNI must
 match the active module host set. Pure-IP SOCKS targets are accepted only until
@@ -17,13 +18,15 @@ SOCKS5 UDP `net.PacketConn`; the sidecar has no direct origin egress path. The
 HTTP/3 client prefers QUIC v1 and retries v2 only on version negotiation before
 request transmission.
 
-External Surge and Loon modules arrive as bounded immutable JSON snapshots in
+External Loon modules arrive as bounded immutable JSON snapshots in
 `/etc/5gpn/intercept/config.json`. The runtime supports normalized MITM hosts,
-HTTP request/response JavaScript actions, request-header rewrites, and terminal
-URL reject/redirect actions. Every action runs in a fresh goja VM with bounded source/body sizes,
+HTTP request/response JavaScript actions, Loon URL/header rewrites, module Host
+mappings, and post-import input/select parameters. Every action runs in a fresh
+goja VM with bounded source/body sizes,
 execution time, and backtracking-regexp time. There is no script network,
-filesystem, process, or module-loader access. `$persistentStore` and `$prefs`
-write only to the bounded service-owned
+filesystem, process, or module-loader access. String and Uint8Array bodies
+decode identity, gzip, deflate, and Brotli within expanded-size limits.
+`$persistentStore` writes only to the bounded service-owned
 `/var/lib/5gpn-intercept/store.json`.
 
 The built-in WLOC module buffers `/clls/wloc` responses up to its configured

@@ -99,6 +99,9 @@ func (p *interceptProxy) handleSOCKSConnection(ctx context.Context, conn net.Con
 			return err
 		}
 		_ = conn.SetDeadline(time.Time{})
+		if target.Port == 80 {
+			return p.servePlainHTTPConnection(conn)
+		}
 		return p.serveTLSConnection(conn)
 	case socksCommandUDP:
 		return p.serveUDPAssociation(ctx, conn)
@@ -106,6 +109,21 @@ func (p *interceptProxy) handleSOCKSConnection(ctx context.Context, conn net.Con
 		_ = writeSOCKSReply(conn, 7, nil)
 		return fmt.Errorf("unsupported SOCKS command %d", command)
 	}
+}
+
+func (p *interceptProxy) servePlainHTTPConnection(conn net.Conn) error {
+	listener := newSingleConnListener(conn)
+	server := &http.Server{
+		Handler:           p,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+	err := server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 func (p *interceptProxy) serveTLSConnection(conn net.Conn) error {
@@ -199,7 +217,11 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unrecognized interception host", http.StatusMisdirectedRequest)
 		return
 	}
-	bufferSlot := requestHasPayload(r) || responseTransformationConfigured(cfg, "https://"+host+r.URL.RequestURI())
+	scheme := "http"
+	if r.TLS != nil || r.ProtoMajor == 3 {
+		scheme = "https"
+	}
+	bufferSlot := requestHasPayload(r) || responseTransformationConfigured(cfg, scheme+"://"+host+r.URL.RequestURI())
 	if bufferSlot && !p.acquireBodySlot() {
 		http.Error(w, "interception body capacity is busy", http.StatusServiceUnavailable)
 		return
@@ -311,10 +333,14 @@ func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Res
 		},
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 			host, portText, err := net.SplitHostPort(address)
-			if err != nil || !activeInterceptHost(cfg, host) || portText != "443" {
+			if err != nil || !activeInterceptHost(cfg, host) || (portText != "80" && portText != "443") {
 				return nil, errors.New("upstream TCP target is outside the active module allowlist")
 			}
-			return dialSOCKS5TCP(ctx, cfg.UpstreamProxy, socksTarget{Host: host, Port: 443})
+			port := 443
+			if portText == "80" {
+				port = 80
+			}
+			return dialSOCKS5TCP(ctx, cfg.UpstreamProxy, socksTarget{Host: mappedInterceptTarget(cfg, host), Port: port})
 		},
 	}
 	response, err := transport.RoundTrip(request)
@@ -346,7 +372,7 @@ func roundTripHTTP3Version(request *http.Request, cfg Config, roots *x509.CertPo
 	if !activeInterceptHost(cfg, host) {
 		return nil, nil, errors.New("upstream QUIC target is outside the active module allowlist")
 	}
-	target := socksTarget{Host: host, Port: 443}
+	target := socksTarget{Host: mappedInterceptTarget(cfg, host), Port: 443}
 	packetConn, err := dialSOCKS5UDP(request.Context(), cfg.UpstreamProxy, target)
 	if err != nil {
 		return nil, nil, err
