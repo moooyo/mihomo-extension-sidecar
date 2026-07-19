@@ -4,11 +4,14 @@
 enabled interception modules. It is not an open proxy and does not fetch module
 or script content at runtime.
 
-The service accepts authenticated SOCKS5 on `127.0.0.1:18080`. TCP CONNECT on
-port 80 serves plain HTTP; port 443 terminates TLS with HTTP/1.1 and HTTP/2.
-An authenticated UDP
-ASSOCIATE receives a private ephemeral loopback socket and is terminated as
-QUIC v1/v2 with HTTP/3. A hostname target and the eventual TLS/QUIC SNI must
+The service remains stopped unless the version-2 configuration's MITM master is
+enabled. It then accepts authenticated SOCKS5 on `127.0.0.1:18080`. TCP CONNECT
+on port 80 serves plain HTTP; port 443 terminates TLS with HTTP/1.1 and,
+optionally, HTTP/2. An authenticated UDP
+ASSOCIATE receives a private ephemeral loopback socket. It either terminates
+IETF QUIC v1/v2 with HTTP/3 or discards matched packets for client TCP fallback,
+according to `quic_fallback_protection`. Legacy GQUIC is not claimed. A
+hostname target and the eventual TLS/QUIC SNI must
 match the active module host set. Pure-IP SOCKS targets are accepted only until
 the authenticated application handshake supplies an allowlisted SNI.
 
@@ -45,6 +48,7 @@ Useful commands:
 ```text
 5gpn-intercept --version
 5gpn-intercept --config /etc/5gpn/intercept/config.json --check-config
+5gpn-intercept --config /etc/5gpn/intercept/config.json --check-enabled
 5gpn-intercept --config /etc/5gpn/intercept/config.json --print-certificate-hosts
 5gpn-intercept --config /etc/5gpn/intercept/config.json --print-certificate-digest
 5gpn-intercept --config /etc/5gpn/intercept/config.json --print-certificate-request

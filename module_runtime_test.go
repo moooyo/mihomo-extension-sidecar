@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -167,7 +168,7 @@ func TestScriptRuntimeBoundsBacktrackingRegexpFallback(t *testing.T) {
 
 func TestDynamicHostPatternMatching(t *testing.T) {
 	t.Parallel()
-	cfg := Config{Modules: []Module{{Enabled: true, Hosts: []string{"api.example.com", "*.cdn.example.com"}}}}
+	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{{Enabled: true, Hosts: []string{"api.example.com", "*.cdn.example.com"}}}}
 	for host, want := range map[string]bool{
 		"api.example.com":   true,
 		"a.cdn.example.com": true,
@@ -180,9 +181,29 @@ func TestDynamicHostPatternMatching(t *testing.T) {
 	}
 }
 
+func TestMITMHTTP2SettingControlsInboundAndUpstreamProtocols(t *testing.T) {
+	t.Parallel()
+	proxy := &interceptProxy{}
+	for _, test := range []struct {
+		http2      bool
+		wantProtos []string
+	}{
+		{http2: false, wantProtos: []string{"http/1.1"}},
+		{http2: true, wantProtos: []string{"h2", "http/1.1"}},
+	} {
+		if got := mitmTLSNextProtos(test.http2); !reflect.DeepEqual(got, test.wantProtos) {
+			t.Fatalf("mitmTLSNextProtos(%t) = %v, want %v", test.http2, got, test.wantProtos)
+		}
+		transport := proxy.newHTTPTransport(Config{MITM: MITMSettings{HTTP2: test.http2}})
+		if transport.ForceAttemptHTTP2 != test.http2 {
+			t.Fatalf("ForceAttemptHTTP2 = %t, want %t", transport.ForceAttemptHTTP2, test.http2)
+		}
+	}
+}
+
 func TestModuleHeaderRewriteAppliesBeforeUpstream(t *testing.T) {
 	t.Parallel()
-	cfg := Config{Modules: []Module{{
+	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{{
 		ID: "mod-1234567890abcdef", Enabled: true, Hosts: []string{"api.example.com"},
 		Headers: []HeaderRule{{ID: "header-001", Pattern: `^https://api\.example\.com/`, Operation: "delete", Header: "Cookie"}, {
 			ID: "header-002", Pattern: `^https://api\.example\.com/`, Operation: "replace", Header: "User-Agent", Value: "5gpn-test",
@@ -203,7 +224,7 @@ func TestModuleHeaderRewriteAppliesBeforeUpstream(t *testing.T) {
 
 func TestPlainHTTPRequestKeepsHTTPUpstreamScheme(t *testing.T) {
 	t.Parallel()
-	cfg := Config{Modules: []Module{{ID: "mod-1234567890abcdef", Enabled: true, Hosts: []string{"api.example.com"}}}}
+	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{{ID: "mod-1234567890abcdef", Enabled: true, Hosts: []string{"api.example.com"}}}}
 	request := httptest.NewRequest(http.MethodGet, "http://api.example.com/path", nil)
 	proxy := &interceptProxy{scripts: newScriptRuntime()}
 	outbound, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), request, cfg, "api.example.com")

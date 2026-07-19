@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 var version = "dev"
@@ -21,6 +22,7 @@ func main() {
 	flags := flag.NewFlagSet("5gpn-intercept", flag.ExitOnError)
 	configPath := flags.String("config", "/etc/5gpn/intercept/config.json", "path to the interception configuration")
 	checkConfig := flags.Bool("check-config", false, "validate the configuration and exit")
+	checkEnabled := flags.Bool("check-enabled", false, "exit successfully only when MITM is enabled")
 	printMihomoFields := flags.Bool("print-mihomo-fields", false, "print tab-separated mihomo credentials and exit")
 	printCertificateHosts := flags.Bool("print-certificate-hosts", false, "print the canonical certificate SAN list and exit")
 	printCertificateDigest := flags.Bool("print-certificate-digest", false, "print the canonical certificate SAN digest and exit")
@@ -64,13 +66,26 @@ func main() {
 		fmt.Printf("%s\t%s\t%s\t%s\n", cfg.Username, cfg.Password, cfg.UpstreamProxy.Username, cfg.UpstreamProxy.Password)
 		return
 	}
+	if *checkEnabled {
+		if !cfg.MITM.Enabled {
+			os.Exit(3)
+		}
+		return
+	}
 	if *healthcheck {
+		if !cfg.MITM.Enabled {
+			log.Fatal("intercept: healthcheck unavailable while MITM is disabled")
+		}
 		proxy := ProxyConfig{Address: cfg.Listen, Username: cfg.Username, Password: cfg.Password}
 		conn, err := dialSOCKS5UDP(context.Background(), proxy, socksTarget{Host: "gs-loc.apple.com", Port: 443})
 		if err != nil {
 			log.Fatalf("intercept: healthcheck failed: %v", err)
 		}
 		_ = conn.Close()
+		return
+	}
+	if !cfg.MITM.Enabled {
+		log.Print("intercept: MITM is disabled; service will remain stopped")
 		return
 	}
 	certificates, err := newCertificateStore(store)
@@ -81,10 +96,35 @@ func main() {
 	if err != nil {
 		log.Fatalf("intercept: listen %s: %v", cfg.Listen, err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	log.Printf("intercept: modular TLS and HTTP/3 SOCKS5 TCP/UDP service listening on %s", cfg.Listen)
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, stopRuntime := context.WithCancel(signalCtx)
+	defer stopRuntime()
+	go stopWhenMITMDisabled(ctx, store, stopRuntime)
+	log.Printf("intercept: modular TLS and HTTP/3 SOCKS5 TCP/UDP service listening on %s (http2=%t quic_fallback_protection=%t)", cfg.Listen, cfg.MITM.HTTP2, cfg.MITM.QUICFallbackProtection)
 	if err := newInterceptProxy(store, certificates).Serve(ctx, listener); err != nil {
 		log.Fatalf("intercept: service failed: %v", err)
+	}
+}
+
+func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.CancelFunc) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cfg, err := store.Current()
+			if err != nil {
+				log.Printf("intercept: could not refresh MITM state: %v", err)
+				continue
+			}
+			if !cfg.MITM.Enabled {
+				log.Print("intercept: MITM disabled by configuration; stopping service")
+				stop()
+				return
+			}
+		}
 	}
 }

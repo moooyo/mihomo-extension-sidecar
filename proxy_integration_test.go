@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	configBody := `{
-  "version": 1,
+  "version": 2,
   "listen": "127.0.0.1:18080",
   "username": "inbound-user-123",
   "password": "inbound-password-123456789",
@@ -71,6 +72,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
     "username": ` + strconv.Quote(relayUser) + `,
     "password": ` + strconv.Quote(relayPassword) + `
   },
+  "mitm": {"enabled":true,"http2":true,"quic_fallback_protection":false},
   "wloc": {
     "enabled": true,
     "longitude": -122.4194,
@@ -157,6 +159,43 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			assertVarintField(t, fields, 1, uint64(int64(3777490000)))
 		})
 	}
+
+	t.Run("fallback protection", func(t *testing.T) {
+		time.Sleep(20 * time.Millisecond)
+		fallbackConfig := strings.Replace(configBody, `"quic_fallback_protection":false`, `"quic_fallback_protection":true`, 1)
+		if fallbackConfig == configBody {
+			t.Fatal("test config did not contain the QUIC fallback setting")
+		}
+		if err := os.WriteFile(configPath, []byte(fallbackConfig), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		target := socksTarget{Host: "gs-loc.apple.com", Port: 443}
+		packetConn, err := dialSOCKS5UDP(context.Background(), clientProxy, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer packetConn.Close()
+		quicTransport := &quic.Transport{Conn: packetConn}
+		defer quicTransport.Close()
+		clientTransport := &http3.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: target.Host},
+			QUICConfig:      &quic.Config{Versions: []quic.Version{quic.Version1}},
+			Dial: func(ctx context.Context, _ string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
+				return quicTransport.Dial(ctx, target, tlsConfig, quicConfig)
+			},
+		}
+		defer clientTransport.Close()
+		requestCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer stop()
+		request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "https://gs-loc.apple.com/clls/wloc", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response, err := clientTransport.RoundTrip(request); err == nil {
+			response.Body.Close()
+			t.Fatal("QUIC fallback protection unexpectedly completed an HTTP/3 request")
+		}
+	})
 }
 
 func startTestSOCKSUDPRelay(t *testing.T, upstream *net.UDPAddr, username, password string) (string, func()) {

@@ -21,7 +21,7 @@ import (
 	"github.com/dop251/goja"
 )
 
-const configVersion = 1
+const configVersion = 2
 const maxConfigBytes = 16 << 20
 
 var builtInWLOCHosts = []string{"gs-loc.apple.com", "gs-loc-cn.apple.com"}
@@ -34,6 +34,7 @@ type Config struct {
 	TLSCert       string       `json:"tls_cert"`
 	TLSKey        string       `json:"tls_key"`
 	UpstreamProxy ProxyConfig  `json:"upstream_proxy"`
+	MITM          MITMSettings `json:"mitm"`
 	WLOC          WLOCSettings `json:"wloc"`
 	Modules       []Module     `json:"modules,omitempty"`
 }
@@ -42,6 +43,12 @@ type ProxyConfig struct {
 	Address  string `json:"address"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type MITMSettings struct {
+	Enabled                bool `json:"enabled"`
+	HTTP2                  bool `json:"http2"`
+	QUICFallbackProtection bool `json:"quic_fallback_protection"`
 }
 
 type WLOCSettings struct {
@@ -371,6 +378,9 @@ func canonicalHost(value string) string {
 }
 
 func allowedInboundSOCKSTarget(cfg Config, target socksTarget) bool {
+	if !cfg.MITM.Enabled {
+		return false
+	}
 	if target.Port != 80 && target.Port != 443 {
 		return false
 	}
@@ -388,6 +398,9 @@ func activeInterceptHost(cfg Config, value string) bool {
 }
 
 func activeHostPatterns(cfg Config) []string {
+	if !cfg.MITM.Enabled {
+		return nil
+	}
 	patterns := make([]string, 0, len(builtInWLOCHosts)+16)
 	if cfg.WLOC.Enabled {
 		patterns = append(patterns, builtInWLOCHosts...)

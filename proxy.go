@@ -53,12 +53,21 @@ func (p *interceptProxy) Serve(ctx context.Context, listener net.Listener) error
 			return err
 		}
 		connections.Add(1)
-		go func() {
+		go func(conn net.Conn) {
 			defer connections.Done()
+			sessionDone := make(chan struct{})
+			defer close(sessionDone)
+			go func() {
+				select {
+				case <-ctx.Done():
+					_ = conn.Close()
+				case <-sessionDone:
+				}
+			}()
 			if err := p.handleSOCKSConnection(ctx, conn); err != nil && ctx.Err() == nil {
 				log.Printf("intercept: SOCKS session failed: %v", err)
 			}
-		}()
+		}(conn)
 	}
 }
 
@@ -127,6 +136,10 @@ func (p *interceptProxy) servePlainHTTPConnection(conn net.Conn) error {
 }
 
 func (p *interceptProxy) serveTLSConnection(conn net.Conn) error {
+	cfg, err := p.config.Current()
+	if err != nil {
+		return err
+	}
 	listener := newSingleConnListener(conn)
 	server := &http.Server{
 		Handler:           p,
@@ -136,14 +149,21 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn) error {
 		TLSConfig: &tls.Config{
 			MinVersion:     tls.VersionTLS12,
 			GetCertificate: p.certificates.GetCertificate,
-			NextProtos:     []string{"h2", "http/1.1"},
+			NextProtos:     mitmTLSNextProtos(cfg.MITM.HTTP2),
 		},
 	}
-	err := server.ServeTLS(listener, "", "")
+	err = server.ServeTLS(listener, "", "")
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 		return nil
 	}
 	return err
+}
+
+func mitmTLSNextProtos(http2 bool) []string {
+	if http2 {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"http/1.1"}
 }
 
 func (p *interceptProxy) serveUDPAssociation(ctx context.Context, control net.Conn) error {
@@ -169,6 +189,13 @@ func (p *interceptProxy) serveUDPAssociation(ctx context.Context, control net.Co
 		return err
 	}
 	_ = control.SetDeadline(time.Time{})
+	cfg, err := p.config.Current()
+	if err != nil {
+		return err
+	}
+	if cfg.MITM.QUICFallbackProtection {
+		return discardQUICAssociation(ctx, control, packetConn)
+	}
 	server := &http3.Server{
 		Handler:        p,
 		MaxHeaderBytes: 64 << 10,
@@ -204,6 +231,36 @@ func (p *interceptProxy) serveUDPAssociation(ctx context.Context, control net.Co
 	_ = server.Close()
 	_ = packetConn.Close()
 	return nil
+}
+
+func discardQUICAssociation(ctx context.Context, control net.Conn, packetConn net.PacketConn) error {
+	controlClosed := make(chan struct{})
+	go func() {
+		var one [1]byte
+		_, _ = control.Read(one[:])
+		close(controlClosed)
+	}()
+	discardErr := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 64<<10)
+		for {
+			if _, _, err := packetConn.ReadFrom(buffer); err != nil {
+				discardErr <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-controlClosed:
+		return nil
+	case err := <-discardErr:
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	}
 }
 
 func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -324,9 +381,16 @@ func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Res
 	if request.ProtoMajor == 3 {
 		return roundTripHTTP3(request, cfg, p.upstreamRoots)
 	}
-	transport := &http.Transport{
+	transport := p.newHTTPTransport(cfg)
+	response, err := transport.RoundTrip(request)
+	cleanup := func() { transport.CloseIdleConnections() }
+	return response, cleanup, err
+}
+
+func (p *interceptProxy) newHTTPTransport(cfg Config) *http.Transport {
+	return &http.Transport{
 		Proxy:             nil,
-		ForceAttemptHTTP2: true,
+		ForceAttemptHTTP2: cfg.MITM.HTTP2,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    p.upstreamRoots,
@@ -343,9 +407,6 @@ func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Res
 			return dialSOCKS5TCP(ctx, cfg.UpstreamProxy, socksTarget{Host: mappedInterceptTarget(cfg, host), Port: port})
 		},
 	}
-	response, err := transport.RoundTrip(request)
-	cleanup := func() { transport.CloseIdleConnections() }
-	return response, cleanup, err
 }
 
 func roundTripHTTP3(request *http.Request, cfg Config, roots *x509.CertPool) (*http.Response, func(), error) {

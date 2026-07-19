@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,7 +16,7 @@ func TestLoadConfigStrictAndValid(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	body := `{
-  "version": 1,
+  "version": 2,
   "listen": "127.0.0.1:18080",
   "username": "inbound-user-123",
   "password": "inbound-password-123456789",
@@ -26,6 +27,7 @@ func TestLoadConfigStrictAndValid(t *testing.T) {
     "username": "upstream-user-123",
     "password": "upstream-password-12345678"
   },
+  "mitm": {"enabled":true,"http2":true,"quic_fallback_protection":false},
   "wloc": {
     "enabled": true,
     "longitude": 113.9,
@@ -42,7 +44,7 @@ func TestLoadConfigStrictAndValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if !cfg.WLOC.Enabled || cfg.WLOC.Longitude == nil || *cfg.WLOC.Longitude != 113.9 {
+	if !cfg.MITM.Enabled || !cfg.MITM.HTTP2 || cfg.MITM.QUICFallbackProtection || !cfg.WLOC.Enabled || cfg.WLOC.Longitude == nil || *cfg.WLOC.Longitude != 113.9 {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
@@ -50,7 +52,7 @@ func TestLoadConfigStrictAndValid(t *testing.T) {
 func TestLoadConfigRejectsUnknownAndNonLoopback(t *testing.T) {
 	t.Parallel()
 	base := `{
-  "version": 1,
+  "version": 2,
   "listen": %q,
   "username": "inbound-user-123",
   "password": "inbound-password-123456789",
@@ -61,6 +63,7 @@ func TestLoadConfigRejectsUnknownAndNonLoopback(t *testing.T) {
     "username": "upstream-user-123",
     "password": "upstream-password-12345678"
   },
+  "mitm": {"enabled":false,"http2":true,"quic_fallback_protection":true},
   "wloc": {
     "enabled": false,
     "longitude": null,
@@ -96,13 +99,14 @@ func TestConfigStoreRetainsLastValidSnapshot(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.json")
 	valid := `{
-  "version": 1,
+  "version": 2,
   "listen": "127.0.0.1:18080",
   "username": "inbound-user-123",
   "password": "inbound-password-123456789",
   "tls_cert": "cert.pem",
   "tls_key": "key.pem",
   "upstream_proxy": {"address":"127.0.0.1:17890","username":"upstream-user-123","password":"upstream-password-12345678"},
+  "mitm": {"enabled":false,"http2":true,"quic_fallback_protection":true},
   "wloc": {"enabled":false,"longitude":null,"latitude":null,"accuracy":25,"fail_closed":true,"max_body_bytes":8388608}
 }`
 	if err := os.WriteFile(path, []byte(valid), 0o600); err != nil {
@@ -120,7 +124,7 @@ func TestConfigStoreRetainsLastValidSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Current returned an error instead of the last valid snapshot: %v", err)
 	}
-	if cfg.Version != 1 || cfg.Listen != "127.0.0.1:18080" {
+	if cfg.Version != 2 || cfg.Listen != "127.0.0.1:18080" {
 		t.Fatalf("Current returned the invalid replacement: %+v", cfg)
 	}
 }
@@ -171,6 +175,66 @@ func TestConfigBlocksUnconfiguredOrUnsafeEnabledModule(t *testing.T) {
 	cfg.Modules[0].HostMappings = []HostMapping{{Pattern: "api.example.com", Target: "127.0.0.1"}}
 	if err := validateModules(cfg.Modules); err == nil || !strings.Contains(err.Error(), "host mapping") {
 		t.Fatalf("unsafe host mapping error = %v", err)
+	}
+}
+
+func TestMITMMasterSwitchGatesRuntimeHostsButKeepsCertificateScope(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		WLOC: WLOCSettings{Enabled: true},
+		Modules: []Module{{
+			Enabled: true,
+			Hosts:   []string{"api.example.com"},
+		}},
+	}
+	if hosts := activeHostPatterns(cfg); len(hosts) != 0 {
+		t.Fatalf("disabled MITM exposed active hosts: %v", hosts)
+	}
+	if allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 443}) {
+		t.Fatal("disabled MITM accepted an inbound SOCKS target")
+	}
+	if hosts := certificateHostPatterns(cfg); len(hosts) != 3 {
+		t.Fatalf("disabled MITM discarded the armed certificate scope: %v", hosts)
+	}
+	cfg.MITM.Enabled = true
+	if !activeInterceptHost(cfg, "api.example.com") || !allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 443}) {
+		t.Fatal("enabled MITM did not expose the armed host")
+	}
+}
+
+func TestRuntimeStopsAfterMITMMasterIsDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := Config{
+		Version: configVersion, Listen: "127.0.0.1:18080", Username: "inbound-user-123", Password: "inbound-password-123456789",
+		TLSCert: "/etc/5gpn/intercept/tls/fullchain.pem", TLSKey: "/etc/5gpn/intercept/tls/privkey.pem",
+		UpstreamProxy: ProxyConfig{Address: "127.0.0.1:17890", Username: "upstream-user-123", Password: "upstream-password-12345678"},
+		MITM:          MITMSettings{Enabled: true, HTTP2: true, QUICFallbackProtection: true},
+		WLOC:          WLOCSettings{Accuracy: 25, FailClosed: true, MaxBodyBytes: 8 << 20},
+	}
+	write := func() {
+		body, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go stopWhenMITMDisabled(ctx, store, stop)
+	time.Sleep(20 * time.Millisecond)
+	cfg.MITM.Enabled = false
+	write()
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime did not stop after the MITM master was disabled")
 	}
 }
 
