@@ -2,253 +2,169 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
-	"net/http/httptest"
+	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
-func runtimeRule(source string) ScriptRule {
+func nativeRuntimeRule(source string, phase string, bodyMode string) ScriptRule {
 	return ScriptRule{
-		ID: "script-001", Phase: "response", Pattern: `^https://api\.example\.com/`,
-		ScriptURL: "https://modules.example.test/script.js", ScriptDigest: digestText(source), ScriptBody: source,
-		TimeoutMS: 500, MaxBodyBytes: 1 << 20,
+		ID: "action", Phase: phase,
+		Match:        ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/"},
+		ScriptDigest: digestText(source), ScriptBody: source, BodyMode: bodyMode,
+		TimeoutMS: 1000, MaxBodyBytes: 1 << 20,
 	}
 }
 
-func TestScriptRuntimeResponseCompatibility(t *testing.T) {
+func nativeRuntimeModule() Module {
+	return Module{ID: "io.example.fixture", CaptureHosts: []string{"api.example.com"}}
+}
+
+func TestNativeScriptTransformsResponseFromTypedContext(t *testing.T) {
 	t.Parallel()
-	source := `$response.headers["X-Module"] = "active";
-$done({status: 201, headers: $response.headers, body: $response.body.replace("secret", "redacted")});`
-	runtime := newScriptRuntime()
-	result, err := runtime.execute(
-		Module{ID: "mod-1234567890abcdef", Argument: "mode=test"},
-		runtimeRule(source),
-		scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: http.Header{"X-Request": {"yes"}}},
-		&scriptMessage{URL: "https://api.example.com/v1", StatusCode: 200, Headers: http.Header{"Content-Type": {"text/plain"}}, Body: []byte("secret value")},
-	)
+	source := `function transform(context) {
+  return { response: { status: 201, headers: {"X-Mode": context.settings.mode}, body: context.response.body + "!" } }
+}`
+	module := nativeRuntimeModule()
+	module.Settings = []ModuleSetting{{Key: "mode", Type: "text", Required: true, Value: json.RawMessage(`"clean"`)}}
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header), Body: []byte("ok")}
+	result, err := newScriptRuntime().execute(module, nativeRuntimeRule(source, "response", "text"), request, &response)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.ChangedBody || string(result.Body) != "redacted value" || !result.ChangedStatus || result.StatusCode != 201 {
-		t.Fatalf("script result = %+v", result)
-	}
-	if result.Headers.Get("X-Module") != "active" || result.Headers.Get("Content-Type") != "text/plain" {
-		t.Fatalf("script headers = %v", result.Headers)
+	if !result.ChangedBody || string(result.Body) != "ok!" || result.StatusCode != 201 || result.Headers.Get("X-Mode") != "clean" {
+		t.Fatalf("native result = %+v", result)
 	}
 }
 
-func TestScriptRuntimeRequestStatusCreatesSyntheticResponse(t *testing.T) {
+func TestNativeScriptSupportsBinaryBodies(t *testing.T) {
 	t.Parallel()
-	source := `$done({status: "HTTP/1.1 200 OK", headers: {"Content-Type": "application/json"}, body: "{}"});`
-	result, err := newScriptRuntime().execute(
-		Module{ID: "mod-1234567890abcdef"}, runtimeRule(source),
-		scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet}, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Synthetic || result.StatusCode != 200 || string(result.Body) != "{}" {
-		t.Fatalf("synthetic result = %+v", result)
+	source := `function transform(context) {
+  const input = context.response.body
+  return { response: { body: new Uint8Array([input[2], input[1], input[0]]) } }
+}`
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header), Body: []byte{1, 2, 3}}
+	result, err := newScriptRuntime().execute(nativeRuntimeModule(), nativeRuntimeRule(source, "response", "binary"), request, &response)
+	if err != nil || !bytes.Equal(result.Body, []byte{3, 2, 1}) {
+		t.Fatalf("binary result=%+v err=%v", result, err)
 	}
 }
 
-func TestScriptRuntimeBinaryBodyAndAbort(t *testing.T) {
+func TestNativeScriptRejectsAmbientNetworkAndTimesOut(t *testing.T) {
 	t.Parallel()
-	runtime := newScriptRuntime()
-	rule := runtimeRule(`$done({body: new Uint8Array([$response.body[2], $response.body[1], $response.body[0]])});`)
-	rule.BinaryBody = true
-	result, err := runtime.execute(
-		Module{ID: "mod-1234567890abcdef"},
-		rule,
-		scriptMessage{},
-		&scriptMessage{Body: []byte{1, 2, 3}},
-	)
-	if err != nil {
-		t.Fatal(err)
+	request := scriptMessage{URL: "https://api.example.com/v1", Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header)}
+	networked := `function transform() { return fetch("https://example.com/") }`
+	if _, err := newScriptRuntime().execute(nativeRuntimeModule(), nativeRuntimeRule(networked, "response", "none"), request, &response); err == nil {
+		t.Fatal("ambient network API was available")
 	}
-	if !result.ChangedBody || !bytes.Equal(result.Body, []byte{3, 2, 1}) {
-		t.Fatalf("binary result = %+v", result)
-	}
-	aborted, err := runtime.execute(Module{ID: "mod-1234567890abcdef"}, runtimeRule(`$done();`), scriptMessage{}, nil)
-	if err != nil || !aborted.Abort {
-		t.Fatalf("abort result=%+v err=%v", aborted, err)
+	timeout := nativeRuntimeRule(`function transform() { while (true) {} }`, "response", "none")
+	timeout.TimeoutMS = 50
+	started := time.Now()
+	if _, err := newScriptRuntime().execute(nativeRuntimeModule(), timeout, request, &response); err == nil || time.Since(started) > time.Second {
+		t.Fatalf("timeout result err=%v duration=%s", err, time.Since(started))
 	}
 }
 
-func TestModuleParametersAndHostMappings(t *testing.T) {
-	t.Parallel()
-	module := Module{
-		ID: "mod-1234567890abcdef", Enabled: true,
-		Parameters:   []ModuleParameter{{Key: "mode", Kind: "select", Options: []string{"clean", "full"}, Value: "clean"}},
-		HostMappings: []HostMapping{{Pattern: "api.example.com", Target: "origin.example.net"}},
-	}
-	runtime := newScriptRuntime()
-	result, err := runtime.execute(module, runtimeRule(`$done({body: $persistentStore.read("mode")});`), scriptMessage{}, nil)
-	if err != nil || string(result.Body) != "clean" {
-		t.Fatalf("parameter result=%q err=%v", result.Body, err)
-	}
-	cfg := Config{Modules: []Module{module}}
-	if got := mappedInterceptTarget(cfg, "api.example.com"); got != "origin.example.net" {
-		t.Fatalf("mapped target = %q", got)
-	}
-}
-
-func TestScriptRuntimePersistentStore(t *testing.T) {
-	t.Parallel()
-	runtime := newScriptRuntime()
-	module := Module{ID: "mod-1234567890abcdef"}
-	if _, err := runtime.execute(module, runtimeRule(`$persistentStore.write("value", "key"); $done();`), scriptMessage{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	result, err := runtime.execute(module, runtimeRule(`$done({body: $persistentStore.read("key")});`), scriptMessage{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(result.Body) != "value" {
-		t.Fatalf("persistent value = %q", result.Body)
-	}
-}
-
-func TestScriptRuntimePersistentStoreSurvivesRestart(t *testing.T) {
+func TestNativePersistentStorageRequiresManifestPermission(t *testing.T) {
 	t.Parallel()
 	statePath := filepath.Join(t.TempDir(), "store.json")
-	module := Module{ID: "mod-1234567890abcdef"}
+	source := `function transform(context) {
+  const previous = context.storage.get("counter")
+  context.storage.set("counter", previous == null ? "1" : "2")
+  return { response: { body: previous == null ? "empty" : previous } }
+}`
+	module := nativeRuntimeModule()
+	module.PersistentStorage = true
+	request := scriptMessage{URL: "https://api.example.com/", Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header)}
 	first := newScriptRuntime(statePath)
-	if _, err := first.execute(module, runtimeRule(`$persistentStore.write("durable", "key"); $done();`), scriptMessage{}, nil); err != nil {
-		t.Fatal(err)
+	result, err := first.execute(module, nativeRuntimeRule(source, "response", "text"), request, &response)
+	if err != nil || string(result.Body) != "empty" {
+		t.Fatalf("first store result=%q err=%v", result.Body, err)
 	}
 	second := newScriptRuntime(statePath)
-	result, err := second.execute(module, runtimeRule(`$done({body: $persistentStore.read("key")});`), scriptMessage{}, nil)
+	result, err = second.execute(module, nativeRuntimeRule(source, "response", "text"), request, &response)
+	if err != nil || string(result.Body) != "1" {
+		t.Fatalf("persisted store result=%q err=%v", result.Body, err)
+	}
+	module.PersistentStorage = false
+	if _, err := second.execute(module, nativeRuntimeRule(source, "response", "text"), request, &response); err == nil {
+		t.Fatal("storage API was exposed without permission")
+	}
+}
+
+func TestNativeActionMatchingIsScopedToExtensionCaptureHosts(t *testing.T) {
+	t.Parallel()
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	module.Scripts = []ScriptRule{nativeRuntimeRule(`function transform() { return null }`, "response", "none")}
+	cfg := Config{Modules: []Module{module}}
+	inside := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, StatusCode: 200}
+	outside := scriptMessage{URL: "https://other.example.com/v1", Method: http.MethodGet, StatusCode: 200}
+	if len(matchingScriptRules(cfg, "response", inside)) != 1 || len(matchingScriptRules(cfg, "response", outside)) != 0 {
+		t.Fatal("native action escaped its extension capture host boundary")
+	}
+}
+
+func TestRepositoryWLOCExtensionScriptPatchesBinaryResponse(t *testing.T) {
+	t.Parallel()
+	source, err := os.ReadFile(filepath.Join("..", "..", "extensions", "apple-wloc", "wloc.js"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(result.Body) != "durable" {
-		t.Fatalf("reloaded value = %q", result.Body)
+	location := append(testVarintField(1, 1), testVarintField(2, 2)...)
+	location = append(location, testVarintField(3, 99)...)
+	wifi := testLengthField(1, []byte("aa:bb:cc:dd:ee:ff"))
+	wifi = append(wifi, testLengthField(2, location)...)
+	root := testLengthField(2, wifi)
+	frame := append(make([]byte, 8), byte(len(root)>>8), byte(len(root)))
+	frame = append(frame, root...)
+
+	module := Module{
+		ID: "io.5gpn.apple-wloc", CaptureHosts: []string{"gs-loc.apple.com"},
+		Settings: []ModuleSetting{
+			{Key: "location", Type: "location", Required: true, Value: json.RawMessage(`{"longitude":-122.4194,"latitude":37.7749,"accuracy":25}`)},
+			{Key: "failClosed", Type: "boolean", Required: true, Value: json.RawMessage(`true`)},
+		},
 	}
-	second.prune(nil)
-	third := newScriptRuntime(statePath)
-	if len(third.persistent) != 0 {
-		t.Fatalf("deleted module state was retained: %+v", third.persistent)
+	rule := ScriptRule{
+		ID: "rewrite-wloc-response", Phase: "response",
+		Match:        ActionMatch{Hosts: []string{"gs-loc.apple.com"}, Schemes: []string{"https"}, PathRegex: "^/clls/wloc$", StatusCodes: []int{200}},
+		ScriptDigest: digestText(string(source)), ScriptBody: string(source), BodyMode: "binary", TimeoutMS: 1500, MaxBodyBytes: 8 << 20,
+	}
+	request := scriptMessage{URL: "https://gs-loc.apple.com/clls/wloc", Method: http.MethodPost, Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, Method: request.Method, StatusCode: 200, Headers: make(http.Header), Body: frame}
+	result, err := newScriptRuntime().execute(module, rule, request, &response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ChangedBody || bytes.Equal(result.Body, frame) || !strings.Contains(string(source), "function transform(context)") {
+		t.Fatalf("WLOC native extension did not patch the response: %+v", result)
 	}
 }
 
-func TestScriptRuntimeTimeoutAndNetworkDenial(t *testing.T) {
-	t.Parallel()
-	runtime := newScriptRuntime()
-	rule := runtimeRule(`for (;;) {}`)
-	rule.TimeoutMS = 50
-	started := time.Now()
-	if _, err := runtime.execute(Module{ID: "mod-1234567890abcdef"}, rule, scriptMessage{}, nil); err == nil || !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("timeout error = %v", err)
+func testEncodeVarint(value uint64) []byte {
+	var output []byte
+	for value >= 0x80 {
+		output = append(output, byte(value)|0x80)
+		value >>= 7
 	}
-	if time.Since(started) > time.Second {
-		t.Fatal("script timeout did not interrupt promptly")
-	}
-	if _, err := runtime.execute(Module{ID: "mod-1234567890abcdef"}, runtimeRule(`$httpClient.get("https://example.com/", function() {});`), scriptMessage{}, nil); err == nil || !strings.Contains(err.Error(), "network access is disabled") {
-		t.Fatalf("network denial error = %v", err)
-	}
+	return append(output, byte(value))
 }
 
-func TestScriptRuntimeBoundsBacktrackingRegexpFallback(t *testing.T) {
-	t.Parallel()
-	runtime := newScriptRuntime()
-	source := `new RegExp("(?=(a+)+$)").test("a".repeat(50000) + "!"); $done();`
-	rule := runtimeRule(source)
-	rule.TimeoutMS = 2000
-	started := time.Now()
-	_, _ = runtime.execute(Module{ID: "mod-1234567890abcdef"}, rule, scriptMessage{}, nil)
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("regexp timeout took %s", elapsed)
-	}
+func testVarintField(number, value uint64) []byte {
+	return append(testEncodeVarint(number<<3), testEncodeVarint(value)...)
 }
 
-func TestDynamicHostPatternMatching(t *testing.T) {
-	t.Parallel()
-	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{{Enabled: true, Hosts: []string{"api.example.com", "*.cdn.example.com"}}}}
-	for host, want := range map[string]bool{
-		"api.example.com":   true,
-		"a.cdn.example.com": true,
-		"cdn.example.com":   false,
-		"other.example.com": false,
-	} {
-		if got := activeInterceptHost(cfg, host); got != want {
-			t.Errorf("activeInterceptHost(%q) = %v, want %v", host, got, want)
-		}
-	}
-}
-
-func TestMITMHTTP2SettingControlsInboundAndUpstreamProtocols(t *testing.T) {
-	t.Parallel()
-	proxy := &interceptProxy{}
-	for _, test := range []struct {
-		http2      bool
-		wantProtos []string
-	}{
-		{http2: false, wantProtos: []string{"http/1.1"}},
-		{http2: true, wantProtos: []string{"h2", "http/1.1"}},
-	} {
-		if got := mitmTLSNextProtos(test.http2); !reflect.DeepEqual(got, test.wantProtos) {
-			t.Fatalf("mitmTLSNextProtos(%t) = %v, want %v", test.http2, got, test.wantProtos)
-		}
-		transport := proxy.newHTTPTransport(Config{MITM: MITMSettings{HTTP2: test.http2}})
-		if transport.ForceAttemptHTTP2 != test.http2 {
-			t.Fatalf("ForceAttemptHTTP2 = %t, want %t", transport.ForceAttemptHTTP2, test.http2)
-		}
-	}
-}
-
-func TestModuleHeaderRewriteAppliesBeforeUpstream(t *testing.T) {
-	t.Parallel()
-	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{{
-		ID: "mod-1234567890abcdef", Enabled: true, Hosts: []string{"api.example.com"},
-		Headers: []HeaderRule{{ID: "header-001", Pattern: `^https://api\.example\.com/`, Operation: "delete", Header: "Cookie"}, {
-			ID: "header-002", Pattern: `^https://api\.example\.com/`, Operation: "replace", Header: "User-Agent", Value: "5gpn-test",
-		}},
-	}}}
-	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/path", nil)
-	request.Header.Set("Cookie", "secret=1")
-	request.Header.Set("User-Agent", "original")
-	proxy := &interceptProxy{scripts: newScriptRuntime()}
-	outbound, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), request, cfg, "api.example.com")
-	if err != nil || handled {
-		t.Fatalf("prepare request handled=%v err=%v", handled, err)
-	}
-	if outbound.Header.Get("Cookie") != "" || outbound.Header.Get("User-Agent") != "5gpn-test" {
-		t.Fatalf("rewritten headers = %v", outbound.Header)
-	}
-}
-
-func TestPlainHTTPRequestKeepsHTTPUpstreamScheme(t *testing.T) {
-	t.Parallel()
-	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{{ID: "mod-1234567890abcdef", Enabled: true, Hosts: []string{"api.example.com"}}}}
-	request := httptest.NewRequest(http.MethodGet, "http://api.example.com/path", nil)
-	proxy := &interceptProxy{scripts: newScriptRuntime()}
-	outbound, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), request, cfg, "api.example.com")
-	if err != nil || handled {
-		t.Fatalf("prepare request handled=%v err=%v", handled, err)
-	}
-	if outbound.URL.Scheme != "http" || outbound.URL.Hostname() != "api.example.com" {
-		t.Fatalf("plain HTTP outbound URL = %s", outbound.URL)
-	}
-	if !allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 80}) ||
-		!allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 443}) ||
-		allowedInboundSOCKSTarget(cfg, socksTarget{Host: "api.example.com", Port: 8080}) {
-		t.Fatal("SOCKS target port boundary is not limited to HTTP/HTTPS")
-	}
-}
-
-func TestBodyBufferAdmissionFailsClosed(t *testing.T) {
-	t.Parallel()
-	proxy := &interceptProxy{bodySlots: make(chan struct{}, 2)}
-	if !proxy.acquireBodySlot() || !proxy.acquireBodySlot() || proxy.acquireBodySlot() {
-		t.Fatal("body-buffer admission did not enforce its fixed capacity")
-	}
-	proxy.releaseBodySlot()
-	if !proxy.acquireBodySlot() {
-		t.Fatal("body-buffer capacity was not released")
-	}
+func testLengthField(number uint64, value []byte) []byte {
+	output := testEncodeVarint(number<<3 | 2)
+	output = append(output, testEncodeVarint(uint64(len(value)))...)
+	return append(output, value...)
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -22,7 +23,7 @@ func main() {
 	flags := flag.NewFlagSet("5gpn-intercept", flag.ExitOnError)
 	configPath := flags.String("config", "/etc/5gpn/intercept/config.json", "path to the interception configuration")
 	checkConfig := flags.Bool("check-config", false, "validate the configuration and exit")
-	checkEnabled := flags.Bool("check-enabled", false, "exit successfully only when MITM is enabled")
+	checkEnabled := flags.Bool("check-enabled", false, "exit successfully only when MITM and at least one extension are enabled")
 	printMihomoFields := flags.Bool("print-mihomo-fields", false, "print tab-separated mihomo credentials and exit")
 	printCertificateHosts := flags.Bool("print-certificate-hosts", false, "print the canonical certificate SAN list and exit")
 	printCertificateDigest := flags.Bool("print-certificate-digest", false, "print the canonical certificate SAN digest and exit")
@@ -67,25 +68,29 @@ func main() {
 		return
 	}
 	if *checkEnabled {
-		if !cfg.MITM.Enabled {
+		if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
 			os.Exit(3)
 		}
 		return
 	}
 	if *healthcheck {
-		if !cfg.MITM.Enabled {
-			log.Fatal("intercept: healthcheck unavailable while MITM is disabled")
+		if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
+			log.Fatal("intercept: healthcheck unavailable without an active extension")
+		}
+		host := activeHostPatterns(cfg)[0]
+		if strings.HasPrefix(host, "*.") {
+			host = "probe." + strings.TrimPrefix(host, "*.")
 		}
 		proxy := ProxyConfig{Address: cfg.Listen, Username: cfg.Username, Password: cfg.Password}
-		conn, err := dialSOCKS5UDP(context.Background(), proxy, socksTarget{Host: "gs-loc.apple.com", Port: 443})
+		conn, err := dialSOCKS5UDP(context.Background(), proxy, socksTarget{Host: host, Port: 443})
 		if err != nil {
 			log.Fatalf("intercept: healthcheck failed: %v", err)
 		}
 		_ = conn.Close()
 		return
 	}
-	if !cfg.MITM.Enabled {
-		log.Print("intercept: MITM is disabled; service will remain stopped")
+	if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
+		log.Print("intercept: no active interception extension; service will remain stopped")
 		return
 	}
 	certificates, err := newCertificateStore(store)
@@ -120,8 +125,8 @@ func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.
 				log.Printf("intercept: could not refresh MITM state: %v", err)
 				continue
 			}
-			if !cfg.MITM.Enabled {
-				log.Print("intercept: MITM disabled by configuration; stopping service")
+			if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
+				log.Print("intercept: no active interception extension; stopping service")
 				stop()
 				return
 			}

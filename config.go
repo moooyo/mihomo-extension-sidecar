@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -21,10 +22,10 @@ import (
 	"github.com/dop251/goja"
 )
 
-const configVersion = 2
+const configVersion = 3
 const maxConfigBytes = 16 << 20
 
-var builtInWLOCHosts = []string{"gs-loc.apple.com", "gs-loc-cn.apple.com"}
+var nativeExtensionIDPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])$`)
 
 type Config struct {
 	Version       int          `json:"version"`
@@ -35,7 +36,6 @@ type Config struct {
 	TLSKey        string       `json:"tls_key"`
 	UpstreamProxy ProxyConfig  `json:"upstream_proxy"`
 	MITM          MITMSettings `json:"mitm"`
-	WLOC          WLOCSettings `json:"wloc"`
 	Modules       []Module     `json:"modules,omitempty"`
 }
 
@@ -51,79 +51,69 @@ type MITMSettings struct {
 	QUICFallbackProtection bool `json:"quic_fallback_protection"`
 }
 
-type WLOCSettings struct {
-	Enabled      bool     `json:"enabled"`
-	Longitude    *float64 `json:"longitude"`
-	Latitude     *float64 `json:"latitude"`
-	Accuracy     uint32   `json:"accuracy"`
-	FailClosed   bool     `json:"fail_closed"`
-	MaxBodyBytes int64    `json:"max_body_bytes"`
-}
-
 type ModuleSource struct {
 	URL    string `json:"url,omitempty"`
 	Digest string `json:"digest"`
 	Body   string `json:"body"`
 }
 
-type ScriptRule struct {
-	ID           string `json:"id"`
-	Phase        string `json:"phase"`
-	Pattern      string `json:"pattern"`
-	ScriptURL    string `json:"script_url,omitempty"`
-	ScriptDigest string `json:"script_digest"`
-	ScriptBody   string `json:"script_body"`
-	RequiresBody bool   `json:"requires_body"`
-	BinaryBody   bool   `json:"binary_body"`
-	TimeoutMS    int    `json:"timeout_ms"`
-	MaxBodyBytes int64  `json:"max_body_bytes"`
-	Argument     string `json:"argument,omitempty"`
+type ActionMatch struct {
+	Hosts       []string `json:"hosts"`
+	Schemes     []string `json:"schemes"`
+	Methods     []string `json:"methods,omitempty"`
+	PathRegex   string   `json:"path_regex"`
+	StatusCodes []int    `json:"status_codes,omitempty"`
 }
 
-type ModuleParameter struct {
-	Key     string   `json:"key"`
-	Kind    string   `json:"kind"`
-	Options []string `json:"options,omitempty"`
-	Value   string   `json:"value,omitempty"`
+type ScriptRule struct {
+	ID           string      `json:"id"`
+	Phase        string      `json:"phase"`
+	Match        ActionMatch `json:"match"`
+	ScriptURL    string      `json:"script_url,omitempty"`
+	ScriptDigest string      `json:"script_digest"`
+	ScriptBody   string      `json:"script_body"`
+	BodyMode     string      `json:"body_mode"`
+	TimeoutMS    int         `json:"timeout_ms"`
+	MaxBodyBytes int64       `json:"max_body_bytes"`
+}
+
+type LocationValue struct {
+	Longitude *float64 `json:"longitude,omitempty"`
+	Latitude  *float64 `json:"latitude,omitempty"`
+	Accuracy  uint32   `json:"accuracy"`
+}
+
+type ModuleSetting struct {
+	Key         string          `json:"key"`
+	Type        string          `json:"type"`
+	Label       string          `json:"label,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Required    bool            `json:"required"`
+	Options     []string        `json:"options,omitempty"`
+	Min         *float64        `json:"min,omitempty"`
+	Max         *float64        `json:"max,omitempty"`
+	Default     json.RawMessage `json:"default,omitempty"`
+	Value       json.RawMessage `json:"value,omitempty"`
 }
 
 type HostMapping struct {
-	Pattern string `json:"pattern"`
+	Pattern string `json:"host"`
 	Target  string `json:"target"`
 }
 
-type RewriteRule struct {
-	ID          string `json:"id"`
-	Pattern     string `json:"pattern"`
-	Replacement string `json:"replacement,omitempty"`
-	Action      string `json:"action"`
-}
-
-type HeaderRule struct {
-	ID        string `json:"id"`
-	Pattern   string `json:"pattern"`
-	Operation string `json:"operation"`
-	Header    string `json:"header"`
-	Value     string `json:"value,omitempty"`
-}
-
 type Module struct {
-	ID             string            `json:"id"`
-	Name           string            `json:"name"`
-	Description    string            `json:"description,omitempty"`
-	Enabled        bool              `json:"enabled"`
-	Argument       string            `json:"argument,omitempty"`
-	ImportedAt     string            `json:"imported_at"`
-	Source         ModuleSource      `json:"source"`
-	Hosts          []string          `json:"hosts"`
-	HostMappings   []HostMapping     `json:"host_mappings,omitempty"`
-	Parameters     []ModuleParameter `json:"parameters,omitempty"`
-	Scripts        []ScriptRule      `json:"scripts,omitempty"`
-	Rewrites       []RewriteRule     `json:"rewrites,omitempty"`
-	Headers        []HeaderRule      `json:"headers,omitempty"`
-	Unsupported    []string          `json:"unsupported,omitempty"`
-	Incompatible   []string          `json:"incompatible,omitempty"`
-	PartialAllowed bool              `json:"partial_allowed"`
+	ID                string          `json:"id"`
+	Version           string          `json:"extension_version"`
+	Name              string          `json:"name"`
+	Description       string          `json:"description,omitempty"`
+	Enabled           bool            `json:"enabled"`
+	ImportedAt        string          `json:"imported_at"`
+	Source            ModuleSource    `json:"source"`
+	CaptureHosts      []string        `json:"capture_hosts"`
+	HostMappings      []HostMapping   `json:"upstream_mappings,omitempty"`
+	Settings          []ModuleSetting `json:"settings,omitempty"`
+	Scripts           []ScriptRule    `json:"actions,omitempty"`
+	PersistentStorage bool            `json:"persistent_storage"`
 }
 
 func loadConfig(path string) (Config, error) {
@@ -134,13 +124,13 @@ func loadConfig(path string) (Config, error) {
 	if err := rejectDuplicateJSONKeys(body); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
 	var cfg Config
-	if err := dec.Decode(&cfg); err != nil {
+	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
-	if err := requireJSONEOF(dec); err != nil {
+	if err := requireJSONEOF(decoder); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -248,9 +238,9 @@ func scanJSONValue(decoder *json.Decoder) error {
 	}
 }
 
-func requireJSONEOF(dec *json.Decoder) error {
+func requireJSONEOF(decoder *json.Decoder) error {
 	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return errors.New("config contains multiple JSON values")
 		}
@@ -272,43 +262,20 @@ func (c Config) Validate() error {
 	if c.Listen != "127.0.0.1:18080" || c.UpstreamProxy.Address != "127.0.0.1:17890" {
 		return errors.New("SOCKS addresses do not match the fixed loopback boundary")
 	}
-	if len(c.Username) < 16 || len(c.Password) < 24 {
-		return errors.New("inbound SOCKS credentials are too short")
+	if len(c.Username) < 16 || len(c.Password) < 24 || len(c.Username) > 255 || len(c.Password) > 255 {
+		return errors.New("inbound SOCKS credentials have an invalid length")
 	}
-	if len(c.Username) > 255 || len(c.Password) > 255 {
-		return errors.New("inbound SOCKS credentials are too long")
-	}
-	if len(c.UpstreamProxy.Username) < 16 || len(c.UpstreamProxy.Password) < 24 {
-		return errors.New("upstream SOCKS credentials are too short")
-	}
-	if len(c.UpstreamProxy.Username) > 255 || len(c.UpstreamProxy.Password) > 255 {
-		return errors.New("upstream SOCKS credentials are too long")
+	if len(c.UpstreamProxy.Username) < 16 || len(c.UpstreamProxy.Password) < 24 || len(c.UpstreamProxy.Username) > 255 || len(c.UpstreamProxy.Password) > 255 {
+		return errors.New("upstream SOCKS credentials have an invalid length")
 	}
 	if strings.TrimSpace(c.TLSCert) == "" || strings.TrimSpace(c.TLSKey) == "" {
 		return errors.New("tls_cert and tls_key are required")
-	}
-	if c.WLOC.Accuracy == 0 || c.WLOC.Accuracy > 100000 {
-		return errors.New("wloc.accuracy must be between 1 and 100000")
-	}
-	if c.WLOC.MaxBodyBytes < 1024 || c.WLOC.MaxBodyBytes > 64<<20 {
-		return errors.New("wloc.max_body_bytes must be between 1024 and 67108864")
-	}
-	if c.WLOC.Enabled {
-		if c.WLOC.Longitude == nil || c.WLOC.Latitude == nil {
-			return errors.New("enabled WLOC interception requires longitude and latitude")
-		}
-		if *c.WLOC.Longitude < -180 || *c.WLOC.Longitude > 180 {
-			return errors.New("wloc.longitude must be between -180 and 180")
-		}
-		if *c.WLOC.Latitude < -90 || *c.WLOC.Latitude > 90 {
-			return errors.New("wloc.latitude must be between -90 and 90")
-		}
 	}
 	if err := validateModules(c.Modules); err != nil {
 		return err
 	}
 	if len(certificateHostPatterns(c)) > 256 {
-		return errors.New("enabled interception modules exceed 256 unique certificate hosts")
+		return errors.New("enabled interception extensions exceed 256 unique certificate hosts")
 	}
 	return nil
 }
@@ -321,28 +288,28 @@ func (c Config) ValidateCertificateRequest() error {
 		return errors.New("TLS paths do not match the fixed interception runtime boundary")
 	}
 	if len(c.Modules) > 64 {
-		return errors.New("at most 64 interception modules are allowed")
+		return errors.New("at most 64 interception extensions are allowed")
 	}
 	ids := make(map[string]struct{}, len(c.Modules))
 	for _, module := range c.Modules {
 		if _, duplicate := ids[module.ID]; duplicate {
-			return fmt.Errorf("duplicate module id %q", module.ID)
+			return fmt.Errorf("duplicate extension id %q", module.ID)
 		}
 		ids[module.ID] = struct{}{}
 		if !module.Enabled {
 			continue
 		}
-		if !validModuleID(module.ID) || len(module.Hosts) == 0 || len(module.Hosts) > 256 {
-			return fmt.Errorf("enabled module %q has invalid identity or host count", module.ID)
+		if !validModuleID(module.ID) || len(module.CaptureHosts) == 0 || len(module.CaptureHosts) > 256 {
+			return fmt.Errorf("enabled extension %q has invalid identity or capture host count", module.ID)
 		}
-		for _, host := range module.Hosts {
+		for _, host := range module.CaptureHosts {
 			if !validHostPattern(host) {
-				return fmt.Errorf("enabled module %q has invalid host %q", module.ID, host)
+				return fmt.Errorf("enabled extension %q has invalid capture host %q", module.ID, host)
 			}
 		}
 	}
 	if len(certificateHostPatterns(c)) > 256 {
-		return errors.New("enabled interception modules exceed 256 unique certificate hosts")
+		return errors.New("enabled interception extensions exceed 256 unique certificate hosts")
 	}
 	return nil
 }
@@ -378,10 +345,7 @@ func canonicalHost(value string) string {
 }
 
 func allowedInboundSOCKSTarget(cfg Config, target socksTarget) bool {
-	if !cfg.MITM.Enabled {
-		return false
-	}
-	if target.Port != 80 && target.Port != 443 {
+	if !cfg.MITM.Enabled || (target.Port != 80 && target.Port != 443) {
 		return false
 	}
 	return activeInterceptHost(cfg, target.Host) || net.ParseIP(target.Host) != nil
@@ -401,16 +365,27 @@ func activeHostPatterns(cfg Config) []string {
 	if !cfg.MITM.Enabled {
 		return nil
 	}
-	patterns := make([]string, 0, len(builtInWLOCHosts)+16)
-	if cfg.WLOC.Enabled {
-		patterns = append(patterns, builtInWLOCHosts...)
-	}
+	patterns := make([]string, 0, 16)
 	for _, module := range cfg.Modules {
 		if module.Enabled {
-			patterns = append(patterns, module.Hosts...)
+			patterns = append(patterns, module.CaptureHosts...)
 		}
 	}
 	return uniqueSorted(patterns)
+}
+
+func hasActiveExtensions(cfg Config) bool {
+	return len(activeHostPatterns(cfg)) > 0
+}
+
+func moduleOwnsHost(module Module, host string) bool {
+	host = canonicalHost(host)
+	for _, pattern := range module.CaptureHosts {
+		if matchHostPattern(pattern, host) {
+			return true
+		}
+	}
+	return false
 }
 
 func mappedInterceptTarget(cfg Config, host string) string {
@@ -418,7 +393,7 @@ func mappedInterceptTarget(cfg Config, host string) string {
 	bestPattern := ""
 	target := host
 	for _, module := range cfg.Modules {
-		if !module.Enabled {
+		if !module.Enabled || !moduleOwnsHost(module, host) {
 			continue
 		}
 		for _, mapping := range module.HostMappings {
@@ -435,10 +410,10 @@ func mappedInterceptTarget(cfg Config, host string) string {
 }
 
 func certificateHostPatterns(cfg Config) []string {
-	patterns := append([]string(nil), builtInWLOCHosts...)
+	patterns := make([]string, 0, 16)
 	for _, module := range cfg.Modules {
 		if module.Enabled {
-			patterns = append(patterns, module.Hosts...)
+			patterns = append(patterns, module.CaptureHosts...)
 		}
 	}
 	return uniqueSorted(patterns)
@@ -452,126 +427,114 @@ func matchHostPattern(pattern, host string) bool {
 	return host == pattern
 }
 
+func hostPatternCovers(allowed, candidate string) bool {
+	if allowed == candidate {
+		return true
+	}
+	if !strings.HasPrefix(allowed, "*.") {
+		return false
+	}
+	base := strings.TrimPrefix(allowed, "*.")
+	candidateBase := strings.TrimPrefix(candidate, "*.")
+	return strings.HasSuffix(candidateBase, "."+base)
+}
+
+func hostCoveredBy(patterns []string, candidate string) bool {
+	for _, pattern := range patterns {
+		if hostPatternCovers(pattern, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateModules(modules []Module) error {
 	if len(modules) > 64 {
-		return errors.New("at most 64 interception modules are allowed")
+		return errors.New("at most 64 interception extensions are allowed")
 	}
 	ids := make(map[string]struct{}, len(modules))
 	activeMappings := make(map[string]string)
 	for index, module := range modules {
 		if !validModuleID(module.ID) {
-			return fmt.Errorf("module %d has an invalid id", index)
+			return fmt.Errorf("extension %d has an invalid id", index)
 		}
 		if _, exists := ids[module.ID]; exists {
-			return fmt.Errorf("duplicate module id %q", module.ID)
+			return fmt.Errorf("duplicate extension id %q", module.ID)
 		}
 		ids[module.ID] = struct{}{}
 		if _, err := time.Parse(time.RFC3339, module.ImportedAt); err != nil {
-			return fmt.Errorf("module %q imported_at is invalid", module.ID)
+			return fmt.Errorf("extension %q imported_at is invalid", module.ID)
 		}
-		if strings.TrimSpace(module.Name) == "" || len(module.Name) > 128 || len(module.Description) > 1024 || len(module.Argument) > 4096 {
-			return fmt.Errorf("module %q metadata exceeds its bounds", module.ID)
+		if strings.TrimSpace(module.Version) == "" || len(module.Version) > 64 || strings.TrimSpace(module.Name) == "" || len(module.Name) > 128 || len(module.Description) > 1024 {
+			return fmt.Errorf("extension %q metadata exceeds its bounds", module.ID)
 		}
 		if len(module.Source.Body) == 0 || len(module.Source.Body) > 2<<20 || module.Source.Digest != digestText(module.Source.Body) {
-			return fmt.Errorf("module %q source snapshot digest is invalid", module.ID)
+			return fmt.Errorf("extension %q manifest snapshot digest is invalid", module.ID)
 		}
-		if len(module.Source.URL) > 4096 {
-			return fmt.Errorf("module %q source URL is too long", module.ID)
+		if len(module.Source.URL) > 4096 || (module.Source.URL != "" && !validSnapshotURL(module.Source.URL)) {
+			return fmt.Errorf("extension %q source URL is invalid", module.ID)
 		}
-		if module.Source.URL != "" && !validSnapshotURL(module.Source.URL) {
-			return fmt.Errorf("module %q source URL is invalid", module.ID)
+		if len(module.CaptureHosts) == 0 || len(module.CaptureHosts) > 256 || !sort.StringsAreSorted(module.CaptureHosts) {
+			return fmt.Errorf("extension %q capture_hosts are invalid", module.ID)
 		}
-		if len(module.Hosts) > 256 {
-			return fmt.Errorf("module %q exceeds 256 hosts", module.ID)
-		}
-		for _, host := range module.Hosts {
+		for _, host := range module.CaptureHosts {
 			if !validHostPattern(host) {
-				return fmt.Errorf("module %q has an invalid host %q", module.ID, host)
+				return fmt.Errorf("extension %q has an invalid capture host %q", module.ID, host)
 			}
 		}
-		if len(module.Scripts)+len(module.Rewrites)+len(module.Headers) > 256 {
-			return fmt.Errorf("module %q has an invalid action count", module.ID)
+		if len(module.Scripts)+len(module.HostMappings) == 0 || len(module.Scripts)+len(module.HostMappings) > 256 {
+			return fmt.Errorf("extension %q has an invalid action count", module.ID)
 		}
-		if err := validateModuleParameters(module.Parameters); err != nil {
-			return fmt.Errorf("module %q: %w", module.ID, err)
+		if err := validateModuleSettings(module.Settings, module.Enabled); err != nil {
+			return fmt.Errorf("extension %q: %w", module.ID, err)
 		}
-		if err := validateHostMappings(module.HostMappings); err != nil {
-			return fmt.Errorf("module %q: %w", module.ID, err)
-		}
-		if len(module.Unsupported) > 64 || len(module.Incompatible) > 64 {
-			return fmt.Errorf("module %q compatibility report is too large", module.ID)
-		}
-		if module.Enabled {
-			if len(module.Hosts) == 0 || len(module.Scripts)+len(module.Rewrites)+len(module.Headers) == 0 {
-				return fmt.Errorf("module %q has no runnable interception actions", module.ID)
-			}
-			if len(module.Incompatible) > 0 {
-				return fmt.Errorf("module %q is incompatible", module.ID)
-			}
-			if !moduleParametersReady(module.Parameters) {
-				return fmt.Errorf("module %q parameters are not configured", module.ID)
-			}
+		if err := validateHostMappings(module.CaptureHosts, module.HostMappings); err != nil {
+			return fmt.Errorf("extension %q: %w", module.ID, err)
 		}
 		total := 0
+		actionIDs := make(map[string]struct{}, len(module.Scripts))
 		for _, rule := range module.Scripts {
+			if !validSettingKey(rule.ID) {
+				return fmt.Errorf("extension %q has an invalid action id", module.ID)
+			}
+			if _, duplicate := actionIDs[rule.ID]; duplicate {
+				return fmt.Errorf("extension %q has duplicate action %q", module.ID, rule.ID)
+			}
+			actionIDs[rule.ID] = struct{}{}
 			if rule.Phase != "request" && rule.Phase != "response" {
-				return fmt.Errorf("module %q script phase is invalid", module.ID)
+				return fmt.Errorf("extension %q action %q phase is invalid", module.ID, rule.ID)
 			}
-			if len(rule.ScriptURL) > 4096 {
-				return fmt.Errorf("module %q script URL is too long", module.ID)
+			if err := validateActionMatch(module.CaptureHosts, rule.Phase, rule.Match); err != nil {
+				return fmt.Errorf("extension %q action %q: %w", module.ID, rule.ID, err)
 			}
-			if !validSnapshotURL(rule.ScriptURL) {
-				return fmt.Errorf("module %q script URL is invalid", module.ID)
-			}
-			if _, err := regexp.Compile(rule.Pattern); err != nil {
-				return fmt.Errorf("module %q script pattern is invalid: %w", module.ID, err)
+			if len(rule.ScriptURL) > 4096 || (rule.ScriptURL != "" && !validSnapshotURL(rule.ScriptURL)) {
+				return fmt.Errorf("extension %q action %q URL is invalid", module.ID, rule.ID)
 			}
 			if len(rule.ScriptBody) == 0 || len(rule.ScriptBody) > 1<<20 || rule.ScriptDigest != digestText(rule.ScriptBody) {
-				return fmt.Errorf("module %q script snapshot digest is invalid", module.ID)
+				return fmt.Errorf("extension %q action %q script snapshot is invalid", module.ID, rule.ID)
 			}
-			if _, err := goja.Compile(rule.ScriptURL, rule.ScriptBody, false); err != nil {
-				return fmt.Errorf("module %q script source does not compile: %w", module.ID, err)
+			filename := firstNonEmpty(rule.ScriptURL, "extension:"+module.ID+"/"+rule.ID)
+			if _, err := goja.Compile(filename, rule.ScriptBody, false); err != nil {
+				return fmt.Errorf("extension %q action %q script does not compile: %w", module.ID, rule.ID, err)
+			}
+			if rule.BodyMode != "none" && rule.BodyMode != "text" && rule.BodyMode != "binary" {
+				return fmt.Errorf("extension %q action %q body mode is invalid", module.ID, rule.ID)
 			}
 			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
-				return fmt.Errorf("module %q script limits are invalid", module.ID)
+				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
 			}
 			total += len(rule.ScriptBody)
 		}
 		if total > 8<<20 {
-			return fmt.Errorf("module %q script snapshots exceed 8388608 bytes", module.ID)
-		}
-		for _, rule := range module.Rewrites {
-			if _, err := regexp.Compile(rule.Pattern); err != nil {
-				return fmt.Errorf("module %q rewrite pattern is invalid: %w", module.ID, err)
-			}
-			if rule.Action != "reject" && rule.Action != "reject-200" && rule.Action != "reject-dict" && rule.Action != "reject-array" && rule.Action != "reject-img" && rule.Action != "reject-drop" && rule.Action != "rewrite" && rule.Action != "redirect-302" && rule.Action != "redirect-307" {
-				return fmt.Errorf("module %q rewrite action is invalid", module.ID)
-			}
-			if (rule.Action == "rewrite" || rule.Action == "redirect-302" || rule.Action == "redirect-307") && strings.TrimSpace(rule.Replacement) == "" {
-				return fmt.Errorf("module %q rewrite replacement is missing", module.ID)
-			}
-		}
-		for _, rule := range module.Headers {
-			if _, err := regexp.Compile(rule.Pattern); err != nil || !validHeaderName(rule.Header) {
-				return fmt.Errorf("module %q header rewrite is invalid", module.ID)
-			}
-			switch rule.Operation {
-			case "delete":
-			case "add", "replace":
-				if strings.ContainsAny(rule.Value, "\r\n") {
-					return fmt.Errorf("module %q header value is invalid", module.ID)
-				}
-			default:
-				return fmt.Errorf("module %q header operation is invalid", module.ID)
-			}
-		}
-		if module.Enabled && len(module.Unsupported) > 0 && !module.PartialAllowed {
-			return fmt.Errorf("module %q needs partial compatibility acknowledgement", module.ID)
+			return fmt.Errorf("extension %q script snapshots exceed 8388608 bytes", module.ID)
 		}
 		if module.Enabled {
+			if !moduleSettingsReady(module.Settings) {
+				return fmt.Errorf("extension %q required settings are not configured", module.ID)
+			}
 			for _, mapping := range module.HostMappings {
 				if target, exists := activeMappings[mapping.Pattern]; exists && target != mapping.Target {
-					return fmt.Errorf("enabled modules conflict on host mapping %q", mapping.Pattern)
+					return fmt.Errorf("enabled extensions conflict on upstream mapping %q", mapping.Pattern)
 				}
 				activeMappings[mapping.Pattern] = mapping.Target
 			}
@@ -580,45 +543,206 @@ func validateModules(modules []Module) error {
 	return nil
 }
 
-func validateModuleParameters(parameters []ModuleParameter) error {
-	seen := make(map[string]struct{}, len(parameters))
-	for _, parameter := range parameters {
-		if !validParameterKey(parameter.Key) || len(parameter.Value) > 4096 {
-			return fmt.Errorf("parameter %q is invalid", parameter.Key)
+func validateActionMatch(captureHosts []string, phase string, match ActionMatch) error {
+	if len(match.Hosts) == 0 || len(match.Schemes) == 0 || match.PathRegex == "" {
+		return errors.New("match hosts, schemes, and path_regex are required")
+	}
+	for _, host := range match.Hosts {
+		if !validHostPattern(host) || !hostCoveredBy(captureHosts, host) {
+			return fmt.Errorf("match host %q is outside capture_hosts", host)
 		}
-		if _, duplicate := seen[parameter.Key]; duplicate {
-			return fmt.Errorf("parameter %q is duplicated", parameter.Key)
+	}
+	for _, scheme := range match.Schemes {
+		if scheme != "http" && scheme != "https" {
+			return fmt.Errorf("scheme %q is unsupported", scheme)
 		}
-		seen[parameter.Key] = struct{}{}
-		switch parameter.Kind {
-		case "input":
-			if len(parameter.Options) != 0 {
-				return fmt.Errorf("input parameter %q has options", parameter.Key)
-			}
-		case "select":
-			if len(parameter.Options) == 0 || len(parameter.Options) > 64 {
-				return fmt.Errorf("select parameter %q has invalid options", parameter.Key)
-			}
-			found := parameter.Value == ""
-			for _, option := range parameter.Options {
-				if option == "" || len(option) > 256 {
-					return fmt.Errorf("select parameter %q has an invalid option", parameter.Key)
-				}
-				if option == parameter.Value {
-					found = true
-				}
-			}
-			if !found {
-				return fmt.Errorf("select parameter %q value is invalid", parameter.Key)
-			}
-		default:
-			return fmt.Errorf("parameter %q has an invalid kind", parameter.Key)
+	}
+	for _, method := range match.Methods {
+		if method == "" || method != strings.ToUpper(method) || strings.ContainsAny(method, " \t\r\n") {
+			return fmt.Errorf("method %q is invalid", method)
+		}
+	}
+	if _, err := regexp.Compile(match.PathRegex); err != nil {
+		return fmt.Errorf("path_regex is invalid: %w", err)
+	}
+	if phase == "request" && len(match.StatusCodes) > 0 {
+		return errors.New("request action cannot match response status codes")
+	}
+	for _, status := range match.StatusCodes {
+		if status < 100 || status > 599 {
+			return fmt.Errorf("status code %d is invalid", status)
 		}
 	}
 	return nil
 }
 
-func validParameterKey(value string) bool {
+func validateModuleSettings(settings []ModuleSetting, requireReady bool) error {
+	if len(settings) > 128 {
+		return errors.New("extension exceeds 128 settings")
+	}
+	seen := make(map[string]struct{}, len(settings))
+	for _, setting := range settings {
+		if !validSettingKey(setting.Key) {
+			return fmt.Errorf("setting %q has an invalid key", setting.Key)
+		}
+		if _, duplicate := seen[setting.Key]; duplicate {
+			return fmt.Errorf("setting %q is duplicated", setting.Key)
+		}
+		seen[setting.Key] = struct{}{}
+		if len(setting.Label) > 128 || len(setting.Description) > 512 {
+			return fmt.Errorf("setting %q metadata exceeds its bounds", setting.Key)
+		}
+		if err := validateSettingDefinition(setting); err != nil {
+			return fmt.Errorf("setting %q: %w", setting.Key, err)
+		}
+		if requireReady && setting.Required && !settingReady(setting) {
+			return fmt.Errorf("required setting %q is not configured", setting.Key)
+		}
+	}
+	return nil
+}
+
+func validateSettingDefinition(setting ModuleSetting) error {
+	switch setting.Type {
+	case "text":
+		if len(setting.Options) > 0 || setting.Min != nil || setting.Max != nil {
+			return errors.New("text setting has incompatible constraints")
+		}
+	case "select":
+		if len(setting.Options) == 0 || len(setting.Options) > 64 || setting.Min != nil || setting.Max != nil {
+			return errors.New("select setting has invalid options or constraints")
+		}
+		seen := make(map[string]struct{}, len(setting.Options))
+		for _, option := range setting.Options {
+			if option == "" || len(option) > 256 {
+				return errors.New("select setting contains an invalid option")
+			}
+			if _, duplicate := seen[option]; duplicate {
+				return errors.New("select setting contains duplicate options")
+			}
+			seen[option] = struct{}{}
+		}
+	case "boolean", "location":
+		if len(setting.Options) > 0 || setting.Min != nil || setting.Max != nil {
+			return errors.New("setting has incompatible constraints")
+		}
+	case "number":
+		if len(setting.Options) > 0 || (setting.Min != nil && setting.Max != nil && *setting.Min > *setting.Max) {
+			return errors.New("number setting has invalid constraints")
+		}
+	default:
+		return fmt.Errorf("setting type %q is unsupported", setting.Type)
+	}
+	if len(setting.Default) > 0 {
+		if err := validateSettingValue(setting, setting.Default, false); err != nil {
+			return fmt.Errorf("default is invalid: %w", err)
+		}
+	}
+	if len(setting.Value) > 0 {
+		if err := validateSettingValue(setting, setting.Value, false); err != nil {
+			return fmt.Errorf("value is invalid: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateSettingValue(setting ModuleSetting, raw json.RawMessage, complete bool) error {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		if complete {
+			return errors.New("value is required")
+		}
+		return nil
+	}
+	if len(raw) > 64<<10 {
+		return errors.New("value exceeds 65536 bytes")
+	}
+	switch setting.Type {
+	case "text", "select":
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil || len(value) > 4096 {
+			return errors.New("value must be a bounded string")
+		}
+		if complete && strings.TrimSpace(value) == "" {
+			return errors.New("value must not be empty")
+		}
+		if setting.Type == "select" && value != "" && !containsString(setting.Options, value) {
+			return errors.New("value is not a declared option")
+		}
+	case "boolean":
+		var value bool
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return errors.New("value must be a boolean")
+		}
+	case "number":
+		var value float64
+		if err := json.Unmarshal(raw, &value); err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+			return errors.New("value must be a finite number")
+		}
+		if (setting.Min != nil && value < *setting.Min) || (setting.Max != nil && value > *setting.Max) {
+			return errors.New("value is outside its numeric bounds")
+		}
+	case "location":
+		var value LocationValue
+		if err := unmarshalStrictRaw(raw, &value); err != nil {
+			return fmt.Errorf("value must be a location object: %w", err)
+		}
+		if value.Accuracy == 0 || value.Accuracy > 100000 || (value.Longitude == nil) != (value.Latitude == nil) {
+			return errors.New("location coordinates or accuracy are invalid")
+		}
+		if value.Longitude != nil && (*value.Longitude < -180 || *value.Longitude > 180 || math.IsNaN(*value.Longitude) || math.IsInf(*value.Longitude, 0)) {
+			return errors.New("longitude is invalid")
+		}
+		if value.Latitude != nil && (*value.Latitude < -90 || *value.Latitude > 90 || math.IsNaN(*value.Latitude) || math.IsInf(*value.Latitude, 0)) {
+			return errors.New("latitude is invalid")
+		}
+		if complete && value.Longitude == nil {
+			return errors.New("coordinates are required")
+		}
+	}
+	return nil
+}
+
+func unmarshalStrictRaw(raw []byte, target any) error {
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func settingReady(setting ModuleSetting) bool {
+	return validateSettingValue(setting, setting.Value, true) == nil
+}
+
+func moduleSettingsReady(settings []ModuleSetting) bool {
+	for _, setting := range settings {
+		if setting.Required && !settingReady(setting) {
+			return false
+		}
+	}
+	return true
+}
+
+func moduleSettingValues(module Module) (map[string]any, error) {
+	values := make(map[string]any, len(module.Settings))
+	for _, setting := range module.Settings {
+		if len(setting.Value) == 0 {
+			continue
+		}
+		var value any
+		if err := json.Unmarshal(setting.Value, &value); err != nil {
+			return nil, fmt.Errorf("decode setting %q: %w", setting.Key, err)
+		}
+		values[setting.Key] = value
+	}
+	return values, nil
+}
+
+func validSettingKey(value string) bool {
 	if len(value) == 0 || len(value) > 64 {
 		return false
 	}
@@ -631,23 +755,14 @@ func validParameterKey(value string) bool {
 	return true
 }
 
-func moduleParametersReady(parameters []ModuleParameter) bool {
-	for _, parameter := range parameters {
-		if strings.TrimSpace(parameter.Value) == "" {
-			return false
-		}
-	}
-	return true
-}
-
-func validateHostMappings(mappings []HostMapping) error {
+func validateHostMappings(captureHosts []string, mappings []HostMapping) error {
 	seen := make(map[string]struct{}, len(mappings))
 	for _, mapping := range mappings {
-		if !validHostPattern(mapping.Pattern) || !validHostTarget(mapping.Target) {
-			return fmt.Errorf("host mapping %q is invalid", mapping.Pattern)
+		if !validHostPattern(mapping.Pattern) || !hostCoveredBy(captureHosts, mapping.Pattern) || !validHostTarget(mapping.Target) {
+			return fmt.Errorf("upstream mapping %q is invalid or outside capture_hosts", mapping.Pattern)
 		}
 		if _, duplicate := seen[mapping.Pattern]; duplicate {
-			return fmt.Errorf("host mapping %q is duplicated", mapping.Pattern)
+			return fmt.Errorf("upstream mapping %q is duplicated", mapping.Pattern)
 		}
 		seen[mapping.Pattern] = struct{}{}
 	}
@@ -663,37 +778,12 @@ func validHostTarget(value string) bool {
 }
 
 func validModuleID(id string) bool {
-	if len(id) < 20 || len(id) > 36 || !strings.HasPrefix(id, "mod-") {
-		return false
-	}
-	suffix := id[4:]
-	if suffix[0] == '-' || suffix[len(suffix)-1] == '-' {
-		return false
-	}
-	for _, r := range suffix {
-		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
-			return false
-		}
-	}
-	return true
+	return len(id) >= 3 && len(id) <= 40 && nativeExtensionIDPattern.MatchString(id)
 }
 
 func validSnapshotURL(raw string) bool {
 	u, err := url.Parse(raw)
 	return err == nil && u.Scheme == "https" && u.Hostname() != "" && u.User == nil && u.Fragment == ""
-}
-
-func validHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", r) {
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 func validHostPattern(pattern string) bool {
@@ -730,6 +820,24 @@ func uniqueSorted(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func digestText(value string) string {

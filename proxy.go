@@ -10,7 +10,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,7 +38,7 @@ func newInterceptProxy(config *configStore, certificates *certificateStore) *int
 func (p *interceptProxy) Serve(ctx context.Context, listener net.Listener) error {
 	var connections sync.WaitGroup
 	defer connections.Wait()
-	go p.pruneModuleState(ctx)
+	go p.pruneExtensionState(ctx)
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
@@ -71,7 +70,7 @@ func (p *interceptProxy) Serve(ctx context.Context, listener net.Listener) error
 	}
 }
 
-func (p *interceptProxy) pruneModuleState(ctx context.Context) {
+func (p *interceptProxy) pruneExtensionState(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -102,7 +101,7 @@ func (p *interceptProxy) handleSOCKSConnection(ctx context.Context, conn net.Con
 	case socksCommandConnect:
 		if !allowedInboundSOCKSTarget(cfg, target) {
 			_ = writeSOCKSReply(conn, 2, nil)
-			return errors.New("SOCKS CONNECT target is outside the active module allowlist")
+			return errors.New("SOCKS CONNECT target is outside the active extension allowlist")
 		}
 		if err := writeSOCKSReply(conn, 0, conn.LocalAddr()); err != nil {
 			return err
@@ -274,11 +273,7 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unrecognized interception host", http.StatusMisdirectedRequest)
 		return
 	}
-	scheme := "http"
-	if r.TLS != nil || r.ProtoMajor == 3 {
-		scheme = "https"
-	}
-	bufferSlot := requestHasPayload(r) || responseTransformationConfigured(cfg, scheme+"://"+host+r.URL.RequestURI())
+	bufferSlot := requestHasPayload(r)
 	if bufferSlot && !p.acquireBodySlot() {
 		http.Error(w, "interception body capacity is busy", http.StatusServiceUnavailable)
 		return
@@ -306,7 +301,11 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer response.Body.Close()
-	if !bufferSlot && responseTransformationConfigured(cfg, outbound.URL.String()) {
+	responseProbe := scriptMessage{
+		URL: outbound.URL.String(), Method: outbound.Method, StatusCode: response.StatusCode,
+		Headers: response.Header,
+	}
+	if !bufferSlot && len(matchingScriptRules(cfg, "response", responseProbe)) > 0 {
 		if !p.acquireBodySlot() {
 			http.Error(w, "interception body capacity is busy", http.StatusServiceUnavailable)
 			return
@@ -357,26 +356,6 @@ func requestHasPayload(request *http.Request) bool {
 	return request != nil && request.Body != nil && (request.ContentLength != 0 || len(request.TransferEncoding) > 0)
 }
 
-func responseTransformationConfigured(cfg Config, requestURL string) bool {
-	if len(matchingScriptRules(cfg, "response", requestURL)) > 0 {
-		return true
-	}
-	parsed, err := url.Parse(requestURL)
-	return err == nil && cfg.WLOC.Enabled && isBuiltInWLOCHost(parsed.Hostname()) && parsed.Path == "/clls/wloc"
-}
-
-func (p *interceptProxy) handlePatchFailure(w http.ResponseWriter, response *http.Response, original []byte, cfg Config, patchErr error) {
-	log.Printf("intercept: WLOC response patch failed: %v", patchErr)
-	if cfg.WLOC.FailClosed || original == nil {
-		http.Error(w, "WLOC response transformation failed", http.StatusBadGateway)
-		return
-	}
-	copyResponseHeaders(w.Header(), response.Header)
-	w.Header().Set("Content-Length", strconv.Itoa(len(original)))
-	w.WriteHeader(response.StatusCode)
-	_, _ = w.Write(original)
-}
-
 func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Response, func(), error) {
 	if request.ProtoMajor == 3 {
 		return roundTripHTTP3(request, cfg, p.upstreamRoots)
@@ -398,7 +377,7 @@ func (p *interceptProxy) newHTTPTransport(cfg Config) *http.Transport {
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 			host, portText, err := net.SplitHostPort(address)
 			if err != nil || !activeInterceptHost(cfg, host) || (portText != "80" && portText != "443") {
-				return nil, errors.New("upstream TCP target is outside the active module allowlist")
+				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
 			}
 			port := 443
 			if portText == "80" {
@@ -431,7 +410,7 @@ func roundTripHTTP3(request *http.Request, cfg Config, roots *x509.CertPool) (*h
 func roundTripHTTP3Version(request *http.Request, cfg Config, roots *x509.CertPool, version quic.Version) (*http.Response, func(), error) {
 	host := canonicalHost(request.URL.Host)
 	if !activeInterceptHost(cfg, host) {
-		return nil, nil, errors.New("upstream QUIC target is outside the active module allowlist")
+		return nil, nil, errors.New("upstream QUIC target is outside the active extension allowlist")
 	}
 	target := socksTarget{Host: mappedInterceptTarget(cfg, host), Port: 443}
 	packetConn, err := dialSOCKS5UDP(request.Context(), cfg.UpstreamProxy, target)

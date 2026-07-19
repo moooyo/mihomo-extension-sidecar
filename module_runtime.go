@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,9 +22,6 @@ import (
 )
 
 func init() {
-	// goja uses regexp2 only when a JavaScript expression cannot be represented
-	// by Go's linear-time RE2 engine. Bound that fallback independently of the
-	// VM interrupt so catastrophic backtracking cannot pin a runtime goroutine.
 	regexp2.DefaultMatchTimeout = 250 * time.Millisecond
 }
 
@@ -34,36 +32,6 @@ type scriptRuntime struct {
 	statePath      string
 	moduleSet      string
 	moduleSetReady bool
-}
-
-func (r *scriptRuntime) prune(modules []Module) {
-	ids := make([]string, 0, len(modules))
-	allowed := make(map[string]struct{}, len(modules))
-	for _, module := range modules {
-		ids = append(ids, module.ID)
-		allowed[module.ID] = struct{}{}
-	}
-	sort.Strings(ids)
-	signature := strings.Join(ids, "\n")
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.moduleSetReady && signature == r.moduleSet {
-		return
-	}
-	changed := false
-	for moduleID := range r.persistent {
-		if _, exists := allowed[moduleID]; !exists {
-			delete(r.persistent, moduleID)
-			changed = true
-		}
-	}
-	r.moduleSet = signature
-	r.moduleSetReady = true
-	if changed {
-		if err := r.savePersistentLocked(); err != nil {
-			log.Printf("intercept: persistent module store prune failed: %v", err)
-		}
-	}
 }
 
 type scriptMessage struct {
@@ -95,177 +63,237 @@ func newScriptRuntime(statePath ...string) *scriptRuntime {
 	if len(statePath) > 0 {
 		runtime.statePath = statePath[0]
 		if err := runtime.loadPersistent(); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("intercept: persistent module store ignored: %v", err)
+			log.Printf("intercept: ignoring invalid native extension store: %v", err)
 		}
 	}
 	return runtime
 }
 
+func (r *scriptRuntime) prune(modules []Module) {
+	ids := make([]string, 0, len(modules))
+	allowed := make(map[string]struct{}, len(modules))
+	for _, module := range modules {
+		if !module.PersistentStorage {
+			continue
+		}
+		ids = append(ids, module.ID)
+		allowed[module.ID] = struct{}{}
+	}
+	sort.Strings(ids)
+	signature := strings.Join(ids, "\n")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.moduleSetReady && signature == r.moduleSet {
+		return
+	}
+	changed := false
+	for moduleID := range r.persistent {
+		if _, exists := allowed[moduleID]; !exists {
+			delete(r.persistent, moduleID)
+			changed = true
+		}
+	}
+	r.moduleSet = signature
+	r.moduleSetReady = true
+	if changed {
+		if err := r.savePersistentLocked(); err != nil {
+			log.Printf("intercept: native extension store prune failed: %v", err)
+		}
+	}
+}
+
 func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMessage, response *scriptMessage) (scriptResult, error) {
-	program, err := r.program(rule)
+	program, err := r.program(module, rule)
+	if err != nil {
+		return scriptResult{}, err
+	}
+	settings, err := moduleSettingValues(module)
 	if err != nil {
 		return scriptResult{}, err
 	}
 	vm := goja.New()
-	result := scriptResult{}
-	doneCalled := false
-	doneHadArgument := false
-	var doneValue goja.Value
-	if err := vm.Set("$done", func(call goja.FunctionCall) goja.Value {
-		doneCalled = true
-		doneHadArgument = len(call.Arguments) > 0
-		doneValue = call.Argument(0)
-		return goja.Undefined()
-	}); err != nil {
-		return scriptResult{}, err
-	}
-	requestObject, err := scriptMessageObject(vm, request, rule.BinaryBody)
+	installConsoleAPI(vm, module.ID, rule.ID)
+	requestObject, err := scriptMessageObject(vm, request, "none")
 	if err != nil {
 		return scriptResult{}, err
 	}
-	if err := vm.Set("$request", requestObject); err != nil {
-		return scriptResult{}, err
+	contextObject := map[string]any{
+		"phase":    rule.Phase,
+		"request":  requestObject,
+		"settings": settings,
 	}
 	if response != nil {
-		responseObject, objectErr := scriptMessageObject(vm, *response, rule.BinaryBody)
+		responseObject, objectErr := scriptMessageObject(vm, *response, rule.BodyMode)
 		if objectErr != nil {
 			return scriptResult{}, objectErr
 		}
-		if err := vm.Set("$response", responseObject); err != nil {
+		contextObject["response"] = responseObject
+	} else if rule.BodyMode != "none" {
+		requestObject, err = scriptMessageObject(vm, request, rule.BodyMode)
+		if err != nil {
 			return scriptResult{}, err
 		}
+		contextObject["request"] = requestObject
 	}
-	argument := rule.Argument
-	if module.Argument != "" {
-		argument = module.Argument
+	if module.PersistentStorage {
+		contextObject["storage"] = r.storageObject(vm, module.ID)
 	}
-	_ = vm.Set("$argument", argument)
-	_ = vm.Set("$loon", "5gpn")
-	r.installPersistentAPI(vm, module)
-	installConsoleAPI(vm, module.ID, rule.ID)
-	installDeniedNetworkAPI(vm)
 
 	timer := time.AfterFunc(time.Duration(rule.TimeoutMS)*time.Millisecond, func() {
 		vm.Interrupt("script execution timed out")
 	})
 	_, runErr := vm.RunProgram(program)
+	if runErr != nil {
+		timer.Stop()
+		vm.ClearInterrupt()
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, runErr)
+	}
+	transform, ok := goja.AssertFunction(vm.Get("transform"))
+	if !ok {
+		timer.Stop()
+		vm.ClearInterrupt()
+		return scriptResult{}, fmt.Errorf("extension %s action %s must define function transform(context)", module.ID, rule.ID)
+	}
+	value, callErr := transform(goja.Undefined(), vm.ToValue(contextObject))
 	timer.Stop()
 	vm.ClearInterrupt()
-	if runErr != nil {
-		return scriptResult{}, fmt.Errorf("module %s rule %s: %w", module.ID, rule.ID, runErr)
+	if callErr != nil {
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, callErr)
 	}
-	if doneCalled && !doneHadArgument {
-		result.Abort = true
-		return result, nil
-	}
-	if !doneCalled || doneValue == nil || goja.IsUndefined(doneValue) || goja.IsNull(doneValue) {
-		return result, nil
-	}
-	exported := doneValue.Export()
-	if text, ok := exported.(string); ok {
-		result.Body = []byte(text)
-		result.ChangedBody = true
-		return result, nil
-	}
-	object, ok := stringAnyMap(exported)
-	if !ok {
-		return scriptResult{}, errors.New("$done value must be an object, string, null, or undefined")
-	}
-	if nested, exists := object["response"]; exists {
-		var nestedOK bool
-		object, nestedOK = stringAnyMap(nested)
-		if !nestedOK {
-			return scriptResult{}, errors.New("$done.response must be an object")
-		}
-		result.Synthetic = true
-	}
-	if raw, exists := object["url"]; exists {
-		value, ok := raw.(string)
-		if !ok {
-			return scriptResult{}, errors.New("$done.url must be a string")
-		}
-		result.URL = value
-		result.ChangedURL = true
-	}
-	if raw, exists := object["body"]; exists {
-		value, err := exportedBody(raw)
-		if err != nil {
-			return scriptResult{}, err
-		}
-		result.Body = value
-		result.ChangedBody = true
-	}
-	if raw, exists := object["headers"]; exists {
-		headers, err := exportedHeaders(raw)
-		if err != nil {
-			return scriptResult{}, err
-		}
-		result.Headers = headers
-		result.ChangedHeaders = true
-	}
-	for _, key := range []string{"status", "statusCode"} {
-		if raw, exists := object[key]; exists {
-			status, err := exportedStatus(raw)
-			if err != nil {
-				return scriptResult{}, err
-			}
-			result.StatusCode = status
-			result.ChangedStatus = true
-			break
-		}
-	}
-	if response == nil && result.ChangedStatus {
-		result.Synthetic = true
-	}
-	return result, nil
+	return parseNativeScriptResult(value, response != nil)
 }
 
-func (r *scriptRuntime) program(rule ScriptRule) (*goja.Program, error) {
+func (r *scriptRuntime) program(module Module, rule ScriptRule) (*goja.Program, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if program := r.programs[rule.ScriptDigest]; program != nil {
 		return program, nil
 	}
-	program, err := goja.Compile(rule.ScriptURL, rule.ScriptBody, false)
+	filename := firstNonEmpty(rule.ScriptURL, "extension:"+module.ID+"/"+rule.ID)
+	program, err := goja.Compile(filename, rule.ScriptBody, false)
 	if err != nil {
-		return nil, fmt.Errorf("compile script %s: %w", rule.ID, err)
+		return nil, fmt.Errorf("compile action %s: %w", rule.ID, err)
 	}
 	r.programs[rule.ScriptDigest] = program
 	return program, nil
 }
 
-func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, module Module) {
-	parameterDefaults := make(map[string]string, len(module.Parameters))
-	for _, parameter := range module.Parameters {
-		parameterDefaults[parameter.Key] = parameter.Value
+func parseNativeScriptResult(value goja.Value, responsePhase bool) (scriptResult, error) {
+	result := scriptResult{}
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return result, nil
 	}
-	read := func(call goja.FunctionCall) goja.Value {
-		key := call.Argument(0).String()
-		if value, exists := parameterDefaults[key]; exists {
-			return vm.ToValue(value)
+	object, ok := stringAnyMap(value.Export())
+	if !ok {
+		return result, errors.New("transform(context) must return an object, null, or undefined")
+	}
+	for key := range object {
+		if key != "abort" && key != "request" && key != "response" {
+			return result, fmt.Errorf("transform result contains unsupported field %q", key)
 		}
+	}
+	if raw, exists := object["abort"]; exists {
+		abort, ok := raw.(bool)
+		if !ok {
+			return result, errors.New("transform.abort must be a boolean")
+		}
+		result.Abort = abort
+	}
+	requestPatch, hasRequest := object["request"]
+	responsePatch, hasResponse := object["response"]
+	if responsePhase && hasRequest {
+		return result, errors.New("a response action cannot return a request patch")
+	}
+	if !responsePhase && hasRequest && hasResponse {
+		return result, errors.New("a request action cannot return request and synthetic response patches together")
+	}
+	if hasRequest {
+		if err := applyNativePatch(&result, requestPatch, false); err != nil {
+			return scriptResult{}, err
+		}
+	}
+	if hasResponse {
+		if err := applyNativePatch(&result, responsePatch, true); err != nil {
+			return scriptResult{}, err
+		}
+		result.Synthetic = !responsePhase
+	}
+	return result, nil
+}
+
+func applyNativePatch(result *scriptResult, raw any, response bool) error {
+	object, ok := stringAnyMap(raw)
+	if !ok {
+		return errors.New("transform request/response patch must be an object")
+	}
+	for key := range object {
+		if key != "url" && key != "headers" && key != "body" && key != "status" {
+			return fmt.Errorf("transform patch contains unsupported field %q", key)
+		}
+	}
+	if rawURL, exists := object["url"]; exists {
+		if response {
+			return errors.New("response patches cannot change the request URL")
+		}
+		value, ok := rawURL.(string)
+		if !ok {
+			return errors.New("request.url must be a string")
+		}
+		result.URL = value
+		result.ChangedURL = true
+	}
+	if rawHeaders, exists := object["headers"]; exists {
+		headers, err := exportedHeaders(rawHeaders)
+		if err != nil {
+			return err
+		}
+		result.Headers = headers
+		result.ChangedHeaders = true
+	}
+	if rawBody, exists := object["body"]; exists {
+		body, err := exportedBody(rawBody)
+		if err != nil {
+			return err
+		}
+		result.Body = body
+		result.ChangedBody = true
+	}
+	if rawStatus, exists := object["status"]; exists {
+		if !response {
+			return errors.New("request patches cannot set status")
+		}
+		status, err := exportedStatus(rawStatus)
+		if err != nil {
+			return err
+		}
+		result.StatusCode = status
+		result.ChangedStatus = true
+	}
+	return nil
+}
+
+func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.Object {
+	get := func(call goja.FunctionCall) goja.Value {
+		key := call.Argument(0).String()
 		r.mu.Lock()
-		value, exists := r.persistent[module.ID][key]
+		value, exists := r.persistent[moduleID][key]
 		r.mu.Unlock()
 		if !exists {
 			return goja.Null()
 		}
 		return vm.ToValue(value)
 	}
-	write := func(call goja.FunctionCall) goja.Value {
-		value := call.Argument(0).String()
-		key := call.Argument(1).String()
-		if _, configured := parameterDefaults[key]; configured {
-			return vm.ToValue(false)
-		}
+	set := func(call goja.FunctionCall) goja.Value {
+		key := call.Argument(0).String()
+		value := call.Argument(1).String()
 		if len(key) == 0 || len(key) > 256 || len(value) > 64<<10 {
 			return vm.ToValue(false)
 		}
 		r.mu.Lock()
-		bucket := r.persistent[module.ID]
+		bucket := r.persistent[moduleID]
 		if bucket == nil {
 			bucket = make(map[string]string)
-			r.persistent[module.ID] = bucket
+			r.persistent[moduleID] = bucket
 		}
 		if len(bucket) >= 256 {
 			if _, exists := bucket[key]; !exists {
@@ -290,7 +318,7 @@ func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, module Module) {
 	remove := func(call goja.FunctionCall) goja.Value {
 		key := call.Argument(0).String()
 		r.mu.Lock()
-		bucket := r.persistent[module.ID]
+		bucket := r.persistent[moduleID]
 		previous, existed := bucket[key]
 		delete(bucket, key)
 		if err := r.savePersistentLocked(); err != nil {
@@ -303,24 +331,24 @@ func (r *scriptRuntime) installPersistentAPI(vm *goja.Runtime, module Module) {
 		r.mu.Unlock()
 		return vm.ToValue(existed)
 	}
-	removeAll := func(goja.FunctionCall) goja.Value {
+	clear := func(goja.FunctionCall) goja.Value {
 		r.mu.Lock()
-		previous := r.persistent[module.ID]
-		delete(r.persistent, module.ID)
+		previous := r.persistent[moduleID]
+		delete(r.persistent, moduleID)
 		if err := r.savePersistentLocked(); err != nil {
-			r.persistent[module.ID] = previous
+			r.persistent[moduleID] = previous
 			r.mu.Unlock()
 			return vm.ToValue(false)
 		}
 		r.mu.Unlock()
 		return vm.ToValue(true)
 	}
-	store := vm.NewObject()
-	_ = store.Set("read", read)
-	_ = store.Set("write", write)
-	_ = store.Set("remove", remove)
-	_ = store.Set("removeAll", removeAll)
-	_ = vm.Set("$persistentStore", store)
+	storage := vm.NewObject()
+	_ = storage.Set("get", get)
+	_ = storage.Set("set", set)
+	_ = storage.Set("delete", remove)
+	_ = storage.Set("clear", clear)
+	return storage
 }
 
 func (r *scriptRuntime) loadPersistent() error {
@@ -332,7 +360,7 @@ func (r *scriptRuntime) loadPersistent() error {
 		return err
 	}
 	if len(body) > 4<<20 {
-		return errors.New("persistent module store exceeds 4194304 bytes")
+		return errors.New("native extension store exceeds 4194304 bytes")
 	}
 	var state map[string]map[string]string
 	if err := json.Unmarshal(body, &state); err != nil {
@@ -340,11 +368,11 @@ func (r *scriptRuntime) loadPersistent() error {
 	}
 	for moduleID, values := range state {
 		if !validModuleID(moduleID) || len(values) > 256 {
-			return errors.New("persistent module store exceeds key limits")
+			return errors.New("native extension store exceeds key limits")
 		}
 		for key, value := range values {
 			if len(key) == 0 || len(key) > 256 || len(value) > 64<<10 {
-				return errors.New("persistent module store contains an oversized entry")
+				return errors.New("native extension store contains an oversized entry")
 			}
 		}
 	}
@@ -361,7 +389,7 @@ func (r *scriptRuntime) savePersistentLocked() error {
 		return err
 	}
 	if len(body) > 4<<20 {
-		return errors.New("persistent module store exceeds 4194304 bytes")
+		return errors.New("native extension store exceeds 4194304 bytes")
 	}
 	dir := filepath.Dir(r.statePath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -391,18 +419,16 @@ func (r *scriptRuntime) savePersistentLocked() error {
 	return os.Rename(tempPath, r.statePath)
 }
 
-func installConsoleAPI(vm *goja.Runtime, moduleID, ruleID string) {
+func installConsoleAPI(vm *goja.Runtime, moduleID, actionID string) {
 	console := vm.NewObject()
 	logger := func(call goja.FunctionCall) goja.Value {
 		parts := make([]string, 0, len(call.Arguments))
 		for _, argument := range call.Arguments {
 			text := strings.ReplaceAll(strings.ReplaceAll(argument.String(), "\r", `\r`), "\n", `\n`)
-			text = truncateScriptLog(text, 512)
-			parts = append(parts, text)
+			parts = append(parts, truncateScriptLog(text, 512))
 		}
-		line := strings.Join(parts, " ")
-		line = truncateScriptLog(line, 2048)
-		log.Printf("intercept: module=%s rule=%s script=%q", moduleID, ruleID, line)
+		line := truncateScriptLog(strings.Join(parts, " "), 2048)
+		log.Printf("intercept: extension=%s action=%s script=%q", moduleID, actionID, line)
 		return goja.Undefined()
 	}
 	_ = console.Set("log", logger)
@@ -410,12 +436,6 @@ func installConsoleAPI(vm *goja.Runtime, moduleID, ruleID string) {
 	_ = console.Set("warn", logger)
 	_ = console.Set("error", logger)
 	_ = vm.Set("console", console)
-	notify := func(call goja.FunctionCall) goja.Value {
-		return logger(call)
-	}
-	notification := vm.NewObject()
-	_ = notification.Set("post", notify)
-	_ = vm.Set("$notification", notification)
 }
 
 func truncateScriptLog(value string, limit int) string {
@@ -429,23 +449,16 @@ func truncateScriptLog(value string, limit int) string {
 	return prefix + "..."
 }
 
-func installDeniedNetworkAPI(vm *goja.Runtime) {
-	denied := func(goja.FunctionCall) goja.Value {
-		panic(vm.NewTypeError("module network access is disabled"))
-	}
-	client := vm.NewObject()
-	for _, method := range []string{"get", "post", "put", "delete", "head", "patch"} {
-		_ = client.Set(method, denied)
-	}
-	_ = vm.Set("$httpClient", client)
-}
-
-func scriptMessageObject(vm *goja.Runtime, message scriptMessage, binary bool) (map[string]any, error) {
+func scriptMessageObject(vm *goja.Runtime, message scriptMessage, bodyMode string) (map[string]any, error) {
 	object := map[string]any{
 		"url":     message.URL,
 		"headers": flatHeaders(message.Headers),
 	}
-	if binary {
+	switch bodyMode {
+	case "none":
+	case "text":
+		object["body"] = string(message.Body)
+	case "binary":
 		constructor, ok := goja.AssertConstructor(vm.Get("Uint8Array"))
 		if !ok {
 			return nil, errors.New("Uint8Array constructor is unavailable")
@@ -455,15 +468,14 @@ func scriptMessageObject(vm *goja.Runtime, message scriptMessage, binary bool) (
 			return nil, err
 		}
 		object["body"] = value
-	} else {
-		object["body"] = string(message.Body)
+	default:
+		return nil, fmt.Errorf("unsupported body mode %q", bodyMode)
 	}
 	if message.Method != "" {
 		object["method"] = message.Method
 	}
 	if message.StatusCode != 0 {
 		object["status"] = message.StatusCode
-		object["statusCode"] = message.StatusCode
 	}
 	return object, nil
 }
@@ -481,13 +493,13 @@ func exportedBody(value any) ([]byte, error) {
 		for index, item := range typed {
 			number, ok := item.(int64)
 			if !ok || number < 0 || number > 255 {
-				return nil, errors.New("$done.body contains a non-byte value")
+				return nil, errors.New("body contains a non-byte value")
 			}
 			out[index] = byte(number)
 		}
 		return out, nil
 	default:
-		return nil, errors.New("$done.body must be a string or Uint8Array")
+		return nil, errors.New("body must be a string or Uint8Array")
 	}
 }
 
@@ -500,55 +512,48 @@ func flatHeaders(headers http.Header) map[string]string {
 }
 
 func stringAnyMap(value any) (map[string]any, bool) {
-	switch typed := value.(type) {
-	case map[string]any:
-		return typed, true
-	default:
-		return nil, false
-	}
+	typed, ok := value.(map[string]any)
+	return typed, ok
 }
 
 func exportedHeaders(value any) (http.Header, error) {
-	switch typed := value.(type) {
-	case map[string]string:
+	if typed, ok := value.(map[string]string); ok {
 		headers := make(http.Header, len(typed))
 		for name, item := range typed {
 			if strings.ContainsAny(name, "\r\n:") || strings.ContainsAny(item, "\r\n") {
-				return nil, fmt.Errorf("invalid response header %q", name)
+				return nil, fmt.Errorf("invalid header %q", name)
 			}
 			headers.Set(name, item)
 		}
 		return headers, nil
-	case http.Header:
-		return cloneProxyHeaders(typed), nil
 	}
 	object, ok := stringAnyMap(value)
 	if !ok {
-		return nil, errors.New("$done.headers must be an object")
+		return nil, errors.New("headers must be an object")
 	}
 	headers := make(http.Header, len(object))
 	for name, raw := range object {
 		if strings.ContainsAny(name, "\r\n:") || strings.TrimSpace(name) == "" {
-			return nil, fmt.Errorf("invalid response header name %q", name)
+			return nil, fmt.Errorf("invalid header name %q", name)
 		}
 		switch typed := raw.(type) {
 		case string:
 			if strings.ContainsAny(typed, "\r\n") {
-				return nil, fmt.Errorf("invalid response header value for %s", name)
+				return nil, fmt.Errorf("invalid header value for %s", name)
 			}
 			headers.Set(name, typed)
 		case []any:
 			for _, item := range typed {
 				text := fmt.Sprint(item)
 				if strings.ContainsAny(text, "\r\n") {
-					return nil, fmt.Errorf("invalid response header value for %s", name)
+					return nil, fmt.Errorf("invalid header value for %s", name)
 				}
 				headers.Add(name, text)
 			}
 		default:
 			text := fmt.Sprint(raw)
 			if strings.ContainsAny(text, "\r\n") {
-				return nil, fmt.Errorf("invalid response header value for %s", name)
+				return nil, fmt.Errorf("invalid header value for %s", name)
 			}
 			headers.Set(name, text)
 		}
@@ -567,45 +572,58 @@ func exportedStatus(value any) (int, error) {
 		status = typed
 	case float64:
 		status = int(typed)
-	case string:
-		fields := strings.Fields(typed)
-		for _, field := range fields {
-			parsed, err := strconv.Atoi(field)
-			if err == nil && parsed >= 100 && parsed <= 599 {
-				status = parsed
-				break
-			}
+	case json.Number:
+		parsed, err := strconv.Atoi(typed.String())
+		if err != nil {
+			return 0, errors.New("status must be an integer")
 		}
-		if status == 0 {
-			return 0, errors.New("$done status is invalid")
-		}
+		status = parsed
 	default:
-		return 0, errors.New("$done status is invalid")
+		return 0, errors.New("status must be an integer")
 	}
 	if status < 100 || status > 599 {
-		return 0, errors.New("$done status must be between 100 and 599")
+		return 0, errors.New("status must be between 100 and 599")
 	}
 	return status, nil
 }
 
-func matchingScriptRules(cfg Config, phase, requestURL string) []struct {
+func matchingScriptRules(cfg Config, phase string, message scriptMessage) []struct {
 	Module Module
 	Rule   ScriptRule
 } {
+	parsed, err := url.Parse(message.URL)
+	if err != nil {
+		return nil
+	}
+	host := canonicalHost(parsed.Hostname())
+	scheme := strings.ToLower(parsed.Scheme)
+	path := parsed.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	if parsed.RawQuery != "" {
+		path += "?" + parsed.RawQuery
+	}
 	var matched []struct {
 		Module Module
 		Rule   ScriptRule
 	}
 	for _, module := range cfg.Modules {
-		if !module.Enabled {
+		if !module.Enabled || !moduleOwnsHost(module, host) {
 			continue
 		}
 		for _, rule := range module.Scripts {
-			if rule.Phase != phase {
+			if rule.Phase != phase || !matchRuleHost(rule.Match.Hosts, host) || !containsString(rule.Match.Schemes, scheme) {
 				continue
 			}
-			pattern, err := regexp.Compile(rule.Pattern)
-			if err == nil && pattern.MatchString(requestURL) {
+			if len(rule.Match.Methods) > 0 && !containsString(rule.Match.Methods, message.Method) {
+				continue
+			}
+			if len(rule.Match.StatusCodes) > 0 && !containsInt(rule.Match.StatusCodes, message.StatusCode) {
+				continue
+			}
+			pattern, compileErr := regexp.Compile(rule.Match.PathRegex)
+			if compileErr == nil && pattern.MatchString(path) {
 				matched = append(matched, struct {
 					Module Module
 					Rule   ScriptRule
@@ -616,55 +634,20 @@ func matchingScriptRules(cfg Config, phase, requestURL string) []struct {
 	return matched
 }
 
-func matchingRewriteRules(cfg Config, requestURL string) []struct {
-	Module Module
-	Rule   RewriteRule
-	RE     *regexp.Regexp
-} {
-	var matched []struct {
-		Module Module
-		Rule   RewriteRule
-		RE     *regexp.Regexp
-	}
-	for _, module := range cfg.Modules {
-		if !module.Enabled {
-			continue
-		}
-		for _, rule := range module.Rewrites {
-			pattern, err := regexp.Compile(rule.Pattern)
-			if err == nil && pattern.MatchString(requestURL) {
-				matched = append(matched, struct {
-					Module Module
-					Rule   RewriteRule
-					RE     *regexp.Regexp
-				}{Module: module, Rule: rule, RE: pattern})
-			}
+func matchRuleHost(patterns []string, host string) bool {
+	for _, pattern := range patterns {
+		if matchHostPattern(pattern, host) {
+			return true
 		}
 	}
-	return matched
+	return false
 }
 
-func matchingHeaderRules(cfg Config, requestURL string) []struct {
-	Module Module
-	Rule   HeaderRule
-} {
-	var matched []struct {
-		Module Module
-		Rule   HeaderRule
-	}
-	for _, module := range cfg.Modules {
-		if !module.Enabled {
-			continue
-		}
-		for _, rule := range module.Headers {
-			pattern, err := regexp.Compile(rule.Pattern)
-			if err == nil && pattern.MatchString(requestURL) {
-				matched = append(matched, struct {
-					Module Module
-					Rule   HeaderRule
-				}{Module: module, Rule: rule})
-			}
+func containsInt(values []int, want int) bool {
+	for _, value := range values {
+		if value == want {
+			return true
 		}
 	}
-	return matched
+	return false
 }

@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
-	"strconv"
 )
 
 const maxModuleHTTPBody = int64(64 << 20)
@@ -24,85 +22,29 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 	if incoming.TLS != nil || incoming.ProtoMajor == 3 {
 		scheme = "https"
 	}
-	requestURL := scheme + "://" + host + incoming.URL.RequestURI()
-	for _, matched := range matchingRewriteRules(cfg, requestURL) {
-		switch matched.Rule.Action {
-		case "reject", "reject-drop":
-			http.Error(w, "request rejected by interception module", http.StatusForbidden)
-			return nil, true, nil
-		case "reject-200", "reject-dict", "reject-array", "reject-img":
-			body := []byte(nil)
-			if matched.Rule.Action == "reject-dict" {
-				body = []byte("{}")
-				w.Header().Set("Content-Type", "application/json")
-			} else if matched.Rule.Action == "reject-array" {
-				body = []byte("[]")
-				w.Header().Set("Content-Type", "application/json")
-			} else if matched.Rule.Action == "reject-img" {
-				body = []byte{71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 0, 0, 0, 255, 255, 255, 33, 249, 4, 1, 0, 0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59}
-				w.Header().Set("Content-Type", "image/gif")
-			}
-			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(body)
-			return nil, true, nil
-		case "redirect-302", "redirect-307":
-			status := http.StatusFound
-			if matched.Rule.Action == "redirect-307" {
-				status = http.StatusTemporaryRedirect
-			}
-			location := matched.RE.ReplaceAllString(requestURL, matched.Rule.Replacement)
-			if _, err := url.ParseRequestURI(location); err != nil {
-				return nil, false, fmt.Errorf("module %s produced an invalid redirect: %w", matched.Module.ID, err)
-			}
-			w.Header().Set("Location", location)
-			w.WriteHeader(status)
-			return nil, true, nil
-		case "rewrite":
-			location := matched.RE.ReplaceAllString(requestURL, matched.Rule.Replacement)
-			parsed, err := url.Parse(location)
-			if err != nil || parsed.User != nil || !activeInterceptHost(cfg, parsed.Hostname()) {
-				return nil, false, fmt.Errorf("module %s produced an unsafe URL rewrite", matched.Module.ID)
-			}
-			requestURL = parsed.String()
-		}
+	message := scriptMessage{
+		URL: scheme + "://" + host + incoming.URL.RequestURI(), Method: incoming.Method,
+		Headers: cloneProxyHeaders(incoming.Header),
 	}
-
-	requestBody := []byte(nil)
+	requestRules := matchingScriptRules(cfg, "request", message)
 	if incoming.Body != nil {
 		incoming.Body = http.MaxBytesReader(w, incoming.Body, maxModuleHTTPBody)
-		var err error
-		requestBody, err = readBounded(incoming.Body, maxModuleHTTPBody)
+		body, err := readBounded(incoming.Body, maxModuleHTTPBody)
 		if err != nil {
 			return nil, false, err
 		}
-		requestBody, err = decodeContentBody(requestBody, incoming.Header.Get("Content-Encoding"), maxModuleHTTPBody)
+		body, err = decodeContentBody(body, incoming.Header.Get("Content-Encoding"), maxModuleHTTPBody)
 		if err != nil {
 			return nil, false, err
 		}
+		message.Body = body
 	}
-	requestHeaders := cloneProxyHeaders(incoming.Header)
-	requestHeaders.Del("Content-Encoding")
-	requestHeaders.Del("Content-Length")
-	for _, matched := range matchingHeaderRules(cfg, requestURL) {
-		switch matched.Rule.Operation {
-		case "delete":
-			requestHeaders.Del(matched.Rule.Header)
-		case "add":
-			requestHeaders.Add(matched.Rule.Header, matched.Rule.Value)
-		case "replace":
-			requestHeaders.Set(matched.Rule.Header, matched.Rule.Value)
-		}
-	}
-	message := scriptMessage{
-		URL:     requestURL,
-		Method:  incoming.Method,
-		Headers: requestHeaders,
-		Body:    requestBody,
-	}
-	for _, matched := range matchingScriptRules(cfg, "request", message.URL) {
-		if int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
-			return nil, false, fmt.Errorf("module %s request body exceeds rule limit", matched.Module.ID)
+	message.Headers.Del("Content-Encoding")
+	message.Headers.Del("Content-Length")
+
+	for _, matched := range requestRules {
+		if matched.Rule.BodyMode != "none" && int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
+			return nil, false, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
 		}
 		result, err := p.scripts.execute(matched.Module, matched.Rule, message, nil)
 		if err != nil {
@@ -116,18 +58,18 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 			if status == 0 {
 				status = http.StatusOK
 			}
-			if result.Headers != nil {
+			if result.ChangedHeaders {
 				copyResponseHeaders(w.Header(), result.Headers)
 			}
-			w.Header().Set("Content-Length", strconv.Itoa(len(result.Body)))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(result.Body)))
 			w.WriteHeader(status)
 			_, _ = w.Write(result.Body)
 			return nil, true, nil
 		}
 		if result.ChangedURL {
-			parsed, err := url.Parse(result.URL)
-			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || !activeInterceptHost(cfg, parsed.Hostname()) {
-				return nil, false, errors.New("request script attempted to leave the active module allowlist")
+			parsed, parseErr := url.Parse(result.URL)
+			if parseErr != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || !moduleOwnsHost(matched.Module, parsed.Hostname()) {
+				return nil, false, fmt.Errorf("extension %s attempted to leave its capture_hosts boundary", matched.Module.ID)
 			}
 			message.URL = parsed.String()
 		}
@@ -138,6 +80,7 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 			message.Body = result.Body
 		}
 	}
+
 	parsedURL, err := url.Parse(message.URL)
 	if err != nil {
 		return nil, false, err
@@ -163,27 +106,32 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 }
 
 func (p *interceptProxy) transformModuleResponse(request *http.Request, response *http.Response, cfg Config) (*transformedResponse, error) {
-	requestURL := request.URL.String()
-	scripts := matchingScriptRules(cfg, "response", requestURL)
-	wloc := cfg.WLOC.Enabled && isBuiltInWLOCHost(request.URL.Hostname()) && request.URL.Path == "/clls/wloc" && response.StatusCode == http.StatusOK
-	if len(scripts) == 0 && !wloc {
+	requestMessage := scriptMessage{
+		URL: request.URL.String(), Method: request.Method,
+		Headers: cloneProxyHeaders(request.Header),
+	}
+	responseMessage := scriptMessage{
+		URL: request.URL.String(), Method: request.Method, StatusCode: response.StatusCode,
+		Headers: cloneProxyHeaders(response.Header),
+	}
+	scripts := matchingScriptRules(cfg, "response", responseMessage)
+	if len(scripts) == 0 {
 		return nil, nil
 	}
-	limit := cfg.WLOC.MaxBodyBytes
+	limit := int64(1024)
 	for _, matched := range scripts {
 		if matched.Rule.MaxBodyBytes > limit {
 			limit = matched.Rule.MaxBodyBytes
 		}
 	}
-	if limit < 1024 || limit > maxModuleHTTPBody {
+	if limit > maxModuleHTTPBody {
 		limit = maxModuleHTTPBody
 	}
 	body, err := readBounded(response.Body, limit)
 	if err != nil {
 		return nil, err
 	}
-	header := cloneProxyHeaders(response.Header)
-	encoding := header.Get("Content-Encoding")
+	encoding := responseMessage.Headers.Get("Content-Encoding")
 	if encoding == "" && isGzip(body) {
 		encoding = "gzip"
 	}
@@ -191,41 +139,13 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 	if err != nil {
 		return nil, err
 	}
-	header.Del("Content-Encoding")
-	if wloc {
-		target := wlocTarget{Longitude: *cfg.WLOC.Longitude, Latitude: *cfg.WLOC.Latitude, Accuracy: cfg.WLOC.Accuracy}
-		patched, stats, patchErr := patchWLOCBody(body, target, cfg.WLOC.MaxBodyBytes)
-		if patchErr != nil {
-			if cfg.WLOC.FailClosed {
-				return nil, patchErr
-			}
-			log.Printf("intercept: WLOC patch skipped after error: %v", patchErr)
-		} else {
-			body = patched
-			log.Printf("intercept: patched WLOC response host=%s protocol=%s locations=%d wifi=%d cell=%d", request.URL.Hostname(), request.Proto, stats.Locations, stats.WiFi, stats.Cell)
-		}
-	}
-	requestBody := []byte(nil)
-	if len(scripts) > 0 && request.GetBody != nil {
-		bodyReader, bodyErr := request.GetBody()
-		if bodyErr != nil {
-			return nil, bodyErr
-		}
-		requestBody, bodyErr = readBounded(bodyReader, maxModuleHTTPBody)
-		_ = bodyReader.Close()
-		if bodyErr != nil {
-			return nil, bodyErr
-		}
-	}
-	requestMessage := scriptMessage{
-		URL: requestURL, Method: request.Method, Headers: cloneProxyHeaders(request.Header), Body: requestBody,
-	}
-	responseMessage := scriptMessage{
-		URL: requestURL, Headers: header, Body: body, StatusCode: response.StatusCode,
-	}
+	responseMessage.Body = body
+	responseMessage.Headers.Del("Content-Encoding")
+	responseMessage.Headers.Del("Content-Length")
+
 	for _, matched := range scripts {
-		if int64(len(responseMessage.Body)) > matched.Rule.MaxBodyBytes {
-			return nil, fmt.Errorf("module %s response body exceeds rule limit", matched.Module.ID)
+		if matched.Rule.BodyMode != "none" && int64(len(responseMessage.Body)) > matched.Rule.MaxBodyBytes {
+			return nil, fmt.Errorf("extension %s response body exceeds action limit", matched.Module.ID)
 		}
 		result, err := p.scripts.execute(matched.Module, matched.Rule, requestMessage, &responseMessage)
 		if err != nil {
@@ -235,7 +155,7 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 			panic(http.ErrAbortHandler)
 		}
 		if result.ChangedURL {
-			return nil, fmt.Errorf("module %s attempted an unsupported response URL mutation", matched.Module.ID)
+			return nil, errors.New("response action attempted an unsupported URL mutation")
 		}
 		if result.ChangedHeaders {
 			responseMessage.Headers = result.Headers
@@ -255,14 +175,4 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 		Header:     responseMessage.Headers,
 		Body:       responseMessage.Body,
 	}, nil
-}
-
-func isBuiltInWLOCHost(host string) bool {
-	host = canonicalHost(host)
-	for _, candidate := range builtInWLOCHosts {
-		if host == candidate {
-			return true
-		}
-	}
-	return false
 }

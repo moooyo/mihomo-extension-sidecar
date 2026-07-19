@@ -12,6 +12,10 @@ import (
 	"github.com/andybalholm/brotli"
 )
 
+func isGzip(body []byte) bool {
+	return len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b
+}
+
 func decodeContentBody(body []byte, encoding string, limit int64) ([]byte, error) {
 	encoding = strings.ToLower(strings.TrimSpace(encoding))
 	if encoding == "" || encoding == "identity" {

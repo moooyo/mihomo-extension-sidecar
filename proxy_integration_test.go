@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"math/big"
@@ -15,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,14 +27,14 @@ import (
 
 func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	certPath, keyPath, roots := writeTestInterceptCertificate(t)
-	upstreamBody := syntheticWLOCFrame()
+	upstreamBody := []byte("upstream")
 	upstreamUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	upstreamServer := &http3.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if canonicalHost(r.Host) != "gs-loc.apple.com" || r.URL.Path != "/clls/wloc" {
+			if canonicalHost(r.Host) != "api.example.com" || r.URL.Path != "/v1" {
 				http.Error(w, "unexpected request", http.StatusBadRequest)
 				return
 			}
@@ -60,29 +60,28 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	t.Cleanup(closeRelay)
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
-	configBody := `{
-  "version": 2,
-  "listen": "127.0.0.1:18080",
-  "username": "inbound-user-123",
-  "password": "inbound-password-123456789",
-  "tls_cert": ` + strconv.Quote(certPath) + `,
-  "tls_key": ` + strconv.Quote(keyPath) + `,
-  "upstream_proxy": {
-    "address": ` + strconv.Quote(relayAddress) + `,
-    "username": ` + strconv.Quote(relayUser) + `,
-    "password": ` + strconv.Quote(relayPassword) + `
-  },
-  "mitm": {"enabled":true,"http2":true,"quic_fallback_protection":false},
-  "wloc": {
-    "enabled": true,
-    "longitude": -122.4194,
-    "latitude": 37.7749,
-    "accuracy": 25,
-    "fail_closed": true,
-    "max_body_bytes": 1048576
-  }
-}`
-	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+	manifest := "apiVersion: 5gpn.io/v1\nkind: Extension\n"
+	script := `function transform(context) { return { response: { body: context.response.body + "-patched" } } }`
+	cfg := Config{
+		Version: configVersion, Listen: "127.0.0.1:18080", Username: "inbound-user-123", Password: "inbound-password-123456789",
+		TLSCert: certPath, TLSKey: keyPath,
+		UpstreamProxy: ProxyConfig{Address: relayAddress, Username: relayUser, Password: relayPassword},
+		MITM:          MITMSettings{Enabled: true, HTTP2: true},
+		Modules: []Module{{
+			ID: "io.example.http3", Version: "1.0.0", Name: "HTTP3 fixture", Enabled: true, ImportedAt: time.Now().UTC().Format(time.RFC3339),
+			Source: ModuleSource{Digest: digestText(manifest), Body: manifest}, CaptureHosts: []string{"api.example.com"},
+			Scripts: []ScriptRule{{
+				ID: "patch", Phase: "response", Match: ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/v1$", StatusCodes: []int{200}},
+				ScriptDigest: digestText(script), ScriptBody: script, BodyMode: "text", TimeoutMS: 1000, MaxBodyBytes: 1 << 20,
+			}},
+		}},
+	}
+	configBytes, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configBody := string(configBytes)
+	if err := os.WriteFile(configPath, configBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store, err := newConfigStore(configPath)
@@ -119,7 +118,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	}
 	for _, version := range []quic.Version{quic.Version1, quic.Version2} {
 		t.Run(version.String(), func(t *testing.T) {
-			target := socksTarget{Host: "gs-loc.apple.com", Port: 443}
+			target := socksTarget{Host: "api.example.com", Port: 443}
 			packetConn, err := dialSOCKS5UDP(context.Background(), clientProxy, target)
 			if err != nil {
 				t.Fatal(err)
@@ -135,7 +134,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			defer clientTransport.Close()
 			defer quicTransport.Close()
 			defer packetConn.Close()
-			request, err := http.NewRequest(http.MethodPost, "https://gs-loc.apple.com/clls/wloc", nil)
+			request, err := http.NewRequest(http.MethodPost, "https://api.example.com/v1", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -151,12 +150,9 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			if response.StatusCode != http.StatusOK {
 				t.Fatalf("status=%d body=%q", response.StatusCode, body)
 			}
-			location := extractPatchedWiFiLocation(t, body[10:])
-			fields, err := parseProtoFields(location)
-			if err != nil {
-				t.Fatal(err)
+			if string(body) != "upstream-patched" {
+				t.Fatalf("body=%q", body)
 			}
-			assertVarintField(t, fields, 1, uint64(int64(3777490000)))
 		})
 	}
 
@@ -169,7 +165,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 		if err := os.WriteFile(configPath, []byte(fallbackConfig), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		target := socksTarget{Host: "gs-loc.apple.com", Port: 443}
+		target := socksTarget{Host: "api.example.com", Port: 443}
 		packetConn, err := dialSOCKS5UDP(context.Background(), clientProxy, target)
 		if err != nil {
 			t.Fatal(err)
@@ -187,7 +183,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 		defer clientTransport.Close()
 		requestCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer stop()
-		request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "https://gs-loc.apple.com/clls/wloc", nil)
+		request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "https://api.example.com/v1", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,8 +309,8 @@ func writeTestInterceptCertificate(t *testing.T) (string, string, *x509.CertPool
 	}
 	leafTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "gs-loc.apple.com"},
-		DNSNames:     []string{"gs-loc.apple.com", "gs-loc-cn.apple.com"},
+		Subject:      pkix.Name{CommonName: "api.example.com"},
+		DNSNames:     []string{"api.example.com"},
 		NotBefore:    now.Add(-time.Hour),
 		NotAfter:     now.Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -354,12 +350,4 @@ func loadTestKeyPair(t *testing.T, certPath, keyPath string) tls.Certificate {
 		t.Fatal(err)
 	}
 	return certificate
-}
-
-func syntheticWLOCFrame() []byte {
-	location := append(encodeVarintField(1, 1), encodeVarintField(2, 2)...)
-	wifi := append(encodeLengthField(1, []byte("00:11:22:33:44:55")), encodeLengthField(2, location)...)
-	root := encodeLengthField(2, wifi)
-	frame := append(make([]byte, 8), byte(len(root)>>8), byte(len(root)))
-	return append(frame, root...)
 }
