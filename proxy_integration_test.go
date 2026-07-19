@@ -65,8 +65,9 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	cfg := Config{
 		Version: configVersion, Listen: "127.0.0.1:18080", Username: "inbound-user-123", Password: "inbound-password-123456789",
 		TLSCert: certPath, TLSKey: keyPath,
-		UpstreamProxy: ProxyConfig{Address: relayAddress, Username: relayUser, Password: relayPassword},
-		MITM:          MITMSettings{Enabled: true, HTTP2: true},
+		UpstreamProxy:  ProxyConfig{Address: relayAddress, Username: relayUser, Password: relayPassword},
+		MITM:           MITMSettings{Enabled: true, HTTP2: true},
+		ExecutionOrder: []string{"io.example.http3"},
 		Modules: []Module{{
 			ID: "io.example.http3", Version: "1.0.0", Name: "HTTP3 fixture", Enabled: true, ImportedAt: time.Now().UTC().Format(time.RFC3339),
 			Source: ModuleSource{Digest: digestText(manifest), Body: manifest}, CaptureHosts: []string{"api.example.com"},

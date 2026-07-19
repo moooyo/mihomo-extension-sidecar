@@ -4,7 +4,7 @@
 enabled native interception extensions. It is not an open proxy and does not fetch extension
 or script content at runtime.
 
-The service remains stopped unless the version-3 configuration's MITM master
+The service remains stopped unless the version-4 configuration's MITM master
 and at least one extension are enabled. It then accepts authenticated SOCKS5 on `127.0.0.1:18080`. TCP CONNECT
 on port 80 serves plain HTTP; port 443 terminates TLS with HTTP/1.1 and,
 optionally, HTTP/2. An authenticated UDP
@@ -24,10 +24,14 @@ request transmission.
 Native `5gpn.io/v1` manifests are compiled by `5gpn-dns` into bounded immutable
 JSON snapshots in `/etc/5gpn/intercept/config.json`. The sidecar receives only
 normalized capture hosts, structured action matchers, typed settings, explicit
-permissions, safe upstream mappings, and immutable scripts. Every action runs
+permissions, exact approved network origins, safe upstream mappings, operator
+egress bindings, explicit execution order, and immutable scripts. Every action runs
 in a fresh goja VM through `transform(context)` with bounded source/body sizes,
-execution time, and backtracking-regexp time. There is no script network,
-filesystem, process, timer, or module-loader access. String and Uint8Array
+execution time, and backtracking-regexp time. There is no ambient network,
+filesystem, process, timer, or module-loader access. A module that declared
+network origins receives only synchronous `context.network.request`; every call
+is exact-origin checked, bounded, and sent through the authenticated upstream
+mihomo SOCKS5 listener. Ambient `fetch` and sockets remain unavailable. String and Uint8Array
 bodies decode identity, gzip, deflate, and Brotli within expanded-size limits.
 When explicitly permitted, `context.storage` writes only to the bounded
 service-owned `/var/lib/5gpn-intercept/store.json`.

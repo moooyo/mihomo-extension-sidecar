@@ -15,28 +15,34 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/dop251/goja"
 )
 
-const configVersion = 3
+const configVersion = 4
 const maxConfigBytes = 16 << 20
+const maxModuleNetworkOrigins = 256
+const reservedTerminalMatchEgressGroup = "__5GPN_TERMINAL_MATCH__"
 
 var nativeExtensionIDPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])$`)
 
 type Config struct {
-	Version       int          `json:"version"`
-	Listen        string       `json:"listen"`
-	Username      string       `json:"username"`
-	Password      string       `json:"password"`
-	TLSCert       string       `json:"tls_cert"`
-	TLSKey        string       `json:"tls_key"`
-	UpstreamProxy ProxyConfig  `json:"upstream_proxy"`
-	MITM          MITMSettings `json:"mitm"`
-	Modules       []Module     `json:"modules,omitempty"`
+	Version        int          `json:"version"`
+	ExecutionOrder []string     `json:"execution_order"`
+	Listen         string       `json:"listen"`
+	Username       string       `json:"username"`
+	Password       string       `json:"password"`
+	TLSCert        string       `json:"tls_cert"`
+	TLSKey         string       `json:"tls_key"`
+	UpstreamProxy  ProxyConfig  `json:"upstream_proxy"`
+	MITM           MITMSettings `json:"mitm"`
+	Modules        []Module     `json:"modules,omitempty"`
 }
 
 type ProxyConfig struct {
@@ -102,18 +108,21 @@ type HostMapping struct {
 }
 
 type Module struct {
-	ID                string          `json:"id"`
-	Version           string          `json:"extension_version"`
-	Name              string          `json:"name"`
-	Description       string          `json:"description,omitempty"`
-	Enabled           bool            `json:"enabled"`
-	ImportedAt        string          `json:"imported_at"`
-	Source            ModuleSource    `json:"source"`
-	CaptureHosts      []string        `json:"capture_hosts"`
-	HostMappings      []HostMapping   `json:"upstream_mappings,omitempty"`
-	Settings          []ModuleSetting `json:"settings,omitempty"`
-	Scripts           []ScriptRule    `json:"actions,omitempty"`
-	PersistentStorage bool            `json:"persistent_storage"`
+	ID                  string          `json:"id"`
+	Version             string          `json:"extension_version"`
+	Name                string          `json:"name"`
+	Description         string          `json:"description,omitempty"`
+	Enabled             bool            `json:"enabled"`
+	ImportedAt          string          `json:"imported_at"`
+	Source              ModuleSource    `json:"source"`
+	CaptureHosts        []string        `json:"capture_hosts"`
+	HostMappings        []HostMapping   `json:"upstream_mappings,omitempty"`
+	Settings            []ModuleSetting `json:"settings,omitempty"`
+	Scripts             []ScriptRule    `json:"actions,omitempty"`
+	PersistentStorage   bool            `json:"persistent_storage"`
+	NetworkOrigins      []string        `json:"network_origins"`
+	EgressGroupRequired bool            `json:"egress_group_required"`
+	EgressGroup         string          `json:"egress_group,omitempty"`
 }
 
 func loadConfig(path string) (Config, error) {
@@ -274,6 +283,9 @@ func (c Config) Validate() error {
 	if err := validateModules(c.Modules); err != nil {
 		return err
 	}
+	if err := validateExecutionOrder(c.Modules, c.ExecutionOrder); err != nil {
+		return err
+	}
 	if len(certificateHostPatterns(c)) > 256 {
 		return errors.New("enabled interception extensions exceed 256 unique certificate hosts")
 	}
@@ -290,12 +302,18 @@ func (c Config) ValidateCertificateRequest() error {
 	if len(c.Modules) > 64 {
 		return errors.New("at most 64 interception extensions are allowed")
 	}
+	if err := validateExecutionOrder(c.Modules, c.ExecutionOrder); err != nil {
+		return err
+	}
 	ids := make(map[string]struct{}, len(c.Modules))
 	for _, module := range c.Modules {
 		if _, duplicate := ids[module.ID]; duplicate {
 			return fmt.Errorf("duplicate extension id %q", module.ID)
 		}
 		ids[module.ID] = struct{}{}
+		if err := validateModuleNetworkPermissions(module); err != nil {
+			return fmt.Errorf("extension %q: %w", module.ID, err)
+		}
 		if !module.Enabled {
 			continue
 		}
@@ -491,6 +509,9 @@ func validateModules(modules []Module) error {
 		if err := validateHostMappings(module.CaptureHosts, module.HostMappings); err != nil {
 			return fmt.Errorf("extension %q: %w", module.ID, err)
 		}
+		if err := validateModuleNetworkPermissions(module); err != nil {
+			return fmt.Errorf("extension %q: %w", module.ID, err)
+		}
 		total := 0
 		actionIDs := make(map[string]struct{}, len(module.Scripts))
 		for _, rule := range module.Scripts {
@@ -541,6 +562,105 @@ func validateModules(modules []Module) error {
 		}
 	}
 	return nil
+}
+
+func validateExecutionOrder(modules []Module, order []string) error {
+	if order == nil {
+		return errors.New("execution_order must be an array")
+	}
+	if len(order) != len(modules) {
+		return errors.New("execution_order must contain every extension id exactly once")
+	}
+	moduleIDs := make(map[string]struct{}, len(modules))
+	for _, module := range modules {
+		moduleIDs[module.ID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(order))
+	for _, id := range order {
+		if _, exists := moduleIDs[id]; !exists {
+			return fmt.Errorf("execution_order contains unknown extension id %q", id)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return fmt.Errorf("execution_order contains duplicate extension id %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+func validateModuleNetworkPermissions(module Module) error {
+	if len(module.NetworkOrigins) > maxModuleNetworkOrigins {
+		return fmt.Errorf("network_origins exceeds %d entries", maxModuleNetworkOrigins)
+	}
+	previous := ""
+	for _, origin := range module.NetworkOrigins {
+		canonical, err := canonicalModuleNetworkOrigin(origin)
+		if err != nil || canonical != origin {
+			return fmt.Errorf("network origin %q is not canonical", origin)
+		}
+		if previous != "" && origin <= previous {
+			return errors.New("network_origins must be sorted and unique")
+		}
+		previous = origin
+	}
+	if module.Enabled && module.EgressGroupRequired && strings.TrimSpace(module.EgressGroup) == "" {
+		return errors.New("egress_group is required")
+	}
+	if module.EgressGroup != "" {
+		if module.EgressGroup == reservedTerminalMatchEgressGroup {
+			return errors.New("egress_group uses a reserved internal name")
+		}
+		if !utf8.ValidString(module.EgressGroup) || module.EgressGroup != strings.TrimSpace(module.EgressGroup) || len(module.EgressGroup) > 128 {
+			return errors.New("egress_group must contain at most 128 bytes without surrounding whitespace")
+		}
+		for _, character := range module.EgressGroup {
+			if character == ',' || unicode.IsControl(character) {
+				return errors.New("egress_group contains a comma or control character")
+			}
+		}
+	}
+	return nil
+}
+
+func canonicalModuleNetworkOrigin(raw string) (string, error) {
+	if len(raw) == 0 || len(raw) > 4096 || raw != strings.TrimSpace(raw) {
+		return "", errors.New("network origin has an invalid length or whitespace")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", errors.New("network origin is not an absolute HTTP origin")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", errors.New("network origin cannot contain a path")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("network origin scheme must be http or https")
+	}
+	host := canonicalHost(parsed.Hostname())
+	if host == "" || net.ParseIP(host) != nil || !validHostTarget(host) || strings.Contains(host, ":") {
+		return "", errors.New("network origin host is unsafe")
+	}
+	port := parsed.Port()
+	if strings.HasSuffix(parsed.Host, ":") {
+		return "", errors.New("network origin port is empty")
+	}
+	defaultPort := "80"
+	if scheme == "https" {
+		defaultPort = "443"
+	}
+	if port == "" {
+		port = defaultPort
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", errors.New("network origin port is invalid")
+	}
+	port = strconv.Itoa(portNumber)
+	if port == defaultPort {
+		return scheme + "://" + host, nil
+	}
+	return scheme + "://" + net.JoinHostPort(host, port), nil
 }
 
 func validateActionMatch(captureHosts []string, phase string, match ActionMatch) error {

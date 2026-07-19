@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,7 @@ type scriptRuntime struct {
 	statePath      string
 	moduleSet      string
 	moduleSetReady bool
+	networkSlots   chan struct{}
 }
 
 type scriptMessage struct {
@@ -57,8 +60,9 @@ type scriptResult struct {
 
 func newScriptRuntime(statePath ...string) *scriptRuntime {
 	runtime := &scriptRuntime{
-		programs:   make(map[string]*goja.Program),
-		persistent: make(map[string]map[string]string),
+		programs:     make(map[string]*goja.Program),
+		persistent:   make(map[string]map[string]string),
+		networkSlots: make(chan struct{}, maxConcurrentModuleNetworkCalls),
 	}
 	if len(statePath) > 0 {
 		runtime.statePath = statePath[0]
@@ -102,7 +106,7 @@ func (r *scriptRuntime) prune(modules []Module) {
 	}
 }
 
-func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMessage, response *scriptMessage) (scriptResult, error) {
+func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.CertPool, module Module, rule ScriptRule, request scriptMessage, response *scriptMessage) (scriptResult, error) {
 	program, err := r.program(module, rule)
 	if err != nil {
 		return scriptResult{}, err
@@ -113,6 +117,8 @@ func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMe
 	}
 	vm := goja.New()
 	installConsoleAPI(vm, module.ID, rule.ID)
+	actionCtx, cancelAction := context.WithTimeout(ctx, time.Duration(rule.TimeoutMS)*time.Millisecond)
+	defer cancelAction()
 	requestObject, err := scriptMessageObject(vm, request, "none")
 	if err != nil {
 		return scriptResult{}, err
@@ -138,25 +144,26 @@ func (r *scriptRuntime) execute(module Module, rule ScriptRule, request scriptMe
 	if module.PersistentStorage {
 		contextObject["storage"] = r.storageObject(vm, module.ID)
 	}
+	if len(module.NetworkOrigins) > 0 {
+		contextObject["network"] = newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, r.networkSlots)
+	}
 
-	timer := time.AfterFunc(time.Duration(rule.TimeoutMS)*time.Millisecond, func() {
-		vm.Interrupt("script execution timed out")
+	stopInterrupt := context.AfterFunc(actionCtx, func() {
+		vm.Interrupt("script execution canceled or timed out")
 	})
+	defer func() {
+		stopInterrupt()
+		vm.ClearInterrupt()
+	}()
 	_, runErr := vm.RunProgram(program)
 	if runErr != nil {
-		timer.Stop()
-		vm.ClearInterrupt()
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, runErr)
 	}
 	transform, ok := goja.AssertFunction(vm.Get("transform"))
 	if !ok {
-		timer.Stop()
-		vm.ClearInterrupt()
 		return scriptResult{}, fmt.Errorf("extension %s action %s must define function transform(context)", module.ID, rule.ID)
 	}
 	value, callErr := transform(goja.Undefined(), vm.ToValue(contextObject))
-	timer.Stop()
-	vm.ClearInterrupt()
 	if callErr != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, callErr)
 	}
@@ -608,7 +615,15 @@ func matchingScriptRules(cfg Config, phase string, message scriptMessage) []stru
 		Module Module
 		Rule   ScriptRule
 	}
+	modules := make(map[string]Module, len(cfg.Modules))
 	for _, module := range cfg.Modules {
+		modules[module.ID] = module
+	}
+	for _, moduleID := range cfg.ExecutionOrder {
+		module, exists := modules[moduleID]
+		if !exists {
+			continue
+		}
 		if !module.Enabled || !moduleOwnsHost(module, host) {
 			continue
 		}

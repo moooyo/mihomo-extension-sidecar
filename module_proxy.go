@@ -46,7 +46,7 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 		if matched.Rule.BodyMode != "none" && int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
 			return nil, false, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
 		}
-		result, err := p.scripts.execute(matched.Module, matched.Rule, message, nil)
+		result, err := p.scripts.execute(incoming.Context(), cfg, p.upstreamRoots, matched.Module, matched.Rule, message, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -147,7 +147,7 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 		if matched.Rule.BodyMode != "none" && int64(len(responseMessage.Body)) > matched.Rule.MaxBodyBytes {
 			return nil, fmt.Errorf("extension %s response body exceeds action limit", matched.Module.ID)
 		}
-		result, err := p.scripts.execute(matched.Module, matched.Rule, requestMessage, &responseMessage)
+		result, err := p.scripts.execute(request.Context(), cfg, p.upstreamRoots, matched.Module, matched.Rule, requestMessage, &responseMessage)
 		if err != nil {
 			return nil, err
 		}

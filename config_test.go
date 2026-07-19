@@ -30,9 +30,10 @@ func validNativeConfig() Config {
 	return Config{
 		Version: configVersion, Listen: "127.0.0.1:18080", Username: "inbound-user-123", Password: "inbound-password-123456789",
 		TLSCert: "/etc/5gpn/intercept/tls/fullchain.pem", TLSKey: "/etc/5gpn/intercept/tls/privkey.pem",
-		UpstreamProxy: ProxyConfig{Address: "127.0.0.1:17890", Username: "upstream-user-123", Password: "upstream-password-12345678"},
-		MITM:          MITMSettings{Enabled: true, HTTP2: true, QUICFallbackProtection: true},
-		Modules:       []Module{validNativeModule(true)},
+		UpstreamProxy:  ProxyConfig{Address: "127.0.0.1:17890", Username: "upstream-user-123", Password: "upstream-password-12345678"},
+		MITM:           MITMSettings{Enabled: true, HTTP2: true, QUICFallbackProtection: true},
+		Modules:        []Module{validNativeModule(true)},
+		ExecutionOrder: []string{"io.example.fixture"},
 	}
 }
 
@@ -51,16 +52,105 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Version != 3 || len(loaded.Modules) != 1 || loaded.Modules[0].ID != "io.example.fixture" {
+	if loaded.Version != 4 || len(loaded.Modules) != 1 || loaded.Modules[0].ID != "io.example.fixture" {
 		t.Fatalf("loaded config = %+v", loaded)
 	}
 
-	duplicate := strings.Replace(string(body), `"version":3`, `"version":3,"Version":3`, 1)
+	duplicate := strings.Replace(string(body), `"version":4`, `"version":4,"Version":4`, 1)
 	if err := os.WriteFile(path, []byte(duplicate), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "duplicate JSON key") {
 		t.Fatalf("duplicate key error = %v", err)
+	}
+}
+
+func TestConfigRejectsVersionThreeAndInvalidExecutionOrder(t *testing.T) {
+	t.Parallel()
+	cfg := validNativeConfig()
+	cfg.Version = 3
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 4") {
+		t.Fatalf("version error = %v", err)
+	}
+	cfg = validNativeConfig()
+	cfg.ExecutionOrder = nil
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "execution_order") {
+		t.Fatalf("missing execution order error = %v", err)
+	}
+	cfg = validNativeConfig()
+	cfg.Modules = []Module{}
+	cfg.ExecutionOrder = []string{}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit empty execution order error = %v", err)
+	}
+	cfg = validNativeConfig()
+	cfg.ExecutionOrder = []string{"io.example.other"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown extension") {
+		t.Fatalf("unknown execution order error = %v", err)
+	}
+	cfg.Modules = append(cfg.Modules, validNativeModule(false))
+	cfg.Modules[1].ID = "io.example.second"
+	cfg.ExecutionOrder = []string{"io.example.fixture", "io.example.fixture"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate extension") {
+		t.Fatalf("duplicate execution order error = %v", err)
+	}
+}
+
+func TestConfigValidatesNetworkAndEgressPermissions(t *testing.T) {
+	t.Parallel()
+	cfg := validNativeConfig()
+	cfg.Modules[0].NetworkOrigins = []string{
+		"http://events.example.com:8080",
+		"https://api.example.com",
+	}
+	cfg.Modules[0].EgressGroupRequired = true
+	cfg.Modules[0].EgressGroup = "Extension Egress"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	invalidOrigins := []string{
+		"https://api.example.com:443",
+		"https://api.example.com:443/",
+		"https://api.example.com:8443/path",
+		"https://user@api.example.com:443",
+		"https://127.0.0.1:443",
+		"https://*.example.com:443",
+	}
+	for _, origin := range invalidOrigins {
+		cfg := validNativeConfig()
+		cfg.Modules[0].NetworkOrigins = []string{origin}
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("accepted invalid network origin %q", origin)
+		}
+	}
+
+	cfg = validNativeConfig()
+	cfg.Modules[0].NetworkOrigins = []string{"https://z.example.com", "https://a.example.com"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "sorted") {
+		t.Fatalf("unsorted origins error = %v", err)
+	}
+	cfg = validNativeConfig()
+	cfg.Modules[0].EgressGroupRequired = true
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "egress_group") {
+		t.Fatalf("missing egress group error = %v", err)
+	}
+	cfg.Modules[0].Enabled = false
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled extension required egress error = %v", err)
+	}
+	cfg = validNativeConfig()
+	cfg.Modules[0].EgressGroup = "Optional Egress"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("optional egress group error = %v", err)
+	}
+	cfg.Modules[0].EgressGroup = "Bad,Group"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "comma") {
+		t.Fatalf("invalid egress group error = %v", err)
+	}
+	cfg.Modules[0].EgressGroup = reservedTerminalMatchEgressGroup
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("reserved egress group error = %v", err)
 	}
 }
 
