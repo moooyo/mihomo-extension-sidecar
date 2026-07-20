@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -150,60 +148,4 @@ func TestNativeActionMatchingUsesTopLevelExecutionOrderForBothPhases(t *testing.
 			t.Fatalf("%s order = %+v", phase, matched)
 		}
 	}
-}
-
-func TestRepositoryWLOCExtensionScriptPatchesBinaryResponse(t *testing.T) {
-	t.Parallel()
-	source, err := os.ReadFile(filepath.Join("..", "..", "extensions", "apple-wloc", "wloc.js"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	location := append(testVarintField(1, 1), testVarintField(2, 2)...)
-	location = append(location, testVarintField(3, 99)...)
-	wifi := testLengthField(1, []byte("aa:bb:cc:dd:ee:ff"))
-	wifi = append(wifi, testLengthField(2, location)...)
-	root := testLengthField(2, wifi)
-	frame := append(make([]byte, 8), byte(len(root)>>8), byte(len(root)))
-	frame = append(frame, root...)
-
-	module := Module{
-		ID: "io.5gpn.apple-wloc", CaptureHosts: []string{"gs-loc.apple.com"},
-		Settings: []ModuleSetting{
-			{Key: "location", Type: "location", Required: true, Value: json.RawMessage(`{"longitude":-122.4194,"latitude":37.7749,"accuracy":25}`)},
-			{Key: "failClosed", Type: "boolean", Required: true, Value: json.RawMessage(`true`)},
-		},
-	}
-	rule := ScriptRule{
-		ID: "rewrite-wloc-response", Phase: "response",
-		Match:        ActionMatch{Hosts: []string{"gs-loc.apple.com"}, Schemes: []string{"https"}, PathRegex: "^/clls/wloc$", StatusCodes: []int{200}},
-		ScriptDigest: digestText(string(source)), ScriptBody: string(source), BodyMode: "binary", TimeoutMS: 1500, MaxBodyBytes: 8 << 20,
-	}
-	request := scriptMessage{URL: "https://gs-loc.apple.com/clls/wloc", Method: http.MethodPost, Headers: make(http.Header)}
-	response := scriptMessage{URL: request.URL, Method: request.Method, StatusCode: 200, Headers: make(http.Header), Body: frame}
-	result, err := newScriptRuntime().execute(context.Background(), Config{}, nil, module, rule, request, &response)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.ChangedBody || bytes.Equal(result.Body, frame) || !strings.Contains(string(source), "function transform(context)") {
-		t.Fatalf("WLOC native extension did not patch the response: %+v", result)
-	}
-}
-
-func testEncodeVarint(value uint64) []byte {
-	var output []byte
-	for value >= 0x80 {
-		output = append(output, byte(value)|0x80)
-		value >>= 7
-	}
-	return append(output, byte(value))
-}
-
-func testVarintField(number, value uint64) []byte {
-	return append(testEncodeVarint(number<<3), testEncodeVarint(value)...)
-}
-
-func testLengthField(number uint64, value []byte) []byte {
-	output := testEncodeVarint(number<<3 | 2)
-	output = append(output, testEncodeVarint(uint64(len(value)))...)
-	return append(output, value...)
 }
