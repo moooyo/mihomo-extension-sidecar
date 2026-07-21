@@ -65,6 +65,53 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 	}
 }
 
+func TestReadConfigBoundedRejectsSymlinkAndNonRegularPaths(t *testing.T) {
+	t.Parallel()
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target.json")
+		if err := os.WriteFile(target, []byte(`{"version":4}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "config.json")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symbolic links are unavailable: %v", err)
+		}
+		if _, err := readConfigBounded(link); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("symlink error = %v", err)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		if _, err := readConfigBounded(t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("directory error = %v", err)
+		}
+	})
+}
+
+func TestReadConfigBoundedRejectsPathSwapDuringOpen(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	originalPath := filepath.Join(dir, "original.json")
+	if err := os.WriteFile(path, []byte(`{"version":4}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := readConfigBoundedWithOpen(path, func(name string) (*os.File, error) {
+		if err := os.Rename(name, originalPath); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(name, []byte(`{"version":4,"replacement":true}`), 0o600); err != nil {
+			return nil, err
+		}
+		return os.Open(name)
+	})
+	if err == nil || !strings.Contains(err.Error(), "changed while opening") {
+		t.Fatalf("path swap error = %v", err)
+	}
+}
+
 func TestConfigRejectsVersionThreeAndInvalidExecutionOrder(t *testing.T) {
 	t.Parallel()
 	cfg := validNativeConfig()

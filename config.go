@@ -172,11 +172,37 @@ func loadCertificateConfig(path string) (Config, error) {
 }
 
 func readConfigBounded(path string) ([]byte, error) {
-	file, err := os.Open(path)
+	return readConfigBoundedWithOpen(path, os.Open)
+}
+
+func readConfigBoundedWithOpen(path string, openFile func(string) (*os.File, error)) ([]byte, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !pathInfo.Mode().IsRegular() {
+		return nil, errors.New("config path is not a regular file")
+	}
+	// Windows resolves the file ID stored in FileInfo lazily. Comparing the
+	// pre-open value with itself pins that identity before the path can change.
+	if !os.SameFile(pathInfo, pathInfo) {
+		return nil, errors.New("could not establish config file identity")
+	}
+	file, err := openFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !openedInfo.Mode().IsRegular() {
+		return nil, errors.New("opened config is not a regular file")
+	}
+	if !os.SameFile(pathInfo, openedInfo) {
+		return nil, errors.New("config path changed while opening")
+	}
 	body, err := io.ReadAll(io.LimitReader(file, maxConfigBytes+1))
 	if err != nil {
 		return nil, err

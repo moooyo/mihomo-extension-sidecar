@@ -35,6 +35,28 @@ func (t socksTarget) Network() string { return "udp" }
 
 func (t socksTarget) String() string { return net.JoinHostPort(t.Host, strconv.Itoa(t.Port)) }
 
+func bindSOCKSHandshakeContext(ctx context.Context, conn net.Conn) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
+	fired := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(fired)
+	})
+	return func() {
+		if !stop() {
+			<-fired
+		}
+		_ = conn.SetDeadline(time.Time{})
+	}, nil
+}
+
 func readSOCKSRequest(conn net.Conn, username, password string) (byte, socksTarget, error) {
 	if err := authenticateSOCKSServer(conn, username, password); err != nil {
 		return 0, socksTarget{}, err
@@ -210,9 +232,12 @@ func dialSOCKS5TCP(ctx context.Context, proxy ProxyConfig, target socksTarget) (
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream SOCKS proxy: %w", err)
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
+	releaseContext, err := bindSOCKSHandshakeContext(ctx, conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("bind upstream SOCKS handshake context: %w", err)
 	}
+	defer releaseContext()
 	if err := authenticateSOCKSClient(conn, proxy.Username, proxy.Password); err != nil {
 		conn.Close()
 		return nil, err
@@ -230,7 +255,6 @@ func dialSOCKS5TCP(ctx context.Context, proxy ProxyConfig, target socksTarget) (
 		conn.Close()
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 
@@ -288,6 +312,12 @@ func dialSOCKS5UDP(ctx context.Context, proxy ProxyConfig, target socksTarget) (
 	if err != nil {
 		return nil, fmt.Errorf("dial upstream SOCKS proxy: %w", err)
 	}
+	releaseContext, err := bindSOCKSHandshakeContext(ctx, control)
+	if err != nil {
+		control.Close()
+		return nil, fmt.Errorf("bind upstream SOCKS handshake context: %w", err)
+	}
+	defer releaseContext()
 	if err := authenticateSOCKSClient(control, proxy.Username, proxy.Password); err != nil {
 		control.Close()
 		return nil, err
@@ -302,7 +332,7 @@ func dialSOCKS5UDP(ctx context.Context, proxy ProxyConfig, target socksTarget) (
 		control.Close()
 		return nil, err
 	}
-	relayAddr, err := resolveSOCKSRelay(proxy.Address, relay)
+	relayAddr, err := resolveSOCKSRelay(ctx, proxy.Address, relay)
 	if err != nil {
 		control.Close()
 		return nil, err
@@ -315,7 +345,7 @@ func dialSOCKS5UDP(ctx context.Context, proxy ProxyConfig, target socksTarget) (
 	return &fixedSOCKSPacketConn{conn: udpConn, control: control, relay: relayAddr, target: target}, nil
 }
 
-func resolveSOCKSRelay(proxyAddress string, relay socksTarget) (*net.UDPAddr, error) {
+func resolveSOCKSRelay(ctx context.Context, proxyAddress string, relay socksTarget) (*net.UDPAddr, error) {
 	host := relay.Host
 	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
 		proxyHost, _, err := net.SplitHostPort(proxyAddress)
@@ -324,7 +354,21 @@ func resolveSOCKSRelay(proxyAddress string, relay socksTarget) (*net.UDPAddr, er
 		}
 		host = proxyHost
 	}
-	return net.ResolveUDPAddr("udp4", net.JoinHostPort(host, strconv.Itoa(relay.Port)))
+	ip := net.ParseIP(host)
+	if ip == nil {
+		addresses, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+		if err != nil {
+			return nil, err
+		}
+		if len(addresses) == 0 {
+			return nil, errors.New("upstream SOCKS UDP relay has no IPv4 address")
+		}
+		ip = addresses[0]
+	}
+	if ip = ip.To4(); ip == nil {
+		return nil, errors.New("upstream SOCKS UDP relay is not IPv4")
+	}
+	return &net.UDPAddr{IP: ip, Port: relay.Port}, nil
 }
 
 type fixedSOCKSPacketConn struct {

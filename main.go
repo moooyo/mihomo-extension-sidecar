@@ -15,6 +15,8 @@ import (
 
 var version = "dev"
 
+const interceptHealthcheckTimeout = 5 * time.Second
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		fmt.Println(version)
@@ -77,16 +79,11 @@ func main() {
 		if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
 			log.Fatal("intercept: healthcheck unavailable without an active extension")
 		}
-		host := activeHostPatterns(cfg)[0]
-		if strings.HasPrefix(host, "*.") {
-			host = "probe." + strings.TrimPrefix(host, "*.")
-		}
-		proxy := ProxyConfig{Address: cfg.Listen, Username: cfg.Username, Password: cfg.Password}
-		conn, err := dialSOCKS5UDP(context.Background(), proxy, socksTarget{Host: host, Port: 443})
-		if err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), interceptHealthcheckTimeout)
+		defer cancel()
+		if err := checkInterceptHealth(ctx, cfg); err != nil {
 			log.Fatalf("intercept: healthcheck failed: %v", err)
 		}
-		_ = conn.Close()
 		return
 	}
 	if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
@@ -110,6 +107,20 @@ func main() {
 	if err := newInterceptProxy(store, certificates).Serve(ctx, listener); err != nil {
 		log.Fatalf("intercept: service failed: %v", err)
 	}
+}
+
+func checkInterceptHealth(ctx context.Context, cfg Config) error {
+	host := activeHostPatterns(cfg)[0]
+	if strings.HasPrefix(host, "*.") {
+		host = "probe." + strings.TrimPrefix(host, "*.")
+	}
+	proxy := ProxyConfig{Address: cfg.Listen, Username: cfg.Username, Password: cfg.Password}
+	conn, err := dialSOCKS5UDP(ctx, proxy, socksTarget{Host: host, Port: 443})
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
 }
 
 func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.CancelFunc) {
