@@ -34,12 +34,27 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	}
 	upstreamServer := &http3.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if canonicalHost(r.Host) != "api.example.com" || r.URL.Path != "/v1" {
+			if canonicalHost(r.Host) != "api.example.com" || r.Header.Get("Te") != "trailers" {
+				http.Error(w, "unexpected request", http.StatusBadRequest)
+				return
+			}
+			if r.URL.Path == "/bodyless" {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			if r.URL.Path == "/oversized-header" {
+				w.Header().Set("X-Oversized", strings.Repeat("x", int(maxModuleNetworkHeaderBytes)+1))
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if r.URL.Path != "/v1" {
 				http.Error(w, "unexpected request", http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Trailer", "Grpc-Status")
 			_, _ = w.Write(upstreamBody)
+			w.Header().Set("Grpc-Status", "0")
 		}),
 		TLSConfig: &tls.Config{
 			MinVersion:   tls.VersionTLS13,
@@ -61,7 +76,11 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	manifest := "apiVersion: 5gpn.io/v1\nkind: Extension\n"
-	script := `function transform(context) { return { response: { body: context.response.body + "-patched" } } }`
+	script := `function transform(context) {
+	if (context.response.status === 304) return {response: {body: ""}}
+  if (context.response.trailers["Grpc-Status"] !== "0") throw new Error("missing upstream trailer")
+  return { response: { body: context.response.body + "-patched", trailers: {"Grpc-Status": "7"} } }
+}`
 	cfg := Config{
 		Version: configVersion, Listen: "127.0.0.1:18080", Username: "inbound-user-123", Password: "inbound-password-123456789",
 		TLSCert: certPath, TLSKey: keyPath,
@@ -72,7 +91,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			ID: "io.example.http3", Version: "1.0.0", Name: "HTTP3 fixture", Enabled: true, ImportedAt: time.Now().UTC().Format(time.RFC3339),
 			Source: ModuleSource{Digest: digestText(manifest), Body: manifest}, CaptureHosts: []string{"api.example.com"},
 			Scripts: []ScriptRule{{
-				ID: "patch", Phase: "response", Match: ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/v1$", StatusCodes: []int{200}},
+				ID: "patch", Phase: "response", Match: ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/(?:v1|bodyless)$", StatusCodes: []int{200, 304}},
 				ScriptDigest: digestText(script), ScriptBody: script, BodyMode: "text", TimeoutMS: 1000, MaxBodyBytes: 1 << 20,
 			}},
 		}},
@@ -139,6 +158,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			request.Header.Set("Te", "trailers")
 			response, err := clientTransport.RoundTrip(request)
 			if err != nil {
 				t.Fatalf("HTTP/3 round trip: %v", err)
@@ -153,6 +173,43 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			}
 			if string(body) != "upstream-patched" {
 				t.Fatalf("body=%q", body)
+			}
+			if response.Trailer.Get("Grpc-Status") != "7" {
+				t.Fatalf("trailers=%v", response.Trailer)
+			}
+
+			bodylessRequest, err := http.NewRequest(http.MethodPost, "https://api.example.com/bodyless", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodylessRequest.Header.Set("Te", "trailers")
+			bodylessResponse, err := clientTransport.RoundTrip(bodylessRequest)
+			if err != nil {
+				t.Fatalf("HTTP/3 bodyless round trip: %v", err)
+			}
+			defer bodylessResponse.Body.Close()
+			if _, err := io.ReadAll(bodylessResponse.Body); err != nil {
+				t.Fatal(err)
+			}
+			if bodylessResponse.StatusCode != http.StatusNotModified {
+				t.Fatalf("bodyless status=%d", bodylessResponse.StatusCode)
+			}
+
+			oversizedRequest, err := http.NewRequest(http.MethodGet, "https://api.example.com/oversized-header", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oversizedRequest.Header.Set("Te", "trailers")
+			oversizedResponse, err := clientTransport.RoundTrip(oversizedRequest)
+			if err != nil {
+				t.Fatalf("HTTP/3 oversized-header round trip: %v", err)
+			}
+			defer oversizedResponse.Body.Close()
+			if _, err := io.ReadAll(oversizedResponse.Body); err != nil {
+				t.Fatal(err)
+			}
+			if oversizedResponse.StatusCode != http.StatusBadGateway {
+				t.Fatalf("oversized-header status=%d", oversizedResponse.StatusCode)
 			}
 		})
 	}

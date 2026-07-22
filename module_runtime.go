@@ -41,22 +41,31 @@ type scriptMessage struct {
 	URL        string
 	Method     string
 	Headers    http.Header
+	Trailers   http.Header
 	Body       []byte
 	StatusCode int
 }
 
 type scriptResult struct {
-	URL            string
-	Headers        http.Header
-	Body           []byte
-	StatusCode     int
-	Synthetic      bool
-	Abort          bool
-	ChangedURL     bool
-	ChangedBody    bool
-	ChangedHeaders bool
-	ChangedStatus  bool
+	URL             string
+	Headers         http.Header
+	Trailers        http.Header
+	Body            []byte
+	StatusCode      int
+	Synthetic       bool
+	Abort           bool
+	ChangedURL      bool
+	ChangedBody     bool
+	ChangedHeaders  bool
+	ChangedTrailers bool
+	ChangedStatus   bool
 }
+
+const (
+	maxScriptHeaderFields     = 256
+	maxScriptHeaderValues     = 512
+	maxScriptHeaderValueBytes = 16 << 10
+)
 
 func newScriptRuntime(statePath ...string) *scriptRuntime {
 	runtime := &scriptRuntime{
@@ -234,7 +243,7 @@ func applyNativePatch(result *scriptResult, raw any, response bool) error {
 		return errors.New("transform request/response patch must be an object")
 	}
 	for key := range object {
-		if key != "url" && key != "headers" && key != "body" && key != "status" {
+		if key != "url" && key != "headers" && key != "trailers" && key != "body" && key != "status" {
 			return fmt.Errorf("transform patch contains unsupported field %q", key)
 		}
 	}
@@ -254,8 +263,22 @@ func applyNativePatch(result *scriptResult, raw any, response bool) error {
 		if err != nil {
 			return err
 		}
+		if err := validateNativePatchHeaders(headers, response); err != nil {
+			return err
+		}
 		result.Headers = headers
 		result.ChangedHeaders = true
+	}
+	if rawTrailers, exists := object["trailers"]; exists {
+		if !response {
+			return errors.New("request patches cannot set trailers")
+		}
+		trailers, err := exportedTrailers(rawTrailers)
+		if err != nil {
+			return err
+		}
+		result.Trailers = trailers
+		result.ChangedTrailers = true
 	}
 	if rawBody, exists := object["body"]; exists {
 		body, err := exportedBody(rawBody)
@@ -483,6 +506,7 @@ func scriptMessageObject(vm *goja.Runtime, message scriptMessage, bodyMode strin
 	}
 	if message.StatusCode != 0 {
 		object["status"] = message.StatusCode
+		object["trailers"] = flatHeaders(message.Trailers)
 	}
 	return object, nil
 }
@@ -524,13 +548,28 @@ func stringAnyMap(value any) (map[string]any, bool) {
 }
 
 func exportedHeaders(value any) (http.Header, error) {
+	if typed, ok := value.(http.Header); ok {
+		return exportedStringSliceHeaders(map[string][]string(typed))
+	}
+	if typed, ok := value.(map[string][]string); ok {
+		return exportedStringSliceHeaders(typed)
+	}
 	if typed, ok := value.(map[string]string); ok {
-		headers := make(http.Header, len(typed))
-		for name, item := range typed {
-			if strings.ContainsAny(name, "\r\n:") || strings.ContainsAny(item, "\r\n") {
-				return nil, fmt.Errorf("invalid header %q", name)
+		names, err := validatedScriptHeaderNames(mapKeysString(typed))
+		if err != nil {
+			return nil, err
+		}
+		budget := scriptHeaderBudget{}
+		headers := make(http.Header, len(names))
+		for _, name := range names {
+			if err := budget.addField(name); err != nil {
+				return nil, err
 			}
-			headers.Set(name, item)
+			item := typed[name]
+			if err := budget.addValue(name, item); err != nil {
+				return nil, err
+			}
+			headers[http.CanonicalHeaderKey(name)] = []string{item}
 		}
 		return headers, nil
 	}
@@ -538,34 +577,192 @@ func exportedHeaders(value any) (http.Header, error) {
 	if !ok {
 		return nil, errors.New("headers must be an object")
 	}
-	headers := make(http.Header, len(object))
-	for name, raw := range object {
-		if strings.ContainsAny(name, "\r\n:") || strings.TrimSpace(name) == "" {
-			return nil, fmt.Errorf("invalid header name %q", name)
+	names, err := validatedScriptHeaderNames(mapKeysAny(object))
+	if err != nil {
+		return nil, err
+	}
+	budget := scriptHeaderBudget{}
+	headers := make(http.Header, len(names))
+	for _, name := range names {
+		if err := budget.addField(name); err != nil {
+			return nil, err
 		}
-		switch typed := raw.(type) {
-		case string:
-			if strings.ContainsAny(typed, "\r\n") {
-				return nil, fmt.Errorf("invalid header value for %s", name)
-			}
-			headers.Set(name, typed)
-		case []any:
-			for _, item := range typed {
-				text := fmt.Sprint(item)
-				if strings.ContainsAny(text, "\r\n") {
-					return nil, fmt.Errorf("invalid header value for %s", name)
-				}
-				headers.Add(name, text)
-			}
-		default:
-			text := fmt.Sprint(raw)
-			if strings.ContainsAny(text, "\r\n") {
-				return nil, fmt.Errorf("invalid header value for %s", name)
-			}
-			headers.Set(name, text)
+		values, err := exportedHeaderValues(name, object[name], &budget)
+		if err != nil {
+			return nil, err
 		}
+		headers[http.CanonicalHeaderKey(name)] = values
 	}
 	return headers, nil
+}
+
+func exportedStringSliceHeaders(values map[string][]string) (http.Header, error) {
+	names, err := validatedScriptHeaderNames(mapKeysStringSlice(values))
+	if err != nil {
+		return nil, err
+	}
+	budget := scriptHeaderBudget{}
+	headers := make(http.Header, len(names))
+	for _, name := range names {
+		if err := budget.addField(name); err != nil {
+			return nil, err
+		}
+		exported, err := exportedHeaderValues(name, values[name], &budget)
+		if err != nil {
+			return nil, err
+		}
+		headers[http.CanonicalHeaderKey(name)] = exported
+	}
+	return headers, nil
+}
+
+type scriptHeaderBudget struct {
+	values int
+	bytes  int64
+}
+
+func (b *scriptHeaderBudget) addField(name string) error {
+	b.bytes += int64(len(name))
+	if b.bytes > maxModuleNetworkHeaderBytes {
+		return fmt.Errorf("script headers exceed %d bytes", maxModuleNetworkHeaderBytes)
+	}
+	return nil
+}
+
+func (b *scriptHeaderBudget) addValue(name, value string) error {
+	if !validHTTPHeaderValue(value) {
+		return fmt.Errorf("invalid header value for %s", name)
+	}
+	if len(value) > maxScriptHeaderValueBytes {
+		return fmt.Errorf("header value for %s exceeds %d bytes", name, maxScriptHeaderValueBytes)
+	}
+	b.values++
+	if b.values > maxScriptHeaderValues {
+		return fmt.Errorf("script headers exceed %d values", maxScriptHeaderValues)
+	}
+	b.bytes += int64(len(value))
+	if b.bytes > maxModuleNetworkHeaderBytes {
+		return fmt.Errorf("script headers exceed %d bytes", maxModuleNetworkHeaderBytes)
+	}
+	return nil
+}
+
+func exportedHeaderValues(name string, raw any, budget *scriptHeaderBudget) ([]string, error) {
+	switch typed := raw.(type) {
+	case []string:
+		if len(typed) > maxScriptHeaderValues-budget.values {
+			return nil, fmt.Errorf("script headers exceed %d values", maxScriptHeaderValues)
+		}
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if err := budget.addValue(name, item); err != nil {
+				return nil, err
+			}
+			values = append(values, item)
+		}
+		return values, nil
+	case []any:
+		if len(typed) > maxScriptHeaderValues-budget.values {
+			return nil, fmt.Errorf("script headers exceed %d values", maxScriptHeaderValues)
+		}
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, err := exportedHeaderScalar(item)
+			if err != nil {
+				return nil, fmt.Errorf("invalid header value for %s: %w", name, err)
+			}
+			if err := budget.addValue(name, text); err != nil {
+				return nil, err
+			}
+			values = append(values, text)
+		}
+		return values, nil
+	}
+	text, err := exportedHeaderScalar(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid header value for %s: %w", name, err)
+	}
+	if err := budget.addValue(name, text); err != nil {
+		return nil, err
+	}
+	return []string{text}, nil
+}
+
+func exportedHeaderScalar(value any) (string, error) {
+	switch typed := value.(type) {
+	case string:
+		return typed, nil
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		return fmt.Sprint(typed), nil
+	default:
+		return "", errors.New("header values must be strings or scalar values")
+	}
+}
+
+func validatedScriptHeaderNames(names []string) ([]string, error) {
+	if len(names) > maxScriptHeaderFields {
+		return nil, fmt.Errorf("script headers exceed %d fields", maxScriptHeaderFields)
+	}
+	sort.Strings(names)
+	seen := make(map[string]string, len(names))
+	for _, name := range names {
+		if !validModuleNetworkHeaderName(name) {
+			return nil, fmt.Errorf("invalid header name %q", name)
+		}
+		folded := strings.ToLower(name)
+		if previous, exists := seen[folded]; exists {
+			return nil, fmt.Errorf("duplicate header names %q and %q", previous, name)
+		}
+		seen[folded] = name
+	}
+	return names, nil
+}
+
+func mapKeysString(values map[string]string) []string {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	return names
+}
+
+func mapKeysAny(values map[string]any) []string {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	return names
+}
+
+func mapKeysStringSlice(values map[string][]string) []string {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	return names
+}
+
+func validHTTPHeaderValue(value string) bool {
+	for index := 0; index < len(value); index++ {
+		item := value[index]
+		if item == 0x7f || item < ' ' && item != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+func exportedTrailers(value any) (http.Header, error) {
+	trailers, err := exportedHeaders(value)
+	if err != nil {
+		return nil, err
+	}
+	for name := range trailers {
+		if !validResponseTrailerName(name) {
+			return nil, fmt.Errorf("invalid trailer %q", name)
+		}
+	}
+	return trailers, nil
 }
 
 func exportedStatus(value any) (int, error) {

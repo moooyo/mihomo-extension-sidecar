@@ -10,7 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -320,18 +320,17 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if transformed != nil {
-		copyResponseHeaders(w.Header(), transformed.Header)
-		removeHopByHopHeaders(w.Header())
-		w.Header().Del("Content-Encoding")
-		w.Header().Set("Content-Length", strconv.Itoa(len(transformed.Body)))
-		w.WriteHeader(transformed.StatusCode)
-		_, _ = w.Write(transformed.Body)
+		if writeErr := writeBufferedModuleResponse(w, r.Method, transformed.StatusCode, transformed.Header, transformed.Trailer, transformed.Body); writeErr != nil {
+			log.Printf("intercept: transformed response write failed host=%s protocol=%s: %v", host, r.Proto, writeErr)
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 
-	copyResponseHeaders(w.Header(), response.Header)
-	w.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(w, response.Body)
+	if copyErr := writeStreamingProxyResponse(w, r.ProtoMajor, r.Method, response); copyErr != nil {
+		log.Printf("intercept: upstream response copy failed host=%s protocol=%s: %v", host, r.Proto, copyErr)
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func (p *interceptProxy) acquireBodySlot() bool {
@@ -368,8 +367,9 @@ func (p *interceptProxy) roundTrip(request *http.Request, cfg Config) (*http.Res
 
 func (p *interceptProxy) newHTTPTransport(cfg Config) *http.Transport {
 	return &http.Transport{
-		Proxy:             nil,
-		ForceAttemptHTTP2: cfg.MITM.HTTP2,
+		Proxy:                  nil,
+		ForceAttemptHTTP2:      cfg.MITM.HTTP2,
+		MaxResponseHeaderBytes: maxModuleNetworkHeaderBytes,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    p.upstreamRoots,
@@ -419,6 +419,7 @@ func roundTripHTTP3Version(request *http.Request, cfg Config, roots *x509.CertPo
 	}
 	quicTransport := &quic.Transport{Conn: packetConn}
 	h3Transport := &http3.Transport{
+		MaxResponseHeaderBytes: int(maxModuleNetworkHeaderBytes),
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			ServerName: host,
@@ -476,7 +477,7 @@ func cloneProxyHeaders(source http.Header) http.Header {
 
 func copyResponseHeaders(destination, source http.Header) {
 	for name, values := range source {
-		if isHopByHopHeader(name) {
+		if isHopByHopHeader(name) || connectionListsHeader(source, name) {
 			continue
 		}
 		destination[name] = append([]string(nil), values...)
@@ -484,11 +485,97 @@ func copyResponseHeaders(destination, source http.Header) {
 }
 
 func removeHopByHopHeaders(header http.Header) {
+	for _, value := range header.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.TrimSpace(name)
+			if validModuleNetworkHeaderName(name) {
+				header.Del(name)
+			}
+		}
+	}
 	for name := range header {
 		if isHopByHopHeader(name) {
 			header.Del(name)
 		}
 	}
+}
+
+func validateNativePatchHeaders(headers http.Header, response bool) error {
+	if !response {
+		if err := normalizeRequestTEHeader(headers); err != nil {
+			return err
+		}
+	}
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !isHopByHopHeader(name) || (!response && strings.EqualFold(name, "Te")) {
+			continue
+		}
+		phase := "request"
+		if response {
+			phase = "response"
+		}
+		return fmt.Errorf("header %q is not permitted in a native %s patch", name, phase)
+	}
+	return nil
+}
+
+func sanitizeForwardRequestHeaders(headers http.Header) {
+	preserveTrailers := requestTEIsTrailers(headers)
+	removeHopByHopHeaders(headers)
+	if preserveTrailers {
+		headers.Set("Te", "trailers")
+	}
+}
+
+func requestTEIsTrailers(headers http.Header) bool {
+	var values []string
+	fields := 0
+	for name, fieldValues := range headers {
+		if strings.EqualFold(name, "Te") {
+			fields++
+			values = append(values, fieldValues...)
+		}
+	}
+	return fields == 1 && len(values) == 1 && strings.EqualFold(strings.TrimSpace(values[0]), "trailers")
+}
+
+func connectionListsHeader(headers http.Header, want string) bool {
+	for _, value := range headers.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(name), want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeRequestTEHeader(headers http.Header) error {
+	var names []string
+	for name := range headers {
+		if strings.EqualFold(name, "Te") {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	sort.Strings(names)
+	if len(names) != 1 {
+		return fmt.Errorf("duplicate TE header names %q", names)
+	}
+	values := headers[names[0]]
+	if len(values) != 1 || !strings.EqualFold(strings.TrimSpace(values[0]), "trailers") {
+		return errors.New("TE header must contain exactly trailers")
+	}
+	delete(headers, names[0])
+	headers.Set("Te", "trailers")
+	return nil
 }
 
 func isHopByHopHeader(name string) bool {
@@ -498,6 +585,128 @@ func isHopByHopHeader(name string) bool {
 	default:
 		return false
 	}
+}
+
+func validResponseTrailerName(name string) bool {
+	if !validModuleNetworkHeaderName(name) {
+		return false
+	}
+	canonical := http.CanonicalHeaderKey(name)
+	if strings.HasPrefix(canonical, "If-") {
+		return false
+	}
+	switch canonical {
+	case "Authorization", "Cache-Control", "Connection", "Content-Encoding", "Content-Length", "Content-Range", "Content-Type",
+		"Expect", "Host", "Keep-Alive", "Max-Forwards", "Pragma", "Proxy-Authenticate", "Proxy-Authorization",
+		"Proxy-Connection", "Range", "Realm", "Te", "Trailer", "Transfer-Encoding", "Www-Authenticate":
+		return false
+	default:
+		return true
+	}
+}
+
+func responseTrailerNames(trailers http.Header) []string {
+	seen := make(map[string]struct{}, len(trailers))
+	for name := range trailers {
+		canonical := http.CanonicalHeaderKey(name)
+		if !validResponseTrailerName(canonical) {
+			continue
+		}
+		seen[canonical] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func declareResponseTrailers(header, trailers http.Header) []string {
+	header.Del("Trailer")
+	names := responseTrailerNames(trailers)
+	if len(names) == 0 {
+		return nil
+	}
+	header.Del("Content-Length")
+	header.Set("Trailer", strings.Join(names, ", "))
+	return names
+}
+
+func publishResponseTrailers(header, trailers http.Header, declared []string) {
+	declaredSet := make(map[string]struct{}, len(declared))
+	for _, name := range declared {
+		declaredSet[name] = struct{}{}
+	}
+	for _, name := range responseTrailerNames(trailers) {
+		values := responseTrailerValues(trailers, name)
+		if _, exists := declaredSet[name]; exists {
+			header[name] = values
+			continue
+		}
+		header[http.TrailerPrefix+name] = values
+	}
+}
+
+func responseTrailerValues(trailers http.Header, name string) []string {
+	var values []string
+	for candidate, candidateValues := range trailers {
+		if strings.EqualFold(candidate, name) {
+			values = append(values, candidateValues...)
+		}
+	}
+	return values
+}
+
+func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int, method string, response *http.Response) error {
+	responseHeaders, err := exportedHeaders(response.Header)
+	if err != nil {
+		return fmt.Errorf("upstream response headers: %w", err)
+	}
+	announcedTrailers, err := exportedTrailers(response.Trailer)
+	if err != nil {
+		return fmt.Errorf("upstream response trailers: %w", err)
+	}
+	canHaveBody := responseCanHaveBody(method, response.StatusCode)
+	if len(responseTrailerNames(announcedTrailers)) > 0 && !canHaveBody {
+		return errors.New("response trailers require a response body section")
+	}
+	copyResponseHeaders(w.Header(), responseHeaders)
+	declaredTrailers := declareResponseTrailers(w.Header(), announcedTrailers)
+	forceChunked := downstreamProtoMajor == 1 && response.ProtoMajor >= 2 && canHaveBody
+	if forceChunked {
+		w.Header().Del("Content-Length")
+	}
+	w.WriteHeader(response.StatusCode)
+	if forceChunked {
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return err
+		}
+	}
+	if _, err := io.Copy(w, response.Body); err != nil {
+		return err
+	}
+	responseTrailers, err := exportedTrailers(response.Trailer)
+	if err != nil {
+		return fmt.Errorf("upstream response trailers: %w", err)
+	}
+	if len(responseTrailerNames(responseTrailers)) > 0 && !canHaveBody {
+		return errors.New("response trailers require a response body section")
+	}
+	if len(responseTrailerNames(responseTrailers)) > 0 {
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return err
+		}
+	}
+	publishResponseTrailers(w.Header(), responseTrailers, declaredTrailers)
+	return nil
+}
+
+func responseCanHaveBody(method string, status int) bool {
+	if method == http.MethodHead || status >= 100 && status <= 199 {
+		return false
+	}
+	return status != http.StatusNoContent && status != http.StatusNotModified
 }
 
 type singleConnListener struct {

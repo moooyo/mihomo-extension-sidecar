@@ -59,10 +59,11 @@ func newModuleNetworkAPI(
 			panic(vm.NewGoError(err))
 		}
 		result := map[string]any{
-			"url":     response.url,
-			"status":  response.status,
-			"headers": response.headers,
-			"body":    body,
+			"url":      response.url,
+			"status":   response.status,
+			"headers":  response.headers,
+			"trailers": response.trailers,
+			"body":     body,
 		}
 		if utf8.Valid(response.body) {
 			result["text"] = string(response.body)
@@ -73,10 +74,11 @@ func newModuleNetworkAPI(
 }
 
 type moduleNetworkResponse struct {
-	url     string
-	status  int
-	headers map[string][]string
-	body    []byte
+	url      string
+	status   int
+	headers  map[string][]string
+	trailers map[string][]string
+	body     []byte
 }
 
 func performModuleNetworkRequest(
@@ -196,15 +198,20 @@ func performModuleNetworkRequest(
 	if err != nil {
 		return moduleNetworkResponse{}, err
 	}
-	responseHeaders := make(map[string][]string, len(response.Header))
-	for name, values := range response.Header {
-		responseHeaders[name] = append([]string(nil), values...)
+	responseHeaders, err := exportedHeaders(response.Header)
+	if err != nil {
+		return moduleNetworkResponse{}, fmt.Errorf("network response headers: %w", err)
+	}
+	responseTrailers, err := exportedTrailers(response.Trailer)
+	if err != nil {
+		return moduleNetworkResponse{}, fmt.Errorf("network response trailers: %w", err)
 	}
 	return moduleNetworkResponse{
-		url:     response.Request.URL.String(),
-		status:  response.StatusCode,
-		headers: responseHeaders,
-		body:    responseBody,
+		url:      response.Request.URL.String(),
+		status:   response.StatusCode,
+		headers:  map[string][]string(responseHeaders),
+		trailers: map[string][]string(responseTrailers),
+		body:     responseBody,
 	}, nil
 }
 
@@ -243,9 +250,12 @@ func parseModuleNetworkRequestURL(raw string) (*url.URL, string, socksTarget, er
 }
 
 func validateModuleNetworkHeaders(headers http.Header) error {
+	if err := normalizeRequestTEHeader(headers); err != nil {
+		return err
+	}
 	var size int64
 	for name, values := range headers {
-		if !validModuleNetworkHeaderName(name) || isHopByHopHeader(name) {
+		if !validModuleNetworkHeaderName(name) || (isHopByHopHeader(name) && !strings.EqualFold(name, "Te")) {
 			return fmt.Errorf("header %q is not permitted", name)
 		}
 		switch strings.ToLower(name) {

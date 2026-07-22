@@ -28,9 +28,14 @@ import (
 const configVersion = 4
 const maxConfigBytes = 16 << 20
 const maxModuleNetworkOrigins = 256
+const maxModuleRoutingRules = 256
+const maxActiveModuleRoutingRules = 2048
+const maxModuleRouteKeywords = 8
 const reservedTerminalMatchEgressGroup = "__5GPN_TERMINAL_MATCH__"
 
 var nativeExtensionIDPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{1,126}[a-z0-9])$`)
+var nativeExtensionRouteKeywordPattern = regexp.MustCompile(`^[a-z0-9._-]+$`)
+var canonicalRoutingDomainPattern = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$`)
 
 type Config struct {
 	Version        int          `json:"version"`
@@ -107,6 +112,142 @@ type HostMapping struct {
 	Target  string `json:"target"`
 }
 
+type RoutingRule struct {
+	Action            string    `json:"action"`
+	Domain            *string   `json:"domain,omitempty"`
+	DomainSuffix      *string   `json:"domain_suffix,omitempty"`
+	DomainKeywords    *[]string `json:"domain_keywords,omitempty"`
+	AllDomainKeywords *[]string `json:"all_domain_keywords,omitempty"`
+	IPCIDR            *string   `json:"ip_cidr,omitempty"`
+	Network           *string   `json:"network,omitempty"`
+	DestinationPort   *int      `json:"destination_port,omitempty"`
+}
+
+type RoutingRules []RoutingRule
+
+func (rules *RoutingRules) UnmarshalJSON(body []byte) error {
+	if routingJSONNull(body) {
+		return errors.New("routing_rules must not be null")
+	}
+	var decoded []RoutingRule
+	if err := unmarshalStrictRaw(body, &decoded); err != nil {
+		return err
+	}
+	*rules = decoded
+	return nil
+}
+
+type rawRoutingRule struct {
+	Action            json.RawMessage `json:"action"`
+	Domain            json.RawMessage `json:"domain"`
+	DomainSuffix      json.RawMessage `json:"domain_suffix"`
+	DomainKeywords    json.RawMessage `json:"domain_keywords"`
+	AllDomainKeywords json.RawMessage `json:"all_domain_keywords"`
+	IPCIDR            json.RawMessage `json:"ip_cidr"`
+	Network           json.RawMessage `json:"network"`
+	DestinationPort   json.RawMessage `json:"destination_port"`
+}
+
+// UnmarshalJSON retains field presence without weakening the config's strict
+// JSON boundary. The raw helper is itself decoded with duplicate-key and
+// unknown-field rejection because a custom decoder owns this nested object.
+func (rule *RoutingRule) UnmarshalJSON(body []byte) error {
+	var raw rawRoutingRule
+	if err := unmarshalStrictRaw(body, &raw); err != nil {
+		return err
+	}
+
+	var decoded RoutingRule
+	if err := decodeRoutingString(raw.Action, "action", &decoded.Action, true); err != nil {
+		return err
+	}
+	if err := decodeOptionalRoutingString(raw.Domain, "domain", &decoded.Domain); err != nil {
+		return err
+	}
+	if err := decodeOptionalRoutingString(raw.DomainSuffix, "domain_suffix", &decoded.DomainSuffix); err != nil {
+		return err
+	}
+	if err := decodeOptionalRoutingStrings(raw.DomainKeywords, "domain_keywords", &decoded.DomainKeywords); err != nil {
+		return err
+	}
+	if err := decodeOptionalRoutingStrings(raw.AllDomainKeywords, "all_domain_keywords", &decoded.AllDomainKeywords); err != nil {
+		return err
+	}
+	if err := decodeOptionalRoutingString(raw.IPCIDR, "ip_cidr", &decoded.IPCIDR); err != nil {
+		return err
+	}
+	if err := decodeOptionalRoutingString(raw.Network, "network", &decoded.Network); err != nil {
+		return err
+	}
+	if len(raw.DestinationPort) > 0 {
+		if routingJSONNull(raw.DestinationPort) {
+			return errors.New("destination_port must not be null")
+		}
+		var value int
+		if err := json.Unmarshal(raw.DestinationPort, &value); err != nil {
+			return fmt.Errorf("destination_port must be an integer: %w", err)
+		}
+		if value == 0 {
+			return errors.New("destination_port must not be zero when declared")
+		}
+		decoded.DestinationPort = &value
+	}
+	*rule = decoded
+	return nil
+}
+
+func decodeRoutingString(raw json.RawMessage, name string, target *string, required bool) error {
+	if len(raw) == 0 {
+		if required {
+			return fmt.Errorf("%s is required", name)
+		}
+		return nil
+	}
+	if routingJSONNull(raw) {
+		return fmt.Errorf("%s must not be null", name)
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return fmt.Errorf("%s must be a string: %w", name, err)
+	}
+	if *target == "" {
+		return fmt.Errorf("%s must not be empty when declared", name)
+	}
+	return nil
+}
+
+func decodeOptionalRoutingString(raw json.RawMessage, name string, target **string) error {
+	var value string
+	if err := decodeRoutingString(raw, name, &value, false); err != nil {
+		return err
+	}
+	if len(raw) > 0 {
+		*target = &value
+	}
+	return nil
+}
+
+func decodeOptionalRoutingStrings(raw json.RawMessage, name string, target **[]string) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	if routingJSONNull(raw) {
+		return fmt.Errorf("%s must not be null", name)
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return fmt.Errorf("%s must be an array of strings: %w", name, err)
+	}
+	if len(values) == 0 {
+		return fmt.Errorf("%s must not be empty when declared", name)
+	}
+	*target = &values
+	return nil
+}
+
+func routingJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
 type Module struct {
 	ID                  string          `json:"id"`
 	Version             string          `json:"extension_version"`
@@ -117,6 +258,7 @@ type Module struct {
 	Source              ModuleSource    `json:"source"`
 	CaptureHosts        []string        `json:"capture_hosts"`
 	HostMappings        []HostMapping   `json:"upstream_mappings,omitempty"`
+	RoutingRules        RoutingRules    `json:"routing_rules,omitempty"`
 	Settings            []ModuleSetting `json:"settings,omitempty"`
 	Scripts             []ScriptRule    `json:"actions,omitempty"`
 	PersistentStorage   bool            `json:"persistent_storage"`
@@ -332,6 +474,7 @@ func (c Config) ValidateCertificateRequest() error {
 		return err
 	}
 	ids := make(map[string]struct{}, len(c.Modules))
+	activeRoutingRules := 0
 	for _, module := range c.Modules {
 		if _, duplicate := ids[module.ID]; duplicate {
 			return fmt.Errorf("duplicate extension id %q", module.ID)
@@ -340,8 +483,15 @@ func (c Config) ValidateCertificateRequest() error {
 		if err := validateModuleNetworkPermissions(module); err != nil {
 			return fmt.Errorf("extension %q: %w", module.ID, err)
 		}
+		if err := validateRoutingRules(module.RoutingRules); err != nil {
+			return fmt.Errorf("extension %q: %w", module.ID, err)
+		}
 		if !module.Enabled {
 			continue
+		}
+		activeRoutingRules += len(module.RoutingRules)
+		if activeRoutingRules > maxActiveModuleRoutingRules {
+			return fmt.Errorf("enabled extensions exceed %d declared routing rules", maxActiveModuleRoutingRules)
 		}
 		if !validModuleID(module.ID) || len(module.CaptureHosts) == 0 || len(module.CaptureHosts) > 256 {
 			return fmt.Errorf("enabled extension %q has invalid identity or capture host count", module.ID)
@@ -356,6 +506,108 @@ func (c Config) ValidateCertificateRequest() error {
 		return errors.New("enabled interception extensions exceed 256 unique certificate hosts")
 	}
 	return nil
+}
+
+func validateRoutingRules(rules []RoutingRule) error {
+	if len(rules) > maxModuleRoutingRules {
+		return fmt.Errorf("routing_rules exceeds %d entries", maxModuleRoutingRules)
+	}
+	seenRules := make(map[string]struct{}, len(rules))
+	for index, rule := range rules {
+		if rule.Action != "reject" && rule.Action != "direct" {
+			return fmt.Errorf("routing rule %d action is invalid", index)
+		}
+		primary := 0
+		if rule.Domain != nil {
+			primary++
+			if !validCanonicalRoutingDomain(*rule.Domain) {
+				return fmt.Errorf("routing rule %d domain is invalid", index)
+			}
+		}
+		if rule.DomainSuffix != nil {
+			primary++
+			if !validCanonicalRoutingDomain(*rule.DomainSuffix) {
+				return fmt.Errorf("routing rule %d domain suffix is invalid", index)
+			}
+		}
+		if rule.IPCIDR != nil {
+			primary++
+			_, network, err := net.ParseCIDR(*rule.IPCIDR)
+			if *rule.IPCIDR == "" || err != nil || network.String() != *rule.IPCIDR {
+				return fmt.Errorf("routing rule %d CIDR is invalid", index)
+			}
+		}
+		domainKeywords := []string(nil)
+		if rule.DomainKeywords != nil {
+			domainKeywords = *rule.DomainKeywords
+			if len(domainKeywords) == 0 {
+				return fmt.Errorf("routing rule %d domain keywords are empty", index)
+			}
+		}
+		allDomainKeywords := []string(nil)
+		if rule.AllDomainKeywords != nil {
+			allDomainKeywords = *rule.AllDomainKeywords
+			if len(allDomainKeywords) == 0 {
+				return fmt.Errorf("routing rule %d all-domain keywords are empty", index)
+			}
+		}
+		if primary > 1 || (primary == 0 && len(domainKeywords) == 0 && len(allDomainKeywords) == 0) ||
+			(rule.IPCIDR != nil && (len(domainKeywords) > 0 || len(allDomainKeywords) > 0)) {
+			return fmt.Errorf("routing rule %d selector combination is invalid", index)
+		}
+		if len(domainKeywords) > maxModuleRouteKeywords || !sort.StringsAreSorted(domainKeywords) {
+			return fmt.Errorf("routing rule %d domain keywords are invalid", index)
+		}
+		if len(domainKeywords) == 1 {
+			return fmt.Errorf("routing rule %d single domain keyword is not canonical", index)
+		}
+		seenKeywords := make(map[string]struct{}, len(domainKeywords))
+		for _, keyword := range domainKeywords {
+			if keyword == "" || len(keyword) > 64 || keyword != strings.ToLower(strings.TrimSpace(keyword)) || !nativeExtensionRouteKeywordPattern.MatchString(keyword) {
+				return fmt.Errorf("routing rule %d has an unsafe domain keyword", index)
+			}
+			if _, duplicate := seenKeywords[keyword]; duplicate {
+				return fmt.Errorf("routing rule %d has duplicate domain keywords", index)
+			}
+			seenKeywords[keyword] = struct{}{}
+		}
+		if len(allDomainKeywords) > maxModuleRouteKeywords || !sort.StringsAreSorted(allDomainKeywords) {
+			return fmt.Errorf("routing rule %d all-domain keywords are invalid", index)
+		}
+		for _, keyword := range allDomainKeywords {
+			if keyword == "" || len(keyword) > 64 || keyword != strings.ToLower(strings.TrimSpace(keyword)) || !nativeExtensionRouteKeywordPattern.MatchString(keyword) {
+				return fmt.Errorf("routing rule %d has an unsafe all-domain keyword", index)
+			}
+			if _, duplicate := seenKeywords[keyword]; duplicate {
+				return fmt.Errorf("routing rule %d repeats a domain keyword", index)
+			}
+			seenKeywords[keyword] = struct{}{}
+		}
+		if rule.Network != nil {
+			if *rule.Network != "tcp" && *rule.Network != "udp" {
+				return fmt.Errorf("routing rule %d network is invalid", index)
+			}
+		}
+		if rule.DestinationPort != nil {
+			if *rule.DestinationPort < 1 || *rule.DestinationPort > 65535 {
+				return fmt.Errorf("routing rule %d destination port is invalid", index)
+			}
+		}
+		body, _ := json.Marshal(rule)
+		if _, duplicate := seenRules[string(body)]; duplicate {
+			return fmt.Errorf("routing rule %d is duplicated", index)
+		}
+		seenRules[string(body)] = struct{}{}
+	}
+	return nil
+}
+
+func validCanonicalRoutingDomain(value string) bool {
+	return len(value) >= 1 && len(value) <= 253 &&
+		value == strings.TrimSpace(value) &&
+		value == strings.ToLower(value) &&
+		!strings.HasSuffix(value, ".") &&
+		canonicalRoutingDomainPattern.MatchString(value)
 }
 
 func (c Config) ValidateDeployment() error {
@@ -498,6 +750,7 @@ func validateModules(modules []Module) error {
 	}
 	ids := make(map[string]struct{}, len(modules))
 	activeMappings := make(map[string]string)
+	activeRoutingRules := 0
 	for index, module := range modules {
 		if !validModuleID(module.ID) {
 			return fmt.Errorf("extension %d has an invalid id", index)
@@ -537,6 +790,15 @@ func validateModules(modules []Module) error {
 		}
 		if err := validateModuleNetworkPermissions(module); err != nil {
 			return fmt.Errorf("extension %q: %w", module.ID, err)
+		}
+		if err := validateRoutingRules(module.RoutingRules); err != nil {
+			return fmt.Errorf("extension %q: %w", module.ID, err)
+		}
+		if module.Enabled {
+			activeRoutingRules += len(module.RoutingRules)
+			if activeRoutingRules > maxActiveModuleRoutingRules {
+				return fmt.Errorf("enabled extensions exceed %d declared routing rules", maxActiveModuleRoutingRules)
+			}
 		}
 		total := 0
 		actionIDs := make(map[string]struct{}, len(module.Scripts))

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,6 +54,112 @@ func TestNativeScriptSupportsBinaryBodies(t *testing.T) {
 	result, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), nativeRuntimeRule(source, "response", "binary"), request, &response)
 	if err != nil || !bytes.Equal(result.Body, []byte{3, 2, 1}) {
 		t.Fatalf("binary result=%+v err=%v", result, err)
+	}
+}
+
+func TestNativeScriptTransformsResponseTrailers(t *testing.T) {
+	t.Parallel()
+	source := `function transform(context) {
+  if (context.response.trailers["Grpc-Status"] !== "0") throw new Error("missing upstream trailer")
+  return { response: { trailers: {"Grpc-Status": "7", "Grpc-Message": "blocked"} } }
+}`
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodPost, Headers: make(http.Header)}
+	response := scriptMessage{
+		URL: request.URL, StatusCode: 200, Headers: make(http.Header),
+		Trailers: http.Header{"Grpc-Status": {"0"}},
+	}
+	result, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), nativeRuntimeRule(source, "response", "none"), request, &response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ChangedTrailers || result.Trailers.Get("Grpc-Status") != "7" || result.Trailers.Get("Grpc-Message") != "blocked" {
+		t.Fatalf("native trailer result = %+v", result)
+	}
+}
+
+func TestNativeScriptRejectsRequestAndFramingTrailers(t *testing.T) {
+	t.Parallel()
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodPost, Headers: make(http.Header)}
+	requestRule := nativeRuntimeRule(`function transform() { return {request: {trailers: {"X-Final": "value"}}} }`, "request", "none")
+	if _, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), requestRule, request, nil); err == nil {
+		t.Fatal("request trailer patch was accepted")
+	}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header)}
+	responseTE := nativeRuntimeRule(`function transform() { return {response: {headers: {"TE": "trailers"}}} }`, "response", "none")
+	if _, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), responseTE, request, &response); err == nil {
+		t.Fatal("response TE header was accepted")
+	}
+	for _, name := range []string{"Content-Length", "Content-Type", "Authorization", "If-Match"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			source := fmt.Sprintf(`function transform() { return {response: {trailers: {%q: "value"}}} }`, name)
+			responseRule := nativeRuntimeRule(source, "response", "none")
+			if _, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), responseRule, request, &response); err == nil {
+				t.Fatalf("forbidden trailer %q was accepted", name)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "NUL", value: "value\x00tail"},
+		{name: "DEL", value: "value\x7ftail"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			source := fmt.Sprintf(`function transform() { return {response: {trailers: {"X-Final": %q}}} }`, test.value)
+			responseRule := nativeRuntimeRule(source, "response", "none")
+			if _, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), responseRule, request, &response); err == nil {
+				t.Fatalf("invalid trailer value %q was accepted", test.value)
+			}
+		})
+	}
+}
+
+func TestExportedHeadersEnforceDeterministicHardLimits(t *testing.T) {
+	t.Parallel()
+	tooManyFields := make(map[string]any, maxScriptHeaderFields+1)
+	for index := 0; index <= maxScriptHeaderFields; index++ {
+		tooManyFields[fmt.Sprintf("X-Field-%03d", index)] = "value"
+	}
+	tooManyValues := make([]any, maxScriptHeaderValues+1)
+	for index := range tooManyValues {
+		tooManyValues[index] = ""
+	}
+	totalOverflow := make(map[string]any)
+	for index := 0; index < 5; index++ {
+		totalOverflow[fmt.Sprintf("X-Total-%d", index)] = strings.Repeat("x", maxScriptHeaderValueBytes)
+	}
+	for name, value := range map[string]any{
+		"field count":      tooManyFields,
+		"value count":      map[string]any{"X-Many": tooManyValues},
+		"single value":     map[string]any{"X-Large": strings.Repeat("x", maxScriptHeaderValueBytes+1)},
+		"total bytes":      totalOverflow,
+		"duplicate casing": map[string]any{"X-Duplicate": "one", "x-duplicate": "two"},
+	} {
+		name, value := name, value
+		t.Run(name, func(t *testing.T) {
+			var first string
+			for attempt := 0; attempt < 8; attempt++ {
+				_, err := exportedHeaders(value)
+				if err == nil {
+					t.Fatal("oversized or ambiguous headers were accepted")
+				}
+				if attempt == 0 {
+					first = err.Error()
+				} else if err.Error() != first {
+					t.Fatalf("nondeterministic errors: first=%q current=%q", first, err)
+				}
+			}
+		})
+	}
+	if _, err := exportedTrailers(map[string]any{"Grpc-Status": "0", "grpc-status": "1"}); err == nil {
+		t.Fatal("case-insensitive duplicate trailers were accepted")
+	}
+	headers, err := exportedHeaders(map[string]any{"X-Multi": []string{"one", "two"}})
+	if err != nil || len(headers.Values("X-Multi")) != 2 {
+		t.Fatalf("[]string headers=%v err=%v", headers, err)
 	}
 }
 

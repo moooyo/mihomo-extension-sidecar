@@ -14,6 +14,7 @@ const maxModuleHTTPBody = int64(64 << 20)
 type transformedResponse struct {
 	StatusCode int
 	Header     http.Header
+	Trailer    http.Header
 	Body       []byte
 }
 
@@ -22,9 +23,13 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 	if incoming.TLS != nil || incoming.ProtoMajor == 3 {
 		scheme = "https"
 	}
+	requestHeaders, err := exportedHeaders(cloneProxyHeaders(incoming.Header))
+	if err != nil {
+		return nil, false, fmt.Errorf("request headers: %w", err)
+	}
 	message := scriptMessage{
 		URL: scheme + "://" + host + incoming.URL.RequestURI(), Method: incoming.Method,
-		Headers: cloneProxyHeaders(incoming.Header),
+		Headers: requestHeaders,
 	}
 	requestRules := matchingScriptRules(cfg, "request", message)
 	if incoming.Body != nil {
@@ -58,12 +63,9 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 			if status == 0 {
 				status = http.StatusOK
 			}
-			if result.ChangedHeaders {
-				copyResponseHeaders(w.Header(), result.Headers)
+			if err := writeBufferedModuleResponse(w, incoming.Method, status, result.Headers, result.Trailers, result.Body); err != nil {
+				panic(http.ErrAbortHandler)
 			}
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(result.Body)))
-			w.WriteHeader(status)
-			_, _ = w.Write(result.Body)
 			return nil, true, nil
 		}
 		if result.ChangedURL {
@@ -90,7 +92,7 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 	outbound.Host = parsedURL.Hostname()
 	outbound.RequestURI = ""
 	outbound.Header = cloneProxyHeaders(message.Headers)
-	removeHopByHopHeaders(outbound.Header)
+	sanitizeForwardRequestHeaders(outbound.Header)
 	outbound.Header.Set("Accept-Encoding", "identity")
 	outbound.Body = io.NopCloser(bytes.NewReader(message.Body))
 	outbound.ContentLength = int64(len(message.Body))
@@ -127,6 +129,11 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 	if limit > maxModuleHTTPBody {
 		limit = maxModuleHTTPBody
 	}
+	responseHeaders, err := exportedHeaders(response.Header)
+	if err != nil {
+		return nil, fmt.Errorf("upstream response headers: %w", err)
+	}
+	responseMessage.Headers = responseHeaders
 	body, err := readBounded(response.Body, limit)
 	if err != nil {
 		return nil, err
@@ -140,6 +147,11 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 		return nil, err
 	}
 	responseMessage.Body = body
+	responseTrailers, err := exportedTrailers(response.Trailer)
+	if err != nil {
+		return nil, fmt.Errorf("upstream response trailers: %w", err)
+	}
+	responseMessage.Trailers = responseTrailers
 	responseMessage.Headers.Del("Content-Encoding")
 	responseMessage.Headers.Del("Content-Length")
 
@@ -160,6 +172,9 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 		if result.ChangedHeaders {
 			responseMessage.Headers = result.Headers
 		}
+		if result.ChangedTrailers {
+			responseMessage.Trailers = result.Trailers
+		}
 		if result.ChangedBody {
 			responseMessage.Body = result.Body
 		}
@@ -173,6 +188,41 @@ func (p *interceptProxy) transformModuleResponse(request *http.Request, response
 	return &transformedResponse{
 		StatusCode: responseMessage.StatusCode,
 		Header:     responseMessage.Headers,
+		Trailer:    responseMessage.Trailers,
 		Body:       responseMessage.Body,
 	}, nil
+}
+
+func writeBufferedModuleResponse(w http.ResponseWriter, method string, status int, headers, trailers http.Header, body []byte) error {
+	canHaveBody := responseCanHaveBody(method, status)
+	if len(body) > 0 && !canHaveBody {
+		return http.ErrBodyNotAllowed
+	}
+	if len(responseTrailerNames(trailers)) > 0 && !canHaveBody {
+		return errors.New("response trailers require a response body section")
+	}
+	copyResponseHeaders(w.Header(), headers)
+	removeHopByHopHeaders(w.Header())
+	w.Header().Del("Content-Encoding")
+	declared := declareResponseTrailers(w.Header(), trailers)
+	if len(declared) == 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	}
+	w.WriteHeader(status)
+	if len(body) > 0 {
+		written, err := w.Write(body)
+		if err != nil {
+			return err
+		}
+		if written != len(body) {
+			return io.ErrShortWrite
+		}
+	}
+	if len(declared) > 0 {
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return err
+		}
+	}
+	publishResponseTrailers(w.Header(), trailers, declared)
+	return nil
 }

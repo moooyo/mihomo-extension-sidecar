@@ -26,8 +26,13 @@ func TestNativeNetworkRequestUsesApprovedSOCKSOriginWithoutImplicitCredentials(t
 		observedBody <- body
 		w.Header().Add("X-Network", "one")
 		w.Header().Add("X-Network", "two")
+		w.Header().Add("Trailer", "Grpc-Status")
+		w.Header().Add("Trailer", "X-Network-Final")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("accepted"))
+		w.Header().Set("Grpc-Status", "0")
+		w.Header().Add("X-Network-Final", "one")
+		w.Header().Add("X-Network-Final", "two")
 	}))
 	defer upstream.Close()
 
@@ -45,11 +50,12 @@ func TestNativeNetworkRequestUsesApprovedSOCKSOriginWithoutImplicitCredentials(t
   const reply = context.network.request({
     url: %s + "/submit?source=plugin",
     method: "POST",
-    headers: {"Content-Type": "application/octet-stream", "X-Copied": context.request.headers.Cookie},
+    headers: {"Content-Type": "application/octet-stream", "TE": "Trailers", "X-Copied": context.request.headers.Cookie},
     body: new Uint8Array([65, 66, 67])
   })
   if (!(reply.body instanceof Uint8Array) || reply.headers["X-Network"].length !== 2) throw new Error("invalid response")
-  return {response: {status: reply.status, body: reply.text + ":" + reply.body[0]}}
+  if (reply.trailers["Grpc-Status"][0] !== "0" || reply.trailers["X-Network-Final"].length !== 2) throw new Error("invalid trailers")
+  return {response: {status: reply.status, headers: reply.headers, trailers: reply.trailers, body: reply.text + ":" + reply.body[0]}}
 }`, strconv.Quote(origin))
 	module := nativeRuntimeModule()
 	module.NetworkOrigins = []string{origin}
@@ -68,6 +74,12 @@ func TestNativeNetworkRequestUsesApprovedSOCKSOriginWithoutImplicitCredentials(t
 	if result.StatusCode != http.StatusCreated || string(result.Body) != "accepted:97" {
 		t.Fatalf("network result = %+v", result)
 	}
+	if values := result.Headers.Values("X-Network"); len(values) != 2 || values[0] != "one" || values[1] != "two" {
+		t.Fatalf("round-tripped headers = %v", result.Headers)
+	}
+	if result.Trailers.Get("Grpc-Status") != "0" || len(result.Trailers.Values("X-Network-Final")) != 2 {
+		t.Fatalf("round-tripped trailers = %v", result.Trailers)
+	}
 	select {
 	case target := <-targets:
 		if target.Host != "network.example" || strconv.Itoa(target.Port) != port {
@@ -83,6 +95,9 @@ func TestNativeNetworkRequestUsesApprovedSOCKSOriginWithoutImplicitCredentials(t
 		}
 		if request.Header.Get("X-Copied") != "session=secret" {
 			t.Fatalf("explicitly copied data was lost: headers=%v", request.Header)
+		}
+		if request.Header.Get("Te") != "trailers" {
+			t.Fatalf("TE trailers was not normalized: headers=%v", request.Header)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("upstream request was not observed")
@@ -273,8 +288,21 @@ func TestNativeNetworkRequestInternalSizeAndConcurrencyLimits(t *testing.T) {
 			"X-Oversized": strings.Repeat("x", int(maxModuleNetworkHeaderBytes)+1),
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "request headers exceed") {
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("header limit error = %v", err)
+	}
+	for _, headers := range []map[string]any{
+		{"TE": "gzip"},
+		{"Connection": "close"},
+		{"X-Duplicate": "one", "x-duplicate": "two"},
+	} {
+		_, err = performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, allowed, make(chan struct{}, 1), map[string]any{
+			"url":     "http://network.example:80/",
+			"headers": headers,
+		})
+		if err == nil {
+			t.Fatalf("unsafe network headers were accepted: %v", headers)
+		}
 	}
 }
 

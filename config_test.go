@@ -2,12 +2,19 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func routingString(value string) *string { return &value }
+func routingInt(value int) *int          { return &value }
+func routingStrings(values ...string) *[]string {
+	return &values
+}
 
 func validNativeModule(enabled bool) Module {
 	manifest := "apiVersion: 5gpn.io/v1\nkind: Extension\n"
@@ -63,6 +70,110 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "duplicate JSON key") {
 		t.Fatalf("duplicate key error = %v", err)
 	}
+}
+
+func TestConfigRoutingRuleJSONPreservesStrictPresence(t *testing.T) {
+	t.Parallel()
+	valid := configJSONWithRoutingRule(t, `{"action":"reject","domain":"ads.example.com"}`)
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, valid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := map[string]string{
+		"null action":              `{"action":null,"domain":"ads.example.com"}`,
+		"null domain":              `{"action":"reject","domain":null,"all_domain_keywords":["ads"]}`,
+		"null domain suffix":       `{"action":"reject","domain_suffix":null,"all_domain_keywords":["ads"]}`,
+		"null domain keywords":     `{"action":"reject","domain":"ads.example.com","domain_keywords":null}`,
+		"null all-domain keywords": `{"action":"reject","domain":"ads.example.com","all_domain_keywords":null}`,
+		"null CIDR":                `{"action":"reject","domain":"ads.example.com","ip_cidr":null}`,
+		"null network":             `{"action":"reject","domain":"ads.example.com","network":null}`,
+		"null destination port":    `{"action":"reject","domain":"ads.example.com","destination_port":null}`,
+		"empty action":             `{"action":"","domain":"ads.example.com"}`,
+		"empty domain":             `{"action":"reject","domain":"","all_domain_keywords":["ads"]}`,
+		"empty domain suffix":      `{"action":"reject","domain_suffix":"","all_domain_keywords":["ads"]}`,
+		"empty domain keywords":    `{"action":"reject","domain":"ads.example.com","domain_keywords":[]}`,
+		"empty all keywords":       `{"action":"reject","domain":"ads.example.com","all_domain_keywords":[]}`,
+		"empty CIDR":               `{"action":"reject","domain":"ads.example.com","ip_cidr":""}`,
+		"empty network":            `{"action":"reject","domain":"ads.example.com","network":""}`,
+		"zero destination port":    `{"action":"reject","domain":"ads.example.com","destination_port":0}`,
+		"unknown field":            `{"action":"reject","domain":"ads.example.com","target":"MATCH"}`,
+		"duplicate field":          `{"action":"reject","domain":"ads.example.com","domain":"other.example.com"}`,
+		"case duplicate field":     `{"action":"reject","domain":"ads.example.com","Domain":"other.example.com"}`,
+	}
+	for name, rule := range invalid {
+		name, rule := name, rule
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			candidatePath := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(candidatePath, configJSONWithRoutingRule(t, rule), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadConfig(candidatePath); err == nil {
+				t.Fatal("invalid stored routing rule was accepted")
+			}
+		})
+	}
+}
+
+func TestConfigRoutingRulesCollectionPresence(t *testing.T) {
+	t.Parallel()
+	for name, body := range map[string][]byte{
+		"omitted": func() []byte {
+			encoded, err := json.Marshal(validNativeConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return encoded
+		}(),
+		"empty": configJSONWithRoutingRulesRaw(t, `[]`),
+	} {
+		name, body := name, body
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "empty" && (cfg.Modules[0].RoutingRules == nil || len(cfg.Modules[0].RoutingRules) != 0) {
+				t.Fatalf("empty routing_rules = %#v", cfg.Modules[0].RoutingRules)
+			}
+		})
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, configJSONWithRoutingRulesRaw(t, `null`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "routing_rules must not be null") {
+		t.Fatalf("null routing_rules error = %v", err)
+	}
+}
+
+func configJSONWithRoutingRule(t *testing.T, rule string) []byte {
+	return configJSONWithRoutingRulesRaw(t, `[`+rule+`]`)
+}
+
+func configJSONWithRoutingRulesRaw(t *testing.T, rules string) []byte {
+	t.Helper()
+	body, err := json.Marshal(validNativeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := `"capture_hosts":["api.example.com"],`
+	replacement := marker + `"routing_rules":` + rules + `,`
+	result := strings.Replace(string(body), marker, replacement, 1)
+	if result == string(body) {
+		t.Fatal("capture_hosts insertion point was not found")
+	}
+	return []byte(result)
 }
 
 func TestReadConfigBoundedRejectsSymlinkAndNonRegularPaths(t *testing.T) {
@@ -198,6 +309,99 @@ func TestConfigValidatesNetworkAndEgressPermissions(t *testing.T) {
 	cfg.Modules[0].EgressGroup = reservedTerminalMatchEgressGroup
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("reserved egress group error = %v", err)
+	}
+}
+
+func TestConfigValidatesReviewedRoutingRules(t *testing.T) {
+	t.Parallel()
+	cfg := validNativeConfig()
+	cfg.Modules[0].RoutingRules = []RoutingRule{
+		{Action: "reject", Domain: routingString("ads.example.com"), Network: routingString("udp"), DestinationPort: routingInt(443)},
+		{Action: "direct", DomainSuffix: routingString("assets.example.com"), AllDomainKeywords: routingStrings("cdn", "static")},
+		{Action: "reject", IPCIDR: routingString("203.0.113.7/32")},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, rule := range map[string]RoutingRule{
+		"invalid action":           {Action: "proxy", Domain: routingString("api.example.com")},
+		"multiple primary":         {Action: "reject", Domain: routingString("api.example.com"), DomainSuffix: routingString("example.com")},
+		"keyword injection":        {Action: "reject", DomainKeywords: routingStrings("ads),MATCH")},
+		"duplicate keyword groups": {Action: "reject", DomainKeywords: routingStrings("ads"), AllDomainKeywords: routingStrings("ads")},
+		"single any keyword":       {Action: "reject", DomainKeywords: routingStrings("ads")},
+		"noncanonical CIDR":        {Action: "reject", IPCIDR: routingString("203.0.113.7/24")},
+		"invalid network":          {Action: "reject", Domain: routingString("api.example.com"), Network: routingString("quic")},
+		"invalid port":             {Action: "reject", Domain: routingString("api.example.com"), DestinationPort: routingInt(65536)},
+		"explicit zero port":       {Action: "reject", Domain: routingString("api.example.com"), DestinationPort: routingInt(0)},
+		"explicit empty domain":    {Action: "reject", Domain: routingString("")},
+		"explicit empty network":   {Action: "reject", Domain: routingString("api.example.com"), Network: routingString("")},
+		"explicit empty keywords":  {Action: "reject", Domain: routingString("api.example.com"), DomainKeywords: routingStrings()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := validNativeConfig()
+			candidate.Modules[0].RoutingRules = []RoutingRule{rule}
+			if err := candidate.Validate(); err == nil {
+				t.Fatalf("unsafe routing rule was accepted: %+v", rule)
+			}
+		})
+	}
+}
+
+func TestConfigRoutingDomainsUseCanonicalCorpus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		value string
+		valid bool
+	}{
+		{value: "ads.example.com", valid: true},
+		{value: "a-b.example.co.uk", valid: true},
+		{value: "Ads.Example.com"},
+		{value: " ads.example.com"},
+		{value: "ads.example.com "},
+		{value: "ads.example.com."},
+		{value: "ads.example.123"},
+		{value: "ads.example.c"},
+		{value: "*.example.com"},
+		{value: "ads_example.com"},
+		{value: "ads..example.com"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(strings.ReplaceAll(tc.value, " ", "_"), func(t *testing.T) {
+			t.Parallel()
+			for _, rule := range []RoutingRule{
+				{Action: "reject", Domain: routingString(tc.value)},
+				{Action: "direct", DomainSuffix: routingString(tc.value)},
+			} {
+				err := validateRoutingRules([]RoutingRule{rule})
+				if (err == nil) != tc.valid {
+					t.Fatalf("value %q valid=%v, error=%v", tc.value, tc.valid, err)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigBoundsEnabledRoutingRules(t *testing.T) {
+	t.Parallel()
+	modules := make([]Module, 0, 33)
+	for moduleIndex := 0; moduleIndex < 33; moduleIndex++ {
+		module := validNativeModule(true)
+		module.ID = fmt.Sprintf("io.example.route%02d", moduleIndex)
+		module.RoutingRules = make([]RoutingRule, 0, 64)
+		for ruleIndex := 0; ruleIndex < 64; ruleIndex++ {
+			module.RoutingRules = append(module.RoutingRules, RoutingRule{
+				Action: "reject", Domain: routingString(fmt.Sprintf("r%d-%d.example.com", moduleIndex, ruleIndex)),
+			})
+		}
+		modules = append(modules, module)
+	}
+	if err := validateModules(modules[:32]); err != nil {
+		t.Fatalf("exact active routing limit was rejected: %v", err)
+	}
+	if err := validateModules(modules); err == nil || !strings.Contains(err.Error(), "declared routing rules") {
+		t.Fatalf("active routing overflow error = %v", err)
 	}
 }
 
