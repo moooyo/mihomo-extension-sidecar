@@ -48,6 +48,14 @@ func TestInterceptHealthcheckTimesOutWhenSOCKSPeerDoesNotReply(t *testing.T) {
 	if err == nil {
 		t.Fatal("healthcheck unexpectedly succeeded against a silent SOCKS peer")
 	}
+	// The socket deadline and context timer share the same deadline. The read
+	// can observe its timeout just before the scheduler publishes ctx.Done(), so
+	// wait for that already-due signal instead of racing ctx.Err().
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("healthcheck returned a timeout before its context became done")
+	}
 	if ctx.Err() != context.DeadlineExceeded {
 		t.Fatalf("healthcheck context error = %v", ctx.Err())
 	}
