@@ -791,10 +791,120 @@ func exportedStatus(value any) (int, error) {
 	return status, nil
 }
 
-func matchingScriptRules(cfg Config, phase string, message scriptMessage) []struct {
+type matchedScriptRule struct {
 	Module Module
 	Rule   ScriptRule
-} {
+}
+
+type compiledScriptRule struct {
+	rule  ScriptRule
+	path  *regexp.Regexp
+	hosts *compiledHostMatcher
+}
+
+type compiledScriptModule struct {
+	module Module
+	rules  []compiledScriptRule
+	hosts  *compiledHostMatcher
+}
+
+type compiledHostMatcher struct {
+	exact    map[string]struct{}
+	wildcard []string
+}
+
+func newCompiledHostMatcher(patterns []string) *compiledHostMatcher {
+	matcher := &compiledHostMatcher{exact: make(map[string]struct{}, len(patterns))}
+	seenWildcard := make(map[string]struct{})
+	for _, pattern := range patterns {
+		if strings.HasPrefix(pattern, "*.") {
+			suffix := strings.TrimPrefix(pattern, "*.")
+			if _, exists := seenWildcard[suffix]; !exists {
+				seenWildcard[suffix] = struct{}{}
+				matcher.wildcard = append(matcher.wildcard, suffix)
+			}
+			continue
+		}
+		matcher.exact[pattern] = struct{}{}
+	}
+	return matcher
+}
+
+func (m *compiledHostMatcher) Match(value string) bool {
+	if m == nil {
+		return false
+	}
+	host := canonicalHost(value)
+	if _, exists := m.exact[host]; exists {
+		return true
+	}
+	for _, suffix := range m.wildcard {
+		separator := len(host) - len(suffix) - 1
+		if separator > 0 && host[separator] == '.' && strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// compiledScriptConfig belongs to one validated Config snapshot. ConfigStore
+// replaces the pointer on a successful reload, so regexp programs and ordered
+// module lookup state are bounded by config lifetime rather than a global cache.
+type compiledScriptConfig struct {
+	modules        []compiledScriptModule
+	moduleHosts    map[string]*compiledHostMatcher
+	activeHosts    *compiledHostMatcher
+	activePatterns []string
+}
+
+func compileScriptConfig(cfg Config) (*compiledScriptConfig, error) {
+	byID := make(map[string]Module, len(cfg.Modules))
+	for _, module := range cfg.Modules {
+		byID[module.ID] = module
+	}
+	compiled := &compiledScriptConfig{
+		modules:     make([]compiledScriptModule, 0, len(cfg.Modules)),
+		moduleHosts: make(map[string]*compiledHostMatcher, len(cfg.Modules)),
+	}
+	activePatterns := make([]string, 0, 16)
+	for _, module := range cfg.Modules {
+		if !module.Enabled {
+			continue
+		}
+		compiled.moduleHosts[module.ID] = newCompiledHostMatcher(module.CaptureHosts)
+		if cfg.MITM.Enabled {
+			activePatterns = append(activePatterns, module.CaptureHosts...)
+		}
+	}
+	compiled.activePatterns = uniqueSorted(activePatterns)
+	compiled.activeHosts = newCompiledHostMatcher(compiled.activePatterns)
+	for _, moduleID := range cfg.ExecutionOrder {
+		module, exists := byID[moduleID]
+		if !exists || !module.Enabled {
+			continue
+		}
+		entry := compiledScriptModule{
+			module: module,
+			rules:  make([]compiledScriptRule, 0, len(module.Scripts)),
+			hosts:  compiled.moduleHosts[module.ID],
+		}
+		for _, rule := range module.Scripts {
+			path, err := regexp.Compile(rule.Match.PathRegex)
+			if err != nil {
+				return nil, fmt.Errorf("extension %s action %s path_regex: %w", module.ID, rule.ID, err)
+			}
+			entry.rules = append(entry.rules, compiledScriptRule{
+				rule:  rule,
+				path:  path,
+				hosts: newCompiledHostMatcher(rule.Match.Hosts),
+			})
+		}
+		compiled.modules = append(compiled.modules, entry)
+	}
+	return compiled, nil
+}
+
+func matchingScriptRules(cfg Config, phase string, message scriptMessage) []matchedScriptRule {
 	parsed, err := url.Parse(message.URL)
 	if err != nil {
 		return nil
@@ -808,24 +918,22 @@ func matchingScriptRules(cfg Config, phase string, message scriptMessage) []stru
 	if parsed.RawQuery != "" {
 		path += "?" + parsed.RawQuery
 	}
-	var matched []struct {
-		Module Module
-		Rule   ScriptRule
+	runtime := cfg.runtime
+	if runtime == nil {
+		runtime, err = compileScriptConfig(cfg)
+		if err != nil {
+			return nil
+		}
 	}
-	modules := make(map[string]Module, len(cfg.Modules))
-	for _, module := range cfg.Modules {
-		modules[module.ID] = module
-	}
-	for _, moduleID := range cfg.ExecutionOrder {
-		module, exists := modules[moduleID]
-		if !exists {
+	var matched []matchedScriptRule
+	for _, compiledModule := range runtime.modules {
+		module := compiledModule.module
+		if !compiledModule.hosts.Match(host) {
 			continue
 		}
-		if !module.Enabled || !moduleOwnsHost(module, host) {
-			continue
-		}
-		for _, rule := range module.Scripts {
-			if rule.Phase != phase || !matchRuleHost(rule.Match.Hosts, host) || !containsString(rule.Match.Schemes, scheme) {
+		for _, compiledRule := range compiledModule.rules {
+			rule := compiledRule.rule
+			if rule.Phase != phase || !compiledRule.hosts.Match(host) || !containsString(rule.Match.Schemes, scheme) {
 				continue
 			}
 			if len(rule.Match.Methods) > 0 && !containsString(rule.Match.Methods, message.Method) {
@@ -834,25 +942,12 @@ func matchingScriptRules(cfg Config, phase string, message scriptMessage) []stru
 			if len(rule.Match.StatusCodes) > 0 && !containsInt(rule.Match.StatusCodes, message.StatusCode) {
 				continue
 			}
-			pattern, compileErr := regexp.Compile(rule.Match.PathRegex)
-			if compileErr == nil && pattern.MatchString(path) {
-				matched = append(matched, struct {
-					Module Module
-					Rule   ScriptRule
-				}{Module: module, Rule: rule})
+			if compiledRule.path.MatchString(path) {
+				matched = append(matched, matchedScriptRule{Module: module, Rule: rule})
 			}
 		}
 	}
 	return matched
-}
-
-func matchRuleHost(patterns []string, host string) bool {
-	for _, pattern := range patterns {
-		if matchHostPattern(pattern, host) {
-			return true
-		}
-	}
-	return false
 }
 
 func containsInt(values []int, want int) bool {

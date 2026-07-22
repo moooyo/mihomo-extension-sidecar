@@ -23,7 +23,7 @@ func validNativeModule(enabled bool) Module {
 		ID: "io.example.fixture", Version: "1.0.0", Name: "Fixture", Enabled: enabled,
 		ImportedAt:   time.Now().UTC().Format(time.RFC3339),
 		Source:       ModuleSource{Digest: digestText(manifest), Body: manifest},
-		CaptureHosts: []string{"api.example.com"},
+		CaptureHosts: []string{"api.example.com"}, CaptureDNS: "trust",
 		Scripts: []ScriptRule{{
 			ID: "clean", Phase: "response",
 			Match:     ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/"},
@@ -59,16 +59,76 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Version != 4 || len(loaded.Modules) != 1 || loaded.Modules[0].ID != "io.example.fixture" {
+	if loaded.Version != 5 || len(loaded.Modules) != 1 || loaded.Modules[0].ID != "io.example.fixture" || loaded.runtime == nil || len(loaded.runtime.modules) != 1 {
 		t.Fatalf("loaded config = %+v", loaded)
 	}
 
-	duplicate := strings.Replace(string(body), `"version":4`, `"version":4,"Version":4`, 1)
+	duplicate := strings.Replace(string(body), `"version":5`, `"version":5,"Version":5`, 1)
 	if err := os.WriteFile(path, []byte(duplicate), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "duplicate JSON key") {
 		t.Fatalf("duplicate key error = %v", err)
+	}
+}
+
+func TestConfigCaptureActionAndCertificateHostBoundsAre512(t *testing.T) {
+	t.Parallel()
+	makeModule := func(id, prefix string, count int) Module {
+		module := validNativeModule(true)
+		module.ID = id
+		module.CaptureHosts = make([]string, count)
+		for index := range module.CaptureHosts {
+			module.CaptureHosts[index] = fmt.Sprintf("%s%03d.example.com", prefix, index)
+		}
+		module.Scripts[0].Match.Hosts = append([]string(nil), module.CaptureHosts...)
+		return module
+	}
+	module := makeModule("io.example.fixture", "h", 512)
+	cfg := validNativeConfig()
+	cfg.Modules = []Module{module}
+	cfg.ExecutionOrder = []string{module.ID}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("512 capture/action/certificate hosts rejected: %v", err)
+	}
+	if err := cfg.ValidateCertificateRequest(); err != nil {
+		t.Fatalf("certificate request rejected 512 hosts: %v", err)
+	}
+	module = makeModule("io.example.fixture", "h", 513)
+	cfg.Modules = []Module{module}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "capture_hosts") {
+		t.Fatalf("513 capture/action hosts error = %v", err)
+	}
+
+	first := makeModule("io.example.first", "a", 256)
+	first.Scripts[0].Match.Hosts = []string{first.CaptureHosts[0]}
+	second := makeModule("io.example.second", "b", 256)
+	second.Scripts[0].Match.Hosts = []string{second.CaptureHosts[0]}
+	cfg.Modules = []Module{first, second}
+	cfg.ExecutionOrder = []string{first.ID, second.ID}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("512 global certificate hosts rejected: %v", err)
+	}
+	if err := cfg.ValidateCertificateRequest(); err != nil {
+		t.Fatalf("certificate request rejected 512 global hosts: %v", err)
+	}
+	second = makeModule("io.example.second", "b", 257)
+	second.Scripts[0].Match.Hosts = []string{second.CaptureHosts[0]}
+	cfg.Modules[1] = second
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "512") {
+		t.Fatalf("513 global certificate hosts error = %v", err)
+	}
+	if err := cfg.ValidateCertificateRequest(); err == nil || !strings.Contains(err.Error(), "512") {
+		t.Fatalf("513 certificate request hosts error = %v", err)
+	}
+}
+
+func TestConfigRejectsInvalidCaptureDNSBinding(t *testing.T) {
+	t.Parallel()
+	cfg := validNativeConfig()
+	cfg.Modules[0].CaptureDNS = "automatic"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "capture_dns") {
+		t.Fatalf("invalid capture_dns error = %v", err)
 	}
 }
 
@@ -223,11 +283,11 @@ func TestReadConfigBoundedRejectsPathSwapDuringOpen(t *testing.T) {
 	}
 }
 
-func TestConfigRejectsVersionThreeAndInvalidExecutionOrder(t *testing.T) {
+func TestConfigRejectsStaleVersionAndInvalidExecutionOrder(t *testing.T) {
 	t.Parallel()
 	cfg := validNativeConfig()
 	cfg.Version = 3
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 4") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 5") {
 		t.Fatalf("version error = %v", err)
 	}
 	cfg = validNativeConfig()
@@ -484,5 +544,24 @@ func TestMITMMasterAndEnabledExtensionsGateRuntimeHosts(t *testing.T) {
 	cfg.Modules[0].Enabled = false
 	if hasActiveExtensions(cfg) || len(certificateHostPatterns(cfg)) != 0 {
 		t.Fatal("disabled extension retained an active or certificate host")
+	}
+}
+
+func TestCompiledConfigPreservesActiveAndMappedHostSemantics(t *testing.T) {
+	t.Parallel()
+	cfg := validNativeConfig()
+	cfg.Modules[0].CaptureHosts = []string{"*.example.com", "api.example.net"}
+	cfg.Modules[0].Scripts[0].Match.Hosts = []string{"api.example.net"}
+	cfg.Modules[0].HostMappings = []HostMapping{{Pattern: "*.example.com", Target: "origin.example.net"}}
+	runtime, err := compileScriptConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.runtime = runtime
+	if !activeInterceptHost(cfg, "cdn.example.com") || !activeInterceptHost(cfg, "api.example.net") || activeInterceptHost(cfg, "example.com") {
+		t.Fatal("compiled active matcher changed exact/wildcard semantics")
+	}
+	if got := mappedInterceptTarget(cfg, "cdn.example.com"); got != "origin.example.net" {
+		t.Fatalf("compiled mapped target = %q", got)
 	}
 }

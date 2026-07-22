@@ -25,9 +25,12 @@ import (
 	"github.com/dop251/goja"
 )
 
-const configVersion = 4
+const configVersion = 5
 const maxConfigBytes = 16 << 20
 const maxModuleNetworkOrigins = 256
+const maxModuleCaptureHosts = 512
+const maxActionMatchHosts = 512
+const maxCertificateHosts = 512
 const maxModuleRoutingRules = 256
 const maxActiveModuleRoutingRules = 2048
 const maxModuleRouteKeywords = 8
@@ -48,6 +51,7 @@ type Config struct {
 	UpstreamProxy  ProxyConfig  `json:"upstream_proxy"`
 	MITM           MITMSettings `json:"mitm"`
 	Modules        []Module     `json:"modules,omitempty"`
+	runtime        *compiledScriptConfig
 }
 
 type ProxyConfig struct {
@@ -257,6 +261,7 @@ type Module struct {
 	ImportedAt          string          `json:"imported_at"`
 	Source              ModuleSource    `json:"source"`
 	CaptureHosts        []string        `json:"capture_hosts"`
+	CaptureDNS          string          `json:"capture_dns"`
 	HostMappings        []HostMapping   `json:"upstream_mappings,omitempty"`
 	RoutingRules        RoutingRules    `json:"routing_rules,omitempty"`
 	Settings            []ModuleSetting `json:"settings,omitempty"`
@@ -287,6 +292,11 @@ func loadConfig(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
+	runtime, err := compileScriptConfig(cfg)
+	if err != nil {
+		return Config{}, fmt.Errorf("compile config runtime: %w", err)
+	}
+	cfg.runtime = runtime
 	return cfg, nil
 }
 
@@ -454,8 +464,8 @@ func (c Config) Validate() error {
 	if err := validateExecutionOrder(c.Modules, c.ExecutionOrder); err != nil {
 		return err
 	}
-	if len(certificateHostPatterns(c)) > 256 {
-		return errors.New("enabled interception extensions exceed 256 unique certificate hosts")
+	if len(certificateHostPatterns(c)) > maxCertificateHosts {
+		return fmt.Errorf("enabled interception extensions exceed %d unique certificate hosts", maxCertificateHosts)
 	}
 	return nil
 }
@@ -486,6 +496,9 @@ func (c Config) ValidateCertificateRequest() error {
 		if err := validateRoutingRules(module.RoutingRules); err != nil {
 			return fmt.Errorf("extension %q: %w", module.ID, err)
 		}
+		if module.CaptureDNS != "trust" && module.CaptureDNS != "china" {
+			return fmt.Errorf("extension %q capture_dns must be trust or china", module.ID)
+		}
 		if !module.Enabled {
 			continue
 		}
@@ -493,7 +506,7 @@ func (c Config) ValidateCertificateRequest() error {
 		if activeRoutingRules > maxActiveModuleRoutingRules {
 			return fmt.Errorf("enabled extensions exceed %d declared routing rules", maxActiveModuleRoutingRules)
 		}
-		if !validModuleID(module.ID) || len(module.CaptureHosts) == 0 || len(module.CaptureHosts) > 256 {
+		if !validModuleID(module.ID) || len(module.CaptureHosts) == 0 || len(module.CaptureHosts) > maxModuleCaptureHosts {
 			return fmt.Errorf("enabled extension %q has invalid identity or capture host count", module.ID)
 		}
 		for _, host := range module.CaptureHosts {
@@ -502,8 +515,8 @@ func (c Config) ValidateCertificateRequest() error {
 			}
 		}
 	}
-	if len(certificateHostPatterns(c)) > 256 {
-		return errors.New("enabled interception extensions exceed 256 unique certificate hosts")
+	if len(certificateHostPatterns(c)) > maxCertificateHosts {
+		return fmt.Errorf("enabled interception extensions exceed %d unique certificate hosts", maxCertificateHosts)
 	}
 	return nil
 }
@@ -634,8 +647,10 @@ func validateLoopbackAddress(name, value string) error {
 
 func canonicalHost(value string) string {
 	host := strings.ToLower(strings.TrimSpace(value))
-	if parsed, _, err := net.SplitHostPort(host); err == nil {
-		host = parsed
+	if strings.Contains(host, ":") {
+		if parsed, _, err := net.SplitHostPort(host); err == nil {
+			host = parsed
+		}
 	}
 	return strings.TrimSuffix(host, ".")
 }
@@ -648,6 +663,12 @@ func allowedInboundSOCKSTarget(cfg Config, target socksTarget) bool {
 }
 
 func activeInterceptHost(cfg Config, value string) bool {
+	if !cfg.MITM.Enabled {
+		return false
+	}
+	if cfg.runtime != nil {
+		return cfg.runtime.activeHosts.Match(value)
+	}
 	host := canonicalHost(value)
 	for _, pattern := range activeHostPatterns(cfg) {
 		if matchHostPattern(pattern, host) {
@@ -661,6 +682,9 @@ func activeHostPatterns(cfg Config) []string {
 	if !cfg.MITM.Enabled {
 		return nil
 	}
+	if cfg.runtime != nil {
+		return append([]string(nil), cfg.runtime.activePatterns...)
+	}
 	patterns := make([]string, 0, 16)
 	for _, module := range cfg.Modules {
 		if module.Enabled {
@@ -671,6 +695,12 @@ func activeHostPatterns(cfg Config) []string {
 }
 
 func hasActiveExtensions(cfg Config) bool {
+	if !cfg.MITM.Enabled {
+		return false
+	}
+	if cfg.runtime != nil {
+		return len(cfg.runtime.activePatterns) > 0
+	}
 	return len(activeHostPatterns(cfg)) > 0
 }
 
@@ -689,7 +719,14 @@ func mappedInterceptTarget(cfg Config, host string) string {
 	bestPattern := ""
 	target := host
 	for _, module := range cfg.Modules {
-		if !module.Enabled || !moduleOwnsHost(module, host) {
+		if !module.Enabled {
+			continue
+		}
+		ownsHost := moduleOwnsHost(module, host)
+		if cfg.runtime != nil {
+			ownsHost = cfg.runtime.moduleHosts[module.ID].Match(host)
+		}
+		if !ownsHost {
 			continue
 		}
 		for _, mapping := range module.HostMappings {
@@ -771,13 +808,16 @@ func validateModules(modules []Module) error {
 		if len(module.Source.URL) > 4096 || (module.Source.URL != "" && !validSnapshotURL(module.Source.URL)) {
 			return fmt.Errorf("extension %q source URL is invalid", module.ID)
 		}
-		if len(module.CaptureHosts) == 0 || len(module.CaptureHosts) > 256 || !sort.StringsAreSorted(module.CaptureHosts) {
+		if len(module.CaptureHosts) == 0 || len(module.CaptureHosts) > maxModuleCaptureHosts || !sort.StringsAreSorted(module.CaptureHosts) {
 			return fmt.Errorf("extension %q capture_hosts are invalid", module.ID)
 		}
 		for _, host := range module.CaptureHosts {
 			if !validHostPattern(host) {
 				return fmt.Errorf("extension %q has an invalid capture host %q", module.ID, host)
 			}
+		}
+		if module.CaptureDNS != "trust" && module.CaptureDNS != "china" {
+			return fmt.Errorf("extension %q capture_dns must be trust or china", module.ID)
 		}
 		if len(module.Scripts)+len(module.HostMappings) == 0 || len(module.Scripts)+len(module.HostMappings) > 256 {
 			return fmt.Errorf("extension %q has an invalid action count", module.ID)
@@ -952,7 +992,7 @@ func canonicalModuleNetworkOrigin(raw string) (string, error) {
 }
 
 func validateActionMatch(captureHosts []string, phase string, match ActionMatch) error {
-	if len(match.Hosts) == 0 || len(match.Schemes) == 0 || match.PathRegex == "" {
+	if len(match.Hosts) == 0 || len(match.Hosts) > maxActionMatchHosts || len(match.Schemes) == 0 || match.PathRegex == "" {
 		return errors.New("match hosts, schemes, and path_regex are required")
 	}
 	for _, host := range match.Hosts {

@@ -376,14 +376,14 @@ func (p *interceptProxy) newHTTPTransport(cfg Config) *http.Transport {
 		},
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 			host, portText, err := net.SplitHostPort(address)
-			if err != nil || !activeInterceptHost(cfg, host) || (portText != "80" && portText != "443") {
+			if err != nil {
 				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
 			}
-			port := 443
-			if portText == "80" {
-				port = 80
+			target, permitted := activeModuleUpstreamTarget(cfg, host, portText)
+			if !permitted {
+				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
 			}
-			return dialSOCKS5TCP(ctx, cfg.UpstreamProxy, socksTarget{Host: mappedInterceptTarget(cfg, host), Port: port})
+			return dialSOCKS5TCP(ctx, cfg.UpstreamProxy, target)
 		},
 	}
 }
@@ -409,10 +409,14 @@ func roundTripHTTP3(request *http.Request, cfg Config, roots *x509.CertPool) (*h
 
 func roundTripHTTP3Version(request *http.Request, cfg Config, roots *x509.CertPool, version quic.Version) (*http.Response, func(), error) {
 	host := canonicalHost(request.URL.Host)
-	if !activeInterceptHost(cfg, host) {
+	portText := request.URL.Port()
+	if portText == "" {
+		portText = "443"
+	}
+	target, permitted := activeModuleUpstreamTarget(cfg, host, portText)
+	if !permitted {
 		return nil, nil, errors.New("upstream QUIC target is outside the active extension allowlist")
 	}
-	target := socksTarget{Host: mappedInterceptTarget(cfg, host), Port: 443}
 	packetConn, err := dialSOCKS5UDP(request.Context(), cfg.UpstreamProxy, target)
 	if err != nil {
 		return nil, nil, err

@@ -89,7 +89,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 		ExecutionOrder: []string{"io.example.http3"},
 		Modules: []Module{{
 			ID: "io.example.http3", Version: "1.0.0", Name: "HTTP3 fixture", Enabled: true, ImportedAt: time.Now().UTC().Format(time.RFC3339),
-			Source: ModuleSource{Digest: digestText(manifest), Body: manifest}, CaptureHosts: []string{"api.example.com"},
+			Source: ModuleSource{Digest: digestText(manifest), Body: manifest}, CaptureHosts: []string{"api.example.com"}, CaptureDNS: "trust",
 			Scripts: []ScriptRule{{
 				ID: "patch", Phase: "response", Match: ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/(?:v1|bodyless)$", StatusCodes: []int{200, 304}},
 				ScriptDigest: digestText(script), ScriptBody: script, BodyMode: "text", TimeoutMS: 1000, MaxBodyBytes: 1 << 20,

@@ -218,6 +218,11 @@ func TestNativeActionMatchingIsScopedToExtensionCaptureHosts(t *testing.T) {
 	module.Enabled = true
 	module.Scripts = []ScriptRule{nativeRuntimeRule(`function transform() { return null }`, "response", "none")}
 	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	runtime, err := compileScriptConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.runtime = runtime
 	inside := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, StatusCode: 200}
 	outside := scriptMessage{URL: "https://other.example.com/v1", Method: http.MethodGet, StatusCode: 200}
 	if len(matchingScriptRules(cfg, "response", inside)) != 1 || len(matchingScriptRules(cfg, "response", outside)) != 0 {
@@ -249,11 +254,115 @@ func TestNativeActionMatchingUsesTopLevelExecutionOrderForBothPhases(t *testing.
 		Modules:        []Module{first, second},
 		ExecutionOrder: []string{second.ID, first.ID},
 	}
+	runtime, err := compileScriptConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.runtime = runtime
 	message := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, StatusCode: 200}
 	for _, phase := range []string{"request", "response"} {
 		matched := matchingScriptRules(cfg, phase, message)
 		if len(matched) != 2 || matched[0].Module.ID != second.ID || matched[1].Module.ID != first.ID {
 			t.Fatalf("%s order = %+v", phase, matched)
 		}
+	}
+}
+
+var benchmarkMatchedScriptRules []matchedScriptRule
+
+func BenchmarkMatchingScriptRulesCompiledConfig(b *testing.B) {
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	module.Scripts = make([]ScriptRule, 256)
+	for index := range module.Scripts {
+		rule := nativeRuntimeRule(`function transform() { return null }`, "response", "none")
+		rule.ID = fmt.Sprintf("action-%03d", index)
+		rule.Match.PathRegex = fmt.Sprintf("^/path-%03d$", index)
+		module.Scripts[index] = rule
+	}
+	base := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	compiled, err := compileScriptConfig(base)
+	if err != nil {
+		b.Fatal(err)
+	}
+	message := scriptMessage{URL: "https://api.example.com/miss", Method: http.MethodGet, StatusCode: 200}
+	for _, test := range []struct {
+		name     string
+		compiled bool
+	}{
+		{name: "compiled", compiled: true},
+		{name: "fallback-compile", compiled: false},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			cfg := base
+			if test.compiled {
+				cfg.runtime = compiled
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				benchmarkMatchedScriptRules = matchingScriptRules(cfg, "response", message)
+			}
+		})
+	}
+}
+
+var benchmarkHostMatched bool
+
+func BenchmarkCompiledCaptureHostMatchers(b *testing.B) {
+	activeModule := nativeRuntimeModule()
+	activeModule.Enabled = true
+	activeModule.CaptureHosts = make([]string, 280)
+	for index := range activeModule.CaptureHosts {
+		activeModule.CaptureHosts[index] = fmt.Sprintf("*.h%03d.example.com", index)
+	}
+	activeCfg := Config{
+		MITM: MITMSettings{Enabled: true}, Modules: []Module{activeModule}, ExecutionOrder: []string{activeModule.ID},
+	}
+	activeRuntime, err := compileScriptConfig(activeCfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	activeCfg.runtime = activeRuntime
+
+	ruleModule := nativeRuntimeModule()
+	ruleModule.Enabled = true
+	ruleModule.CaptureHosts = []string{"*.example.com"}
+	ruleModule.Scripts = []ScriptRule{nativeRuntimeRule(`function transform() { return null }`, "response", "none")}
+	ruleModule.Scripts[0].Match.Hosts = make([]string, 259)
+	for index := range ruleModule.Scripts[0].Match.Hosts {
+		ruleModule.Scripts[0].Match.Hosts[index] = fmt.Sprintf("r%03d.example.com", index)
+	}
+	ruleCfg := Config{Modules: []Module{ruleModule}, ExecutionOrder: []string{ruleModule.ID}}
+	ruleRuntime, err := compileScriptConfig(ruleCfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ruleCfg.runtime = ruleRuntime
+	for _, test := range []struct {
+		name string
+		run  func()
+	}{
+		{name: "active-wildcard-last", run: func() {
+			benchmarkHostMatched = activeInterceptHost(activeCfg, "api.h279.example.com")
+		}},
+		{name: "rule-exact-last", run: func() {
+			benchmarkMatchedScriptRules = matchingScriptRules(ruleCfg, "response", scriptMessage{
+				URL: "https://r258.example.com/", Method: http.MethodGet, StatusCode: 200,
+			})
+		}},
+		{name: "rule-exact-miss", run: func() {
+			benchmarkMatchedScriptRules = matchingScriptRules(ruleCfg, "response", scriptMessage{
+				URL: "https://other.example.com/", Method: http.MethodGet, StatusCode: 200,
+			})
+		}},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				test.run()
+			}
+		})
 	}
 }

@@ -48,6 +48,9 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 	message.Headers.Del("Content-Length")
 
 	for _, matched := range requestRules {
+		if err := authorizeModuleRequestActionURL(cfg, matched.Module, message.URL); err != nil {
+			return nil, false, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
+		}
 		if matched.Rule.BodyMode != "none" && int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
 			return nil, false, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
 		}
@@ -69,9 +72,9 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 			return nil, true, nil
 		}
 		if result.ChangedURL {
-			parsed, parseErr := url.Parse(result.URL)
-			if parseErr != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || !moduleOwnsHost(matched.Module, parsed.Hostname()) {
-				return nil, false, fmt.Errorf("extension %s attempted to leave its capture_hosts boundary", matched.Module.ID)
+			parsed, authorizeErr := authorizeModuleRequestURLRewriteConfig(cfg, matched.Module, message.URL, result.URL)
+			if authorizeErr != nil {
+				return nil, false, fmt.Errorf("extension %s request URL rewrite: %w", matched.Module.ID, authorizeErr)
 			}
 			message.URL = parsed.String()
 		}
@@ -89,7 +92,7 @@ func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *h
 	}
 	outbound := incoming.Clone(incoming.Context())
 	outbound.URL = parsedURL
-	outbound.Host = parsedURL.Hostname()
+	outbound.Host = parsedURL.Host
 	outbound.RequestURI = ""
 	outbound.Header = cloneProxyHeaders(message.Headers)
 	sanitizeForwardRequestHeaders(outbound.Header)

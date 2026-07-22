@@ -216,6 +216,9 @@ func performModuleNetworkRequest(
 }
 
 func parseModuleNetworkRequestURL(raw string) (*url.URL, string, socksTarget, error) {
+	if strings.Contains(raw, "#") {
+		return nil, "", socksTarget{}, errors.New("url must be an absolute HTTP URL without credentials or a fragment")
+	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Fragment != "" || parsed.Hostname() == "" {
 		return nil, "", socksTarget{}, errors.New("url must be an absolute HTTP URL without credentials or a fragment")
