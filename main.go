@@ -53,11 +53,14 @@ func main() {
 	}
 	store, err := newConfigStore(*configPath)
 	if err != nil {
-		log.Fatalf("intercept: configuration error: %v", err)
+		if *checkConfig {
+			log.Fatalf("intercept: configuration error: %v", err)
+		}
+		log.Fatal("intercept: configuration unavailable")
 	}
 	cfg, err := store.Current()
 	if err != nil {
-		log.Fatalf("intercept: configuration error: %v", err)
+		log.Fatal("intercept: configuration unavailable")
 	}
 	if err := cfg.ValidateDeployment(); err != nil {
 		log.Fatalf("intercept: deployment boundary error: %v", err)
@@ -102,10 +105,42 @@ func main() {
 	defer stopSignals()
 	ctx, stopRuntime := context.WithCancel(signalCtx)
 	defer stopRuntime()
+	logs := newEngineLogHub(engineLogRingCapacity)
+	store.setEngineLogPublisher(logs)
+	logService, err := startEngineLogService(logs, store, version)
+	if err != nil {
+		log.Print("intercept: engine log service unavailable; continuing without UI log streaming")
+		logService = nil
+	}
+	proxy := newInterceptProxy(store, certificates)
+	proxy.scripts.logs = logs
 	go stopWhenMITMDisabled(ctx, store, stopRuntime)
 	log.Printf("intercept: modular TLS and HTTP/3 SOCKS5 TCP/UDP service listening on %s (http2=%t quic_fallback_protection=%t)", cfg.Listen, cfg.MITM.HTTP2, cfg.MITM.QUICFallbackProtection)
-	if err := newInterceptProxy(store, certificates).Serve(ctx, listener); err != nil {
-		log.Fatalf("intercept: service failed: %v", err)
+	logs.Publish(EngineLog{
+		Level: "info", Source: "engine",
+		Message: fmt.Sprintf("sidecar started with %d active extensions", activeExtensionCount(cfg)),
+	})
+	var logDone chan struct{}
+	if logService != nil {
+		logDone = make(chan struct{})
+		go func() {
+			defer close(logDone)
+			if err := logService.Serve(ctx); err != nil && ctx.Err() == nil {
+				log.Print("intercept: engine log service stopped unexpectedly; data plane remains active")
+			}
+		}()
+	}
+	proxyErr := proxy.Serve(ctx, listener)
+	logs.Publish(EngineLog{Level: "info", Source: "engine", Message: "sidecar stopping"})
+	stopRuntime()
+	if logService != nil {
+		logService.Close()
+		<-logDone
+	} else {
+		logs.Close()
+	}
+	if proxyErr != nil {
+		log.Fatalf("intercept: service failed: %v", proxyErr)
 	}
 }
 
@@ -133,7 +168,7 @@ func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.
 		case <-ticker.C:
 			cfg, err := store.Current()
 			if err != nil {
-				log.Printf("intercept: could not refresh MITM state: %v", err)
+				log.Print("intercept: could not refresh MITM state")
 				continue
 			}
 			if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {

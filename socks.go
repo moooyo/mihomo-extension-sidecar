@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +26,11 @@ const (
 	socksAddressIPv4    = 1
 	socksAddressDomain  = 3
 	socksAddressIPv6    = 4
+
+	// A SOCKS UDP envelope contains the three-byte datagram prefix followed by
+	// the largest possible domain address and its two-byte port.
+	maxSOCKSUDPEnvelopeBytes = 3 + 1 + 1 + 255 + 2
+	maxSOCKSUDPDatagramBytes = 65507
 )
 
 type socksTarget struct {
@@ -202,18 +209,29 @@ func readSOCKSAddress(reader io.Reader) (socksTarget, error) {
 }
 
 func encodeSOCKSAddress(target socksTarget) ([]byte, error) {
+	return appendSOCKSAddress(nil, target)
+}
+
+func appendSOCKSAddress(out []byte, target socksTarget) ([]byte, error) {
 	if target.Port < 0 || target.Port > 65535 {
 		return nil, errors.New("SOCKS target port is out of range")
 	}
-	var out []byte
-	ip := net.ParseIP(target.Host)
+	var ip netip.Addr
+	if mayBeIPAddress(target.Host) {
+		parsed, err := netip.ParseAddr(target.Host)
+		if err == nil && parsed.Zone() == "" {
+			ip = parsed.Unmap()
+		}
+	}
 	switch {
-	case ip != nil && ip.To4() != nil:
+	case ip.Is4():
+		value := ip.As4()
 		out = append(out, socksAddressIPv4)
-		out = append(out, ip.To4()...)
-	case ip != nil:
+		out = append(out, value[:]...)
+	case ip.Is6():
+		value := ip.As16()
 		out = append(out, socksAddressIPv6)
-		out = append(out, ip.To16()...)
+		out = append(out, value[:]...)
 	default:
 		if len(target.Host) == 0 || len(target.Host) > 255 {
 			return nil, errors.New("SOCKS target domain length is invalid")
@@ -224,6 +242,24 @@ func encodeSOCKSAddress(target socksTarget) ([]byte, error) {
 	var port [2]byte
 	binary.BigEndian.PutUint16(port[:], uint16(target.Port))
 	return append(out, port[:]...), nil
+}
+
+func mayBeIPAddress(host string) bool {
+	if host == "" {
+		return false
+	}
+	for index := 0; index < len(host); index++ {
+		if host[index] == ':' {
+			return true
+		}
+	}
+	for index := 0; index < len(host); index++ {
+		value := host[index]
+		if value != '.' && (value < '0' || value > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func dialSOCKS5TCP(ctx context.Context, proxy ProxyConfig, target socksTarget) (net.Conn, error) {
@@ -377,39 +413,79 @@ type fixedSOCKSPacketConn struct {
 	relay   *net.UDPAddr
 	target  socksTarget
 	close   sync.Once
+
+	readMu      sync.Mutex
+	readPacket  []byte
+	writeMu     sync.Mutex
+	writePacket []byte
 }
 
 func (c *fixedSOCKSPacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
-	packet := make([]byte, len(buffer)+512)
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	c.readPacket = resizeSOCKSUDPReadBuffer(c.readPacket, len(buffer))
 	for {
-		n, source, err := c.conn.ReadFromUDP(packet)
+		n, source, err := c.conn.ReadFromUDP(c.readPacket)
 		if err != nil {
 			return 0, nil, err
 		}
 		if !source.IP.Equal(c.relay.IP) || source.Port != c.relay.Port {
 			continue
 		}
-		payload, sourceTarget, err := parseSOCKSUDPDatagram(packet[:n])
-		if err != nil || sourceTarget.Port != 443 || len(payload) > len(buffer) {
+		payload, sourceTarget, err := parseSOCKSUDPDatagram(c.readPacket[:n])
+		if err != nil || sourceTarget.Port != c.target.Port || len(payload) > len(buffer) {
 			continue
 		}
 		copy(buffer, payload)
-		return len(payload), c.target, nil
+		return len(payload), &c.target, nil
 	}
 }
 
 func (c *fixedSOCKSPacketConn) WriteTo(buffer []byte, address net.Addr) (int, error) {
-	if address == nil || address.String() != c.target.String() {
+	if !matchesSOCKSTarget(address, c.target) {
 		return 0, errors.New("unexpected QUIC upstream address")
 	}
-	header, err := encodeSOCKSUDPDatagram(c.target, buffer)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	packet, err := encodeSOCKSUDPDatagramInto(c.writePacket, c.target, buffer)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := c.conn.WriteToUDP(header, c.relay); err != nil {
+	c.writePacket = packet
+	if _, err := c.conn.WriteToUDP(packet, c.relay); err != nil {
 		return 0, err
 	}
 	return len(buffer), nil
+}
+
+func matchesSOCKSTarget(address net.Addr, target socksTarget) bool {
+	switch value := address.(type) {
+	case socksTarget:
+		return sameSOCKSTarget(value, target)
+	case *socksTarget:
+		return value != nil && sameSOCKSTarget(*value, target)
+	default:
+		return address != nil && address.String() == target.String()
+	}
+}
+
+func sameSOCKSTarget(left, right socksTarget) bool {
+	if left.Port != right.Port {
+		return false
+	}
+	leftHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(left.Host)), ".")
+	rightHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(right.Host)), ".")
+	if mayBeIPAddress(leftHost) && mayBeIPAddress(rightHost) {
+		leftIP, leftErr := netip.ParseAddr(leftHost)
+		rightIP, rightErr := netip.ParseAddr(rightHost)
+		if leftErr == nil && rightErr == nil && leftIP.Zone() == "" && rightIP.Zone() == "" {
+			return leftIP.Unmap() == rightIP.Unmap()
+		}
+	}
+	if strings.Contains(leftHost, ":") || strings.Contains(rightHost, ":") {
+		return false
+	}
+	return leftHost == rightHost
 }
 
 func (c *fixedSOCKSPacketConn) Close() error {
@@ -440,13 +516,53 @@ func (c *fixedSOCKSPacketConn) SetReadBuffer(bytes int) error { return c.conn.Se
 func (c *fixedSOCKSPacketConn) SetWriteBuffer(bytes int) error { return c.conn.SetWriteBuffer(bytes) }
 
 func encodeSOCKSUDPDatagram(target socksTarget, payload []byte) ([]byte, error) {
-	address, err := encodeSOCKSAddress(target)
-	if err != nil {
-		return nil, err
+	return encodeSOCKSUDPDatagramInto(nil, target, payload)
+}
+
+func encodeSOCKSUDPDatagramInto(storage []byte, target socksTarget, payload []byte) ([]byte, error) {
+	required := maxSOCKSUDPDatagramBytes
+	if len(payload) <= maxSOCKSUDPDatagramBytes-maxSOCKSUDPEnvelopeBytes {
+		required = len(payload) + maxSOCKSUDPEnvelopeBytes
 	}
-	out := make([]byte, 3, 3+len(address)+len(payload))
-	out = append(out, address...)
-	return append(out, payload...), nil
+	storage = resizeSOCKSUDPBuffer(storage, required)
+	packet := append(storage[:0], 0, 0, 0)
+	var err error
+	packet, err = appendSOCKSAddress(packet, target)
+	if err != nil {
+		return storage[:0], err
+	}
+	if len(payload) > maxSOCKSUDPDatagramBytes-len(packet) {
+		return storage[:0], fmt.Errorf("SOCKS UDP packet exceeds %d bytes", maxSOCKSUDPDatagramBytes)
+	}
+	return append(packet, payload...), nil
+}
+
+func resizeSOCKSUDPReadBuffer(storage []byte, payloadBytes int) []byte {
+	required := maxSOCKSUDPDatagramBytes
+	if payloadBytes <= maxSOCKSUDPDatagramBytes-maxSOCKSUDPEnvelopeBytes-1 {
+		required = payloadBytes + maxSOCKSUDPEnvelopeBytes + 1
+	}
+	return resizeSOCKSUDPBuffer(storage, required)
+}
+
+func resizeSOCKSUDPBuffer(storage []byte, required int) []byte {
+	if required > maxSOCKSUDPDatagramBytes {
+		required = maxSOCKSUDPDatagramBytes
+	}
+	if required < 0 {
+		required = 0
+	}
+	if cap(storage) < required {
+		capacity := cap(storage) * 2
+		if capacity < required {
+			capacity = required
+		}
+		if capacity > maxSOCKSUDPDatagramBytes {
+			capacity = maxSOCKSUDPDatagramBytes
+		}
+		storage = make([]byte, capacity)
+	}
+	return storage[:required]
 }
 
 func parseSOCKSUDPDatagram(packet []byte) ([]byte, socksTarget, error) {
@@ -475,34 +591,37 @@ func (a socksPeerAddr) Network() string { return "udp" }
 func (a socksPeerAddr) String() string { return a.relay.String() + "|" + a.target.String() }
 
 type socksServerPacketConn struct {
-	conn      *net.UDPConn
-	allowedIP net.IP
-	config    *configStore
+	conn          *net.UDPConn
+	allowedIP     net.IP
+	authorization inboundUDPAuthorization
 
-	mu    sync.Mutex
-	relay *net.UDPAddr
+	readMu      sync.Mutex
+	readPacket  []byte
+	relay       *net.UDPAddr
+	writeMu     sync.Mutex
+	writePacket []byte
 }
 
 func (c *socksServerPacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
-	packet := make([]byte, len(buffer)+512)
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	c.readPacket = resizeSOCKSUDPReadBuffer(c.readPacket, len(buffer))
 	for {
-		n, source, err := c.conn.ReadFromUDP(packet)
+		n, source, err := c.conn.ReadFromUDP(c.readPacket)
 		if err != nil {
 			return 0, nil, err
 		}
 		if !source.IP.Equal(c.allowedIP) {
 			continue
 		}
-		c.mu.Lock()
 		if c.relay == nil {
 			c.relay = source
 		}
 		validRelay := source.IP.Equal(c.relay.IP) && source.Port == c.relay.Port
-		c.mu.Unlock()
 		if !validRelay {
 			continue
 		}
-		payload, target, err := parseSOCKSUDPDatagram(packet[:n])
+		payload, target, err := parseSOCKSUDPDatagram(c.readPacket[:n])
 		if err != nil || !c.targetAllowed(target) || len(payload) > len(buffer) {
 			continue
 		}
@@ -512,11 +631,7 @@ func (c *socksServerPacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 }
 
 func (c *socksServerPacketConn) targetAllowed(target socksTarget) bool {
-	if c.config == nil {
-		return false
-	}
-	cfg, err := c.config.Current()
-	return err == nil && target.Port == 443 && allowedInboundSOCKSTarget(cfg, target)
+	return c.authorization.allows(target)
 }
 
 func (c *socksServerPacketConn) WriteTo(buffer []byte, address net.Addr) (int, error) {
@@ -528,10 +643,13 @@ func (c *socksServerPacketConn) WriteTo(buffer []byte, address net.Addr) (int, e
 		}
 		peer = *peerPointer
 	}
-	packet, err := encodeSOCKSUDPDatagram(peer.target, buffer)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	packet, err := encodeSOCKSUDPDatagramInto(c.writePacket, peer.target, buffer)
 	if err != nil {
 		return 0, err
 	}
+	c.writePacket = packet
 	if _, err := c.conn.WriteToUDP(packet, peer.relay); err != nil {
 		return 0, err
 	}

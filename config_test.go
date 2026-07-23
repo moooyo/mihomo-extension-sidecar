@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dop251/goja"
 )
 
 func routingString(value string) *string { return &value }
@@ -62,6 +67,12 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 	if loaded.Version != 5 || len(loaded.Modules) != 1 || loaded.Modules[0].ID != "io.example.fixture" || loaded.runtime == nil || len(loaded.runtime.modules) != 1 {
 		t.Fatalf("loaded config = %+v", loaded)
 	}
+	if loaded.Modules[0].Scripts[0].program != nil || loaded.Modules[0].Scripts[0].settings != nil {
+		t.Fatal("raw config retained compiled script state")
+	}
+	if loaded.runtime.modules[0].rules[0].rule.program == nil || loaded.runtime.modules[0].rules[0].rule.settings == nil {
+		t.Fatal("enabled compiled rule did not retain its validated program and settings")
+	}
 
 	duplicate := strings.Replace(string(body), `"version":5`, `"version":5,"Version":5`, 1)
 	if err := os.WriteFile(path, []byte(duplicate), 0o600); err != nil {
@@ -69,6 +80,469 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 	}
 	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "duplicate JSON key") {
 		t.Fatalf("duplicate key error = %v", err)
+	}
+}
+
+func TestDisabledScriptsAreValidatedButNotRetained(t *testing.T) {
+	t.Parallel()
+	cfg := validNativeConfig()
+	disabled := validNativeModule(false)
+	disabled.ID = "io.example.disabled"
+	disabled.Name = "Disabled"
+	disabled.CaptureHosts = []string{"disabled.example.com"}
+	disabled.Scripts[0].ID = "disabled-action"
+	disabled.Scripts[0].Match.Hosts = append([]string(nil), disabled.CaptureHosts...)
+	cfg.Modules = append(cfg.Modules, disabled)
+	cfg.ExecutionOrder = append(cfg.ExecutionOrder, disabled.ID)
+
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := decodeConfig(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.runtime.modules) != 1 || loaded.runtime.modules[0].module.ID != cfg.Modules[0].ID {
+		t.Fatalf("compiled modules = %+v", loaded.runtime.modules)
+	}
+	for _, module := range loaded.Modules {
+		for _, rule := range module.Scripts {
+			if rule.program != nil || rule.settings != nil {
+				t.Fatalf("raw rule %s/%s retained compiled state", module.ID, rule.ID)
+			}
+		}
+	}
+
+	invalidSource := `function (`
+	cfg.Modules[1].Scripts[0].ScriptBody = invalidSource
+	cfg.Modules[1].Scripts[0].ScriptDigest = digestText(invalidSource)
+	invalidBody, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeConfig(invalidBody); err == nil || !strings.Contains(err.Error(), "does not compile") {
+		t.Fatalf("disabled invalid script error = %v", err)
+	}
+}
+
+func TestCompiledConfigReusesValidatedScriptProgram(t *testing.T) {
+	t.Parallel()
+	cfg := validNativeConfig()
+	programs := make(map[scriptProgramKey]*goja.Program)
+	if err := cfg.validate(programs); err != nil {
+		t.Fatal(err)
+	}
+	key := scriptProgramKey{
+		moduleID: cfg.Modules[0].ID,
+		actionID: cfg.Modules[0].Scripts[0].ID,
+		digest:   cfg.Modules[0].Scripts[0].ScriptDigest,
+	}
+	validated := programs[key]
+	if validated == nil {
+		t.Fatal("validated script program was not retained")
+	}
+	compiled, err := compileScriptConfigWithPrograms(cfg, programs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := compiled.modules[0].rules[0].rule.program; got != validated {
+		t.Fatal("compiled config did not reuse the validated script program")
+	}
+}
+
+func TestConfigReloadKeepsOldProgramSnapshotAndRejectsInvalidReplacement(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	baseTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	cfg := validNativeConfig()
+	cfg.Modules[0].Settings = []ModuleSetting{{
+		Key: "mode", Type: "text", Required: true, Value: json.RawMessage(`"old"`),
+	}}
+	oldSource := `function transform(context) { return {response: {body: "old:" + context.settings.mode}} }`
+	cfg.Modules[0].Scripts[0].ScriptBody = oldSource
+	cfg.Modules[0].Scripts[0].ScriptDigest = digestText(oldSource)
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfigAt(t, path, body, baseTime)
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldMatched := matchingScriptRules(oldSnapshot, "response", scriptMessage{
+		URL: "https://api.example.com/data", Method: http.MethodGet, StatusCode: http.StatusOK,
+	})
+	if len(oldMatched) != 1 {
+		t.Fatalf("old matched actions = %d", len(oldMatched))
+	}
+	oldProgram := oldMatched[0].Rule.program
+	if oldProgram == nil || oldSnapshot.Modules[0].Scripts[0].program != nil || oldSnapshot.Modules[0].Scripts[0].settings != nil {
+		t.Fatal("old snapshot did not isolate compiled state from its raw config")
+	}
+
+	cfg.Modules[0].Settings[0].Value = json.RawMessage(`"new"`)
+	newSource := `function transform(context) { return {response: {body: "new:" + context.settings.mode}} }`
+	cfg.Modules[0].Scripts[0].ScriptBody = newSource
+	cfg.Modules[0].Scripts[0].ScriptDigest = digestText(newSource)
+	newBody, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceConfigAt(t, path, newBody, baseTime.Add(time.Second))
+	newSnapshot, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMatched := matchingScriptRules(newSnapshot, "response", scriptMessage{
+		URL: "https://api.example.com/data", Method: http.MethodGet, StatusCode: http.StatusOK,
+	})
+	if len(newMatched) != 1 || newMatched[0].Rule.program == nil || newMatched[0].Rule.program == oldProgram {
+		t.Fatal("changed config did not publish a distinct compiled program snapshot")
+	}
+	if newSnapshot.Modules[0].Scripts[0].program != nil || newSnapshot.Modules[0].Scripts[0].settings != nil {
+		t.Fatal("new snapshot retained compiled state in its raw config")
+	}
+	if newSnapshot.generation != oldSnapshot.generation+1 {
+		t.Fatalf("new generation = %d, old = %d", newSnapshot.generation, oldSnapshot.generation)
+	}
+
+	execute := func(snapshot Config, matched matchedScriptRule) string {
+		request := scriptMessage{URL: "https://api.example.com/data", Method: http.MethodGet, Headers: make(http.Header)}
+		response := scriptMessage{URL: request.URL, Method: request.Method, StatusCode: http.StatusOK, Headers: make(http.Header)}
+		result, executeErr := newScriptRuntime().execute(
+			context.Background(), snapshot, nil, matched.Module, matched.Rule, request, &response,
+		)
+		if executeErr != nil {
+			t.Fatal(executeErr)
+		}
+		return string(result.Body)
+	}
+	if got := execute(oldSnapshot, oldMatched[0]); got != "old:old" {
+		t.Fatalf("old snapshot executed %q", got)
+	}
+	if got := execute(newSnapshot, newMatched[0]); got != "new:new" {
+		t.Fatalf("new snapshot executed %q", got)
+	}
+
+	invalid := cfg
+	invalid.Modules = append([]Module(nil), cfg.Modules...)
+	invalid.Modules[0].Scripts = append([]ScriptRule(nil), cfg.Modules[0].Scripts...)
+	invalidSource := `function (`
+	invalid.Modules[0].Scripts[0].ScriptBody = invalidSource
+	invalid.Modules[0].Scripts[0].ScriptDigest = digestText(invalidSource)
+	invalidBody, err := json.Marshal(invalid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceConfigAt(t, path, invalidBody, baseTime.Add(2*time.Second))
+	retained, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedMatched := matchingScriptRules(retained, "response", scriptMessage{
+		URL: "https://api.example.com/data", Method: http.MethodGet, StatusCode: http.StatusOK,
+	})
+	if retained.generation != newSnapshot.generation || retained.runtime != newSnapshot.runtime || len(retainedMatched) != 1 || retainedMatched[0].Rule.program != newMatched[0].Rule.program {
+		t.Fatal("invalid script replacement changed the last valid runtime snapshot")
+	}
+	if got := execute(retained, retainedMatched[0]); got != "new:new" {
+		t.Fatalf("retained snapshot executed %q after invalid replacement", got)
+	}
+}
+
+func TestConfigReloadDoesNotRetainDisabledProgramInNewSnapshot(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	baseTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	cfg := validNativeConfig()
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfigAt(t, path, body, baseTime)
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := scriptMessage{URL: "https://api.example.com/data", Method: http.MethodGet, StatusCode: http.StatusOK}
+	oldMatched := matchingScriptRules(oldSnapshot, "response", message)
+	if len(oldMatched) != 1 || oldMatched[0].Rule.program == nil {
+		t.Fatal("enabled old snapshot did not retain its compiled program")
+	}
+
+	cfg.Modules[0].Enabled = false
+	disabledBody, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaceConfigAt(t, path, disabledBody, baseTime.Add(time.Second))
+	newSnapshot, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSnapshot.generation != oldSnapshot.generation+1 || len(newSnapshot.runtime.modules) != 0 {
+		t.Fatalf("disabled snapshot generation=%d compiled_modules=%d", newSnapshot.generation, len(newSnapshot.runtime.modules))
+	}
+	if newSnapshot.Modules[0].Scripts[0].program != nil || newSnapshot.Modules[0].Scripts[0].settings != nil {
+		t.Fatal("disabled raw rule retained compiled state")
+	}
+	if matched := matchingScriptRules(newSnapshot, "response", message); len(matched) != 0 {
+		t.Fatalf("disabled snapshot matched %d actions", len(matched))
+	}
+	if oldAgain := matchingScriptRules(oldSnapshot, "response", message); len(oldAgain) != 1 || oldAgain[0].Rule.program != oldMatched[0].Rule.program {
+		t.Fatal("new disabled snapshot changed the captured old program snapshot")
+	}
+}
+
+func TestConfigStoreReusesIdenticalContentAndAdvancesGeneration(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := validNativeConfig()
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	writeConfigAt(t, path, body, baseTime)
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.generation != 1 {
+		t.Fatalf("initial generation = %d", initial.generation)
+	}
+	initialInfo := store.goodFile
+	if initialInfo == nil {
+		t.Fatal("initial good file identity was not retained")
+	}
+
+	replaceConfigAt(t, path, body, baseTime)
+	replacementInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacementInfo.Size() != initialInfo.Size() || !replacementInfo.ModTime().Equal(initialInfo.ModTime()) || os.SameFile(replacementInfo, initialInfo) {
+		t.Fatal("identical replacement did not preserve size and mtime while changing file identity")
+	}
+	identical, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identical.generation != initial.generation || identical.runtime != initial.runtime || !store.matchesGoodFile(replacementInfo) {
+		t.Fatalf("identical content replaced snapshot: generation=%d runtime_changed=%t", identical.generation, identical.runtime != initial.runtime)
+	}
+
+	cfg.MITM.HTTP2 = false
+	changedBody, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfigAt(t, path, changedBody, baseTime.Add(2*time.Second))
+	changed, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.generation != initial.generation+1 || changed.runtime == initial.runtime || changed.MITM.HTTP2 {
+		t.Fatalf("changed snapshot = generation=%d runtime_changed=%t http2=%t", changed.generation, changed.runtime != initial.runtime, changed.MITM.HTTP2)
+	}
+}
+
+func TestConfigStoreReloadsChangedAtomicReplacementWithSameMetadata(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := validNativeConfig()
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	writeConfigAt(t, path, body, baseTime)
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialInfo := store.goodFile
+	if initialInfo == nil {
+		t.Fatal("initial good file identity was not retained")
+	}
+
+	cfg.Username = "inbound-user-456"
+	replacement, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replacement) != len(body) {
+		t.Fatal("test replacement changed serialized size")
+	}
+	replaceConfigAt(t, path, replacement, baseTime)
+	replacementInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(replacementInfo, initialInfo) || !replacementInfo.ModTime().Equal(initialInfo.ModTime()) || replacementInfo.Size() != initialInfo.Size() {
+		t.Fatal("changed replacement did not preserve size and mtime while changing file identity")
+	}
+
+	reloaded, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.generation != initial.generation+1 || reloaded.Username != cfg.Username || reloaded.runtime == initial.runtime || !store.matchesGoodFile(replacementInfo) {
+		t.Fatalf("changed atomic snapshot = generation=%d username=%q runtime_changed=%t", reloaded.generation, reloaded.Username, reloaded.runtime != initial.runtime)
+	}
+}
+
+func TestConfigStoreCachesOnlyTheSameInvalidFileIdentity(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := validNativeConfig()
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	writeConfigAt(t, path, body, baseTime)
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.MITM.HTTP2 = false
+	validReplacement, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badReplacement := append([]byte(nil), validReplacement...)
+	badReplacement[0] = '!'
+	badTime := baseTime.Add(time.Second)
+	writeConfigAt(t, path, badReplacement, badTime)
+	badInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained.generation != 1 || !store.matchesBadFile(badInfo) {
+		t.Fatalf("invalid snapshot state = generation=%d bad_mod_time=%s bad_size=%d", retained.generation, store.badModTime, store.badSize)
+	}
+	negativeCached, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if negativeCached.generation != 1 || !negativeCached.MITM.HTTP2 {
+		t.Fatal("the same invalid file identity replaced the last valid snapshot")
+	}
+
+	replaceConfigAt(t, path, validReplacement, badTime)
+	replacementInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacementInfo.Size() != badInfo.Size() || !replacementInfo.ModTime().Equal(badInfo.ModTime()) || os.SameFile(replacementInfo, badInfo) {
+		t.Fatal("test replacement did not preserve size and mtime while changing file identity")
+	}
+	reloaded, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.generation != 2 || reloaded.MITM.HTTP2 {
+		t.Fatalf("atomic valid replacement was not loaded: generation=%d http2=%t", reloaded.generation, reloaded.MITM.HTTP2)
+	}
+}
+
+func TestConfigStoreRetriesTransientReadErrorsForTheSameFileVersion(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := validNativeConfig()
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	writeConfigAt(t, path, body, baseTime)
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.MITM.HTTP2 = false
+	replacement, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfigAt(t, path, replacement, baseTime.Add(time.Second))
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realRead := store.readDocument
+	attempts := 0
+	store.readDocument = func(path string) ([]byte, os.FileInfo, error) {
+		attempts++
+		if attempts <= 2 {
+			return nil, nil, errors.New("transient read failure")
+		}
+		return realRead(path)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		retained, err := store.Current()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempts != attempt || retained.generation != 1 || !retained.MITM.HTTP2 {
+			t.Fatalf("attempt %d state = reads=%d generation=%d http2=%t", attempt, attempts, retained.generation, retained.MITM.HTTP2)
+		}
+		if store.badFile != nil || !store.matchesReadErrorFile(fileInfo) {
+			t.Fatal("transient read error was converted into an invalid-document negative cache")
+		}
+	}
+
+	reloaded, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 || reloaded.generation != 2 || reloaded.MITM.HTTP2 || store.readErrorFile != nil {
+		t.Fatalf("recovered state = reads=%d generation=%d http2=%t read_error_cached=%t", attempts, reloaded.generation, reloaded.MITM.HTTP2, store.readErrorFile != nil)
+	}
+}
+
+func writeConfigAt(t *testing.T, path string, body []byte, modTime time.Time) {
+	t.Helper()
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, modTime, modTime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceConfigAt(t *testing.T, path string, body []byte, modTime time.Time) {
+	t.Helper()
+	replacement := filepath.Join(filepath.Dir(path), "replacement.json")
+	writeConfigAt(t, replacement, body, modTime)
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -5,8 +5,10 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/andybalholm/brotli"
@@ -14,6 +16,21 @@ import (
 
 func isGzip(body []byte) bool {
 	return len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b
+}
+
+func normalizedContentEncoding(header http.Header) (string, error) {
+	values := header.Values("Content-Encoding")
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) != 1 {
+		return "", errors.New("content encoding must contain exactly one value")
+	}
+	encoding := strings.ToLower(strings.TrimSpace(values[0]))
+	if encoding == "" || strings.Contains(encoding, ",") {
+		return "", errors.New("content encoding must contain exactly one non-empty coding")
+	}
+	return encoding, nil
 }
 
 func decodeContentBody(body []byte, encoding string, limit int64) ([]byte, error) {

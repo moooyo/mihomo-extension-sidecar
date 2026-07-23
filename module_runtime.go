@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -28,13 +30,20 @@ func init() {
 }
 
 type scriptRuntime struct {
-	mu             sync.Mutex
-	programs       map[string]*goja.Program
-	persistent     map[string]map[string]string
-	statePath      string
-	moduleSet      string
-	moduleSetReady bool
-	networkSlots   chan struct{}
+	persistent        atomic.Pointer[persistentSnapshot]
+	persistentWriteMu sync.Mutex
+	persistentLoadErr error
+	persistPersistent func(*persistentSnapshot) error
+	statePath         string
+	networkSlots      chan struct{}
+	logs              engineLogPublisher
+}
+
+// persistentSnapshot and every map reachable from it are immutable after
+// publication. Mutations copy the outer map and only the affected module
+// bucket before synchronously committing and publishing a replacement.
+type persistentSnapshot struct {
+	modules map[string]map[string]string
 }
 
 type scriptMessage struct {
@@ -65,70 +74,87 @@ const (
 	maxScriptHeaderFields     = 256
 	maxScriptHeaderValues     = 512
 	maxScriptHeaderValueBytes = 16 << 10
+	maxConsoleLogsPerAction   = 128
+	maxConsoleLogArguments    = 16
+	maxConsoleArgumentBytes   = 512
+	maxPersistentStoreBytes   = 4 << 20
+	maxPersistentKeys         = 256
+	maxPersistentKeyBytes     = 256
+	maxPersistentValueBytes   = 64 << 10
 )
 
 func newScriptRuntime(statePath ...string) *scriptRuntime {
+	return newScriptRuntimeWithLogs(nil, statePath...)
+}
+
+func newScriptRuntimeWithLogs(logs engineLogPublisher, statePath ...string) *scriptRuntime {
 	runtime := &scriptRuntime{
-		programs:     make(map[string]*goja.Program),
-		persistent:   make(map[string]map[string]string),
 		networkSlots: make(chan struct{}, maxConcurrentModuleNetworkCalls),
+		logs:         logs,
 	}
+	runtime.persistent.Store(newPersistentSnapshot())
+	runtime.persistPersistent = runtime.savePersistent
 	if len(statePath) > 0 {
 		runtime.statePath = statePath[0]
-		if err := runtime.loadPersistent(); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("intercept: ignoring invalid native extension store: %v", err)
+		loaded, err := runtime.loadPersistent()
+		switch {
+		case err == nil:
+			runtime.persistent.Store(loaded)
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			runtime.persistentLoadErr = err
+			log.Printf("intercept: native extension store unavailable; mutations disabled until restart: %v", err)
 		}
 	}
 	return runtime
 }
 
-func (r *scriptRuntime) prune(modules []Module) {
-	ids := make([]string, 0, len(modules))
-	allowed := make(map[string]struct{}, len(modules))
-	for _, module := range modules {
-		if !module.PersistentStorage {
-			continue
+func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.CertPool, module Module, rule ScriptRule, request scriptMessage, response *scriptMessage) (result scriptResult, err error) {
+	started := time.Now()
+	actionCtx, cancelAction := context.WithTimeout(ctx, time.Duration(rule.TimeoutMS)*time.Millisecond)
+	defer cancelAction()
+	defer func() {
+		if !engineLogPublishingEnabled(r.logs) {
+			return
 		}
-		ids = append(ids, module.ID)
-		allowed[module.ID] = struct{}{}
-	}
-	sort.Strings(ids)
-	signature := strings.Join(ids, "\n")
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.moduleSetReady && signature == r.moduleSet {
-		return
-	}
-	changed := false
-	for moduleID := range r.persistent {
-		if _, exists := allowed[moduleID]; !exists {
-			delete(r.persistent, moduleID)
-			changed = true
+		event := EngineLog{
+			Level: "info", Source: "engine", Extension: module.ID, Action: rule.ID,
+			Phase: rule.Phase, DurationMS: float64(time.Since(started).Nanoseconds()) / 1e6,
+			URL: sanitizeEngineLogURL(request.URL), ScriptDigest: rule.ScriptDigest, Message: "action completed",
 		}
-	}
-	r.moduleSet = signature
-	r.moduleSetReady = true
-	if changed {
-		if err := r.savePersistentLocked(); err != nil {
-			log.Printf("intercept: native extension store prune failed: %v", err)
+		if err != nil {
+			event.Level = "error"
+			switch {
+			case errors.Is(actionCtx.Err(), context.DeadlineExceeded):
+				event.Level = "warn"
+				event.Message = "action timed out"
+			case errors.Is(ctx.Err(), context.Canceled):
+				event.Level = "warn"
+				event.Message = "action canceled"
+			default:
+				event.Message = "action failed: " + err.Error()
+			}
 		}
-	}
-}
-
-func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.CertPool, module Module, rule ScriptRule, request scriptMessage, response *scriptMessage) (scriptResult, error) {
-	program, err := r.program(module, rule)
+		r.logs.Publish(event)
+	}()
+	program, err := scriptProgram(module, rule)
 	if err != nil {
 		return scriptResult{}, err
 	}
-	settings, err := moduleSettingValues(module)
+	settings, err := scriptSettingValues(module, rule)
 	if err != nil {
 		return scriptResult{}, err
 	}
 	vm := goja.New()
-	installConsoleAPI(vm, module.ID, rule.ID)
-	actionCtx, cancelAction := context.WithTimeout(ctx, time.Duration(rule.TimeoutMS)*time.Millisecond)
-	defer cancelAction()
-	requestObject, err := scriptMessageObject(vm, request, "none")
+	installConsoleAPI(vm, r.logs, EngineLog{
+		Source: "script", Extension: module.ID, Action: rule.ID, Phase: rule.Phase,
+		URL: request.URL, ScriptDigest: rule.ScriptDigest,
+	})
+	requestBodyMode := "none"
+	if response == nil {
+		requestBodyMode = rule.BodyMode
+	}
+	requestObject, err := scriptMessageObject(vm, request, requestBodyMode)
 	if err != nil {
 		return scriptResult{}, err
 	}
@@ -143,18 +169,14 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 			return scriptResult{}, objectErr
 		}
 		contextObject["response"] = responseObject
-	} else if rule.BodyMode != "none" {
-		requestObject, err = scriptMessageObject(vm, request, rule.BodyMode)
-		if err != nil {
-			return scriptResult{}, err
-		}
-		contextObject["request"] = requestObject
 	}
 	if module.PersistentStorage {
 		contextObject["storage"] = r.storageObject(vm, module.ID)
 	}
 	if len(module.NetworkOrigins) > 0 {
-		contextObject["network"] = newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, r.networkSlots)
+		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, r.networkSlots)
+		defer closeNetwork()
+		contextObject["network"] = network
 	}
 
 	stopInterrupt := context.AfterFunc(actionCtx, func() {
@@ -179,19 +201,46 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	return parseNativeScriptResult(value, response != nil)
 }
 
-func (r *scriptRuntime) program(module Module, rule ScriptRule) (*goja.Program, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if program := r.programs[rule.ScriptDigest]; program != nil {
-		return program, nil
+func scriptProgram(module Module, rule ScriptRule) (*goja.Program, error) {
+	if rule.program != nil {
+		return rule.program, nil
 	}
 	filename := firstNonEmpty(rule.ScriptURL, "extension:"+module.ID+"/"+rule.ID)
 	program, err := goja.Compile(filename, rule.ScriptBody, false)
 	if err != nil {
 		return nil, fmt.Errorf("compile action %s: %w", rule.ID, err)
 	}
-	r.programs[rule.ScriptDigest] = program
 	return program, nil
+}
+
+func scriptSettingValues(module Module, rule ScriptRule) (map[string]any, error) {
+	if rule.settings != nil {
+		return cloneScriptSettings(rule.settings), nil
+	}
+	return moduleSettingValues(module)
+}
+
+func cloneScriptSettings(settings map[string]any) map[string]any {
+	clone := make(map[string]any, len(settings))
+	for key, value := range settings {
+		clone[key] = cloneScriptSettingValue(value)
+	}
+	return clone
+}
+
+func cloneScriptSettingValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneScriptSettings(typed)
+	case []any:
+		clone := make([]any, len(typed))
+		for index, item := range typed {
+			clone[index] = cloneScriptSettingValue(item)
+		}
+		return clone
+	default:
+		return typed
+	}
 }
 
 func parseNativeScriptResult(value goja.Value, responsePhase bool) (scriptResult, error) {
@@ -305,9 +354,11 @@ func applyNativePatch(result *scriptResult, raw any, response bool) error {
 func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.Object {
 	get := func(call goja.FunctionCall) goja.Value {
 		key := call.Argument(0).String()
-		r.mu.Lock()
-		value, exists := r.persistent[moduleID][key]
-		r.mu.Unlock()
+		snapshot := r.persistent.Load()
+		if snapshot == nil {
+			return goja.Null()
+		}
+		value, exists := snapshot.modules[moduleID][key]
 		if !exists {
 			return goja.Null()
 		}
@@ -316,61 +367,78 @@ func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.O
 	set := func(call goja.FunctionCall) goja.Value {
 		key := call.Argument(0).String()
 		value := call.Argument(1).String()
-		if len(key) == 0 || len(key) > 256 || len(value) > 64<<10 {
+		if len(key) == 0 || len(key) > maxPersistentKeyBytes || len(value) > maxPersistentValueBytes {
 			return vm.ToValue(false)
 		}
-		r.mu.Lock()
-		bucket := r.persistent[moduleID]
-		if bucket == nil {
-			bucket = make(map[string]string)
-			r.persistent[moduleID] = bucket
+		r.persistentWriteMu.Lock()
+		defer r.persistentWriteMu.Unlock()
+		if r.persistentLoadErr != nil {
+			return vm.ToValue(false)
 		}
-		if len(bucket) >= 256 {
+		current := r.persistent.Load()
+		bucket := current.modules[moduleID]
+		if len(bucket) >= maxPersistentKeys {
 			if _, exists := bucket[key]; !exists {
-				r.mu.Unlock()
 				return vm.ToValue(false)
 			}
 		}
 		previous, existed := bucket[key]
-		bucket[key] = value
-		if err := r.savePersistentLocked(); err != nil {
-			if existed {
-				bucket[key] = previous
-			} else {
-				delete(bucket, key)
-			}
-			r.mu.Unlock()
+		if existed && previous == value {
+			return vm.ToValue(true)
+		}
+		nextModules := clonePersistentModules(current.modules)
+		nextBucket := clonePersistentBucket(bucket)
+		nextBucket[key] = value
+		nextModules[moduleID] = nextBucket
+		next := &persistentSnapshot{modules: nextModules}
+		if err := r.persistPersistent(next); err != nil {
 			return vm.ToValue(false)
 		}
-		r.mu.Unlock()
+		r.persistent.Store(next)
 		return vm.ToValue(true)
 	}
 	remove := func(call goja.FunctionCall) goja.Value {
 		key := call.Argument(0).String()
-		r.mu.Lock()
-		bucket := r.persistent[moduleID]
-		previous, existed := bucket[key]
-		delete(bucket, key)
-		if err := r.savePersistentLocked(); err != nil {
-			if existed {
-				bucket[key] = previous
-			}
-			r.mu.Unlock()
+		r.persistentWriteMu.Lock()
+		defer r.persistentWriteMu.Unlock()
+		if r.persistentLoadErr != nil {
 			return vm.ToValue(false)
 		}
-		r.mu.Unlock()
-		return vm.ToValue(existed)
+		current := r.persistent.Load()
+		bucket := current.modules[moduleID]
+		_, existed := bucket[key]
+		if !existed {
+			return vm.ToValue(false)
+		}
+		nextModules := clonePersistentModules(current.modules)
+		nextBucket := clonePersistentBucket(bucket)
+		delete(nextBucket, key)
+		nextModules[moduleID] = nextBucket
+		next := &persistentSnapshot{modules: nextModules}
+		if err := r.persistPersistent(next); err != nil {
+			return vm.ToValue(false)
+		}
+		r.persistent.Store(next)
+		return vm.ToValue(true)
 	}
 	clear := func(goja.FunctionCall) goja.Value {
-		r.mu.Lock()
-		previous := r.persistent[moduleID]
-		delete(r.persistent, moduleID)
-		if err := r.savePersistentLocked(); err != nil {
-			r.persistent[moduleID] = previous
-			r.mu.Unlock()
+		r.persistentWriteMu.Lock()
+		defer r.persistentWriteMu.Unlock()
+		if r.persistentLoadErr != nil {
 			return vm.ToValue(false)
 		}
-		r.mu.Unlock()
+		current := r.persistent.Load()
+		_, exists := current.modules[moduleID]
+		if !exists {
+			return vm.ToValue(true)
+		}
+		nextModules := clonePersistentModules(current.modules)
+		delete(nextModules, moduleID)
+		next := &persistentSnapshot{modules: nextModules}
+		if err := r.persistPersistent(next); err != nil {
+			return vm.ToValue(false)
+		}
+		r.persistent.Store(next)
 		return vm.ToValue(true)
 	}
 	storage := vm.NewObject()
@@ -381,45 +449,86 @@ func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.O
 	return storage
 }
 
-func (r *scriptRuntime) loadPersistent() error {
+func newPersistentSnapshot() *persistentSnapshot {
+	return &persistentSnapshot{modules: make(map[string]map[string]string)}
+}
+
+func clonePersistentModules(modules map[string]map[string]string) map[string]map[string]string {
+	clone := make(map[string]map[string]string, len(modules))
+	for moduleID, bucket := range modules {
+		clone[moduleID] = bucket
+	}
+	return clone
+}
+
+func clonePersistentBucket(bucket map[string]string) map[string]string {
+	clone := make(map[string]string, len(bucket)+1)
+	for key, value := range bucket {
+		clone[key] = value
+	}
+	return clone
+}
+
+func (r *scriptRuntime) loadPersistent() (*persistentSnapshot, error) {
 	if r.statePath == "" {
-		return nil
+		return newPersistentSnapshot(), nil
 	}
-	body, err := os.ReadFile(r.statePath)
+	file, err := os.Open(r.statePath)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(body) > 4<<20 {
-		return errors.New("native extension store exceeds 4194304 bytes")
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, maxPersistentStoreBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxPersistentStoreBytes {
+		return nil, errors.New("native extension store exceeds 4194304 bytes")
+	}
+	if !utf8.Valid(body) {
+		return nil, errors.New("native extension store is not valid UTF-8")
 	}
 	var state map[string]map[string]string
 	if err := json.Unmarshal(body, &state); err != nil {
-		return err
+		return nil, err
+	}
+	if state == nil {
+		return nil, errors.New("native extension store must be a JSON object")
 	}
 	for moduleID, values := range state {
-		if !validModuleID(moduleID) || len(values) > 256 {
-			return errors.New("native extension store exceeds key limits")
+		if !validModuleID(moduleID) || values == nil || len(values) > maxPersistentKeys {
+			return nil, errors.New("native extension store exceeds key limits")
 		}
 		for key, value := range values {
-			if len(key) == 0 || len(key) > 256 || len(value) > 64<<10 {
-				return errors.New("native extension store contains an oversized entry")
+			if len(key) == 0 || len(key) > maxPersistentKeyBytes || len(value) > maxPersistentValueBytes {
+				return nil, errors.New("native extension store contains an oversized entry")
 			}
 		}
 	}
-	r.persistent = state
-	return nil
+	return &persistentSnapshot{modules: state}, nil
 }
 
-func (r *scriptRuntime) savePersistentLocked() error {
+func marshalPersistentSnapshot(snapshot *persistentSnapshot) ([]byte, error) {
+	if snapshot == nil || snapshot.modules == nil {
+		return nil, errors.New("native extension store snapshot is uninitialized")
+	}
+	body, err := json.Marshal(snapshot.modules)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxPersistentStoreBytes {
+		return nil, errors.New("native extension store exceeds 4194304 bytes")
+	}
+	return body, nil
+}
+
+func (r *scriptRuntime) savePersistent(snapshot *persistentSnapshot) error {
 	if r.statePath == "" {
 		return nil
 	}
-	body, err := json.Marshal(r.persistent)
+	body, err := marshalPersistentSnapshot(snapshot)
 	if err != nil {
 		return err
-	}
-	if len(body) > 4<<20 {
-		return errors.New("native extension store exceeds 4194304 bytes")
 	}
 	dir := filepath.Dir(r.statePath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -449,23 +558,76 @@ func (r *scriptRuntime) savePersistentLocked() error {
 	return os.Rename(tempPath, r.statePath)
 }
 
-func installConsoleAPI(vm *goja.Runtime, moduleID, actionID string) {
+func installConsoleAPI(vm *goja.Runtime, publisher engineLogPublisher, metadata EngineLog) {
 	console := vm.NewObject()
-	logger := func(call goja.FunctionCall) goja.Value {
-		parts := make([]string, 0, len(call.Arguments))
-		for _, argument := range call.Arguments {
-			text := strings.ReplaceAll(strings.ReplaceAll(argument.String(), "\r", `\r`), "\n", `\n`)
-			parts = append(parts, truncateScriptLog(text, 512))
+	published := 0
+	limitReported := false
+	metadataNormalized := false
+	logger := func(level string) func(goja.FunctionCall) goja.Value {
+		return func(call goja.FunctionCall) goja.Value {
+			if !engineLogPublishingEnabled(publisher) {
+				return goja.Undefined()
+			}
+			if !metadataNormalized {
+				metadata.URL = sanitizeEngineLogURL(metadata.URL)
+				metadataNormalized = true
+			}
+			if published >= maxConsoleLogsPerAction {
+				if !limitReported {
+					limitReported = true
+					warning := metadata
+					warning.Source = "engine"
+					warning.Level = "warn"
+					warning.Message = "console output limit reached; further messages suppressed"
+					publisher.Publish(warning)
+				}
+				return goja.Undefined()
+			}
+			var message strings.Builder
+			for index, argument := range call.Arguments {
+				if index >= maxConsoleLogArguments || message.Len() >= maxEngineLogMessageBytes {
+					break
+				}
+				if index > 0 {
+					message.WriteByte(' ')
+				}
+				remaining := maxEngineLogMessageBytes - message.Len()
+				if remaining > maxConsoleArgumentBytes {
+					remaining = maxConsoleArgumentBytes
+				}
+				message.WriteString(boundedConsoleArgument(argument, remaining))
+			}
+			event := metadata
+			event.Level = level
+			event.Message = truncateEngineLogField(message.String(), maxEngineLogMessageBytes)
+			publisher.Publish(event)
+			published++
+			return goja.Undefined()
 		}
-		line := truncateScriptLog(strings.Join(parts, " "), 2048)
-		log.Printf("intercept: extension=%s action=%s script=%q", moduleID, actionID, line)
-		return goja.Undefined()
 	}
-	_ = console.Set("log", logger)
-	_ = console.Set("info", logger)
-	_ = console.Set("warn", logger)
-	_ = console.Set("error", logger)
+	_ = console.Set("log", logger("info"))
+	_ = console.Set("info", logger("info"))
+	_ = console.Set("warn", logger("warn"))
+	_ = console.Set("error", logger("error"))
 	_ = vm.Set("console", console)
+}
+
+func boundedConsoleArgument(argument goja.Value, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	value := argument.ToString()
+	text, ok := value.(goja.String)
+	if !ok {
+		return truncateEngineLogField(value.String(), limit)
+	}
+	units := text.Length()
+	if units > limit {
+		units = limit
+	}
+	raw := text.Substring(0, units).String()
+	raw = strings.ReplaceAll(strings.ReplaceAll(raw, "\r", `\r`), "\n", `\n`)
+	return truncateEngineLogField(raw, limit)
 }
 
 func truncateScriptLog(value string, limit int) string {
@@ -848,8 +1010,9 @@ func (m *compiledHostMatcher) Match(value string) bool {
 }
 
 // compiledScriptConfig belongs to one validated Config snapshot. ConfigStore
-// replaces the pointer on a successful reload, so regexp programs and ordered
-// module lookup state are bounded by config lifetime rather than a global cache.
+// replaces the pointer on a successful reload, so JavaScript and regexp
+// programs, decoded settings, and ordered module lookup state are bounded by
+// config lifetime rather than a global cache.
 type compiledScriptConfig struct {
 	modules        []compiledScriptModule
 	moduleHosts    map[string]*compiledHostMatcher
@@ -858,6 +1021,10 @@ type compiledScriptConfig struct {
 }
 
 func compileScriptConfig(cfg Config) (*compiledScriptConfig, error) {
+	return compileScriptConfigWithPrograms(cfg, nil)
+}
+
+func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*goja.Program) (*compiledScriptConfig, error) {
 	byID := make(map[string]Module, len(cfg.Modules))
 	for _, module := range cfg.Modules {
 		byID[module.ID] = module
@@ -883,6 +1050,10 @@ func compileScriptConfig(cfg Config) (*compiledScriptConfig, error) {
 		if !exists || !module.Enabled {
 			continue
 		}
+		settings, err := moduleSettingValues(module)
+		if err != nil {
+			return nil, fmt.Errorf("extension %s settings: %w", module.ID, err)
+		}
 		entry := compiledScriptModule{
 			module: module,
 			rules:  make([]compiledScriptRule, 0, len(module.Scripts)),
@@ -893,6 +1064,15 @@ func compileScriptConfig(cfg Config) (*compiledScriptConfig, error) {
 			if err != nil {
 				return nil, fmt.Errorf("extension %s action %s path_regex: %w", module.ID, rule.ID, err)
 			}
+			program := programs[scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}]
+			if program == nil {
+				program, err = scriptProgram(module, rule)
+				if err != nil {
+					return nil, err
+				}
+			}
+			rule.program = program
+			rule.settings = settings
 			entry.rules = append(entry.rules, compiledScriptRule{
 				rule:  rule,
 				path:  path,

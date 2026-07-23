@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"net/http"
 	"testing"
 
 	"github.com/andybalholm/brotli"
@@ -62,5 +63,28 @@ func TestDecodeContentBodyEnforcesExpandedLimit(t *testing.T) {
 	_ = writer.Close()
 	if _, err := decodeContentBody(encoded.Bytes(), "gzip", 128); err == nil {
 		t.Fatal("expanded body exceeded the limit without an error")
+	}
+}
+
+func TestNormalizedContentEncodingRequiresOneCoding(t *testing.T) {
+	tests := []struct {
+		name    string
+		header  http.Header
+		want    string
+		wantErr bool
+	}{
+		{name: "absent", header: make(http.Header)},
+		{name: "identity", header: http.Header{"Content-Encoding": {" Identity "}}, want: "identity"},
+		{name: "multiple fields", header: http.Header{"Content-Encoding": {"identity", "gzip"}}, wantErr: true},
+		{name: "combined list", header: http.Header{"Content-Encoding": {"identity, gzip"}}, wantErr: true},
+		{name: "empty field", header: http.Header{"Content-Encoding": {" "}}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := normalizedContentEncoding(test.header)
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("encoding=%q err=%v want=%q want_err=%v", got, err, test.want, test.wantErr)
+			}
+		})
 	}
 }

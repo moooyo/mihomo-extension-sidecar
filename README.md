@@ -42,6 +42,17 @@ and Uint8Array bodies decode identity, gzip, deflate, and Brotli within
 expanded-size limits. When explicitly permitted, `context.storage` writes only
 to the bounded service-owned `/var/lib/5gpn-intercept/store.json`.
 
+Structured script-console output and action lifecycle events are retained only
+in a 1000-entry in-memory ring; arbitrary script console text is never written
+to journald. The sidecar exposes that live, read-only stream on the fixed
+`/run/5gpn-intercept/logs.sock` Unix socket. The socket is mode `0660` inside a
+systemd-owned mode-`0750` runtime directory and serves only `GET /health` plus
+the RFC 6455 `GET /logs` upgrade. At most eight log WebSockets may be active;
+new connections start at the current tail and never replay disconnected data.
+URL metadata strips userinfo, query strings, and fragments. No TCP log
+listener, disk log, or additional dependency is used. Log IPC failure is
+non-fatal to the interception data plane.
+
 The runtime leaf must be a non-CA certificate covering only enabled native
 extension capture-host patterns. The sidecar cannot access the private
 root CA signing key. The root-owned certificate publisher derives the canonical

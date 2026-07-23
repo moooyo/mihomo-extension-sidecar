@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -34,11 +35,48 @@ func newModuleNetworkAPI(
 	roots *x509.CertPool,
 	origins []string,
 	slots chan struct{},
-) *goja.Object {
+) (*goja.Object, func()) {
+	requester := newModuleNetworkRequester(ctx, proxy, roots, origins, slots)
+	return requester.newAPI(vm), requester.Close
+}
+
+// moduleNetworkRequester belongs to one action. It never shares transports
+// across action or configuration snapshots.
+type moduleNetworkRequester struct {
+	ctx     context.Context
+	proxy   ProxyConfig
+	roots   *x509.CertPool
+	allowed map[string]struct{}
+	slots   chan struct{}
+
+	mu         sync.Mutex
+	transports map[string]*http.Transport
+	closed     bool
+}
+
+func newModuleNetworkRequester(
+	ctx context.Context,
+	proxy ProxyConfig,
+	roots *x509.CertPool,
+	origins []string,
+	slots chan struct{},
+) *moduleNetworkRequester {
 	allowed := make(map[string]struct{}, len(origins))
 	for _, origin := range origins {
 		allowed[origin] = struct{}{}
 	}
+	requester := &moduleNetworkRequester{
+		ctx:        ctx,
+		proxy:      proxy,
+		roots:      roots,
+		allowed:    allowed,
+		slots:      slots,
+		transports: make(map[string]*http.Transport),
+	}
+	return requester
+}
+
+func (r *moduleNetworkRequester) newAPI(vm *goja.Runtime) *goja.Object {
 	calls := 0
 	network := vm.NewObject()
 	_ = network.Set("request", func(call goja.FunctionCall) goja.Value {
@@ -50,7 +88,7 @@ func newModuleNetworkAPI(
 		if !ok {
 			panic(vm.NewTypeError("network.request requires an options object"))
 		}
-		response, err := performModuleNetworkRequest(ctx, proxy, roots, allowed, slots, options)
+		response, err := r.request(options)
 		if err != nil {
 			panic(vm.NewGoError(fmt.Errorf("network.request failed: %w", err)))
 		}
@@ -73,6 +111,25 @@ func newModuleNetworkAPI(
 	return network
 }
 
+func (r *moduleNetworkRequester) Close() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
+	transports := make([]*http.Transport, 0, len(r.transports))
+	for _, transport := range r.transports {
+		transports = append(transports, transport)
+	}
+	r.transports = nil
+	r.mu.Unlock()
+
+	for _, transport := range transports {
+		transport.CloseIdleConnections()
+	}
+}
+
 type moduleNetworkResponse struct {
 	url      string
 	status   int
@@ -89,6 +146,16 @@ func performModuleNetworkRequest(
 	slots chan struct{},
 	options map[string]any,
 ) (moduleNetworkResponse, error) {
+	origins := make([]string, 0, len(allowed))
+	for origin := range allowed {
+		origins = append(origins, origin)
+	}
+	requester := newModuleNetworkRequester(ctx, proxy, roots, origins, slots)
+	defer requester.Close()
+	return requester.request(options)
+}
+
+func (r *moduleNetworkRequester) request(options map[string]any) (moduleNetworkResponse, error) {
 	for key := range options {
 		switch key {
 		case "url", "method", "headers", "body":
@@ -104,7 +171,7 @@ func performModuleNetworkRequest(
 	if err != nil {
 		return moduleNetworkResponse{}, err
 	}
-	if _, permitted := allowed[origin]; !permitted {
+	if _, permitted := r.allowed[origin]; !permitted {
 		return moduleNetworkResponse{}, fmt.Errorf("origin %q is not permitted", origin)
 	}
 	method := http.MethodGet
@@ -142,12 +209,12 @@ func performModuleNetworkRequest(
 	}
 
 	select {
-	case slots <- struct{}{}:
-		defer func() { <-slots }()
+	case r.slots <- struct{}{}:
+		defer func() { <-r.slots }()
 	default:
 		return moduleNetworkResponse{}, errors.New("network request capacity is busy")
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, moduleNetworkTimeout)
+	requestCtx, cancel := context.WithTimeout(r.ctx, moduleNetworkTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, method, parsed.String(), bytes.NewReader(body))
 	if err != nil {
@@ -160,28 +227,11 @@ func performModuleNetworkRequest(
 		request.ContentLength = 0
 	}
 
-	transport := &http.Transport{
-		Proxy:                  nil,
-		ForceAttemptHTTP2:      true,
-		DisableCompression:     true,
-		DisableKeepAlives:      true,
-		MaxConnsPerHost:        1,
-		MaxResponseHeaderBytes: maxModuleNetworkHeaderBytes,
-		ResponseHeaderTimeout:  moduleNetworkTimeout,
-		TLSHandshakeTimeout:    moduleNetworkTimeout,
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			RootCAs:    roots,
-		},
-		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
-			host, port, splitErr := net.SplitHostPort(address)
-			if splitErr != nil || canonicalHost(host) != target.Host || port != strconv.Itoa(target.Port) {
-				return nil, errors.New("transport attempted a target outside the permitted origin")
-			}
-			return dialSOCKS5TCP(dialCtx, proxy, target)
-		},
+	transport, err := r.transport(origin, target)
+	if err != nil {
+		return moduleNetworkResponse{}, err
 	}
-	defer transport.CloseIdleConnections()
+	defer r.closeTransportIfRequesterClosed(transport)
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   moduleNetworkTimeout,
@@ -213,6 +263,51 @@ func performModuleNetworkRequest(
 		trailers: map[string][]string(responseTrailers),
 		body:     responseBody,
 	}, nil
+}
+
+func (r *moduleNetworkRequester) transport(origin string, target socksTarget) (*http.Transport, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, errors.New("network requester is closed")
+	}
+	if transport := r.transports[origin]; transport != nil {
+		return transport, nil
+	}
+
+	transport := &http.Transport{
+		Proxy:                  nil,
+		ForceAttemptHTTP2:      true,
+		DisableCompression:     true,
+		MaxIdleConns:           1,
+		MaxIdleConnsPerHost:    1,
+		MaxConnsPerHost:        1,
+		MaxResponseHeaderBytes: maxModuleNetworkHeaderBytes,
+		ResponseHeaderTimeout:  moduleNetworkTimeout,
+		TLSHandshakeTimeout:    moduleNetworkTimeout,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    r.roots,
+		},
+		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
+			host, port, splitErr := net.SplitHostPort(address)
+			if splitErr != nil || canonicalHost(host) != target.Host || port != strconv.Itoa(target.Port) {
+				return nil, errors.New("transport attempted a target outside the permitted origin")
+			}
+			return dialSOCKS5TCP(dialCtx, r.proxy, target)
+		},
+	}
+	r.transports[origin] = transport
+	return transport, nil
+}
+
+func (r *moduleNetworkRequester) closeTransportIfRequesterClosed(transport *http.Transport) {
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		transport.CloseIdleConnections()
+	}
 }
 
 func parseModuleNetworkRequestURL(raw string) (*url.URL, string, socksTarget, error) {

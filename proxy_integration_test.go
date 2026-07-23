@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -18,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +30,8 @@ import (
 func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	certPath, keyPath, roots := writeTestInterceptCertificate(t)
 	upstreamBody := []byte("upstream")
+	requestBody := []byte("client-payload")
+	var upstreamV1Calls atomic.Int32
 	upstreamUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +55,12 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 				http.Error(w, "unexpected request", http.StatusBadRequest)
 				return
 			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil || !bytes.Equal(body, requestBody) {
+				http.Error(w, "unexpected request body", http.StatusBadRequest)
+				return
+			}
+			upstreamV1Calls.Add(1)
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Header().Set("Trailer", "Grpc-Status")
 			_, _ = w.Write(upstreamBody)
@@ -71,7 +81,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 
 	relayUser := "relay-username-123"
 	relayPassword := "relay-password-1234567890"
-	relayAddress, closeRelay := startTestSOCKSUDPRelay(t, upstreamUDP.LocalAddr().(*net.UDPAddr), relayUser, relayPassword)
+	relayAddress, relayAssociations, closeRelay := startTestSOCKSUDPRelay(t, upstreamUDP.LocalAddr().(*net.UDPAddr), relayUser, relayPassword)
 	t.Cleanup(closeRelay)
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
@@ -136,7 +146,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 		Username: "inbound-user-123",
 		Password: "inbound-password-123456789",
 	}
-	for _, version := range []quic.Version{quic.Version1, quic.Version2} {
+	for index, version := range []quic.Version{quic.Version1, quic.Version2} {
 		t.Run(version.String(), func(t *testing.T) {
 			target := socksTarget{Host: "api.example.com", Port: 443}
 			packetConn, err := dialSOCKS5UDP(context.Background(), clientProxy, target)
@@ -154,7 +164,26 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			defer clientTransport.Close()
 			defer quicTransport.Close()
 			defer packetConn.Close()
-			request, err := http.NewRequest(http.MethodPost, "https://api.example.com/v1", nil)
+			// The first authority request is bodyless so the v1-to-v2 replay
+			// path cannot rely on a prior payload request caching v2.
+			bodylessRequest, err := http.NewRequest(http.MethodPost, "https://api.example.com/bodyless", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodylessRequest.Header.Set("Te", "trailers")
+			bodylessResponse, err := clientTransport.RoundTrip(bodylessRequest)
+			if err != nil {
+				t.Fatalf("HTTP/3 bodyless round trip: %v", err)
+			}
+			defer bodylessResponse.Body.Close()
+			if _, err := io.ReadAll(bodylessResponse.Body); err != nil {
+				t.Fatal(err)
+			}
+			if bodylessResponse.StatusCode != http.StatusNotModified {
+				t.Fatalf("bodyless status=%d", bodylessResponse.StatusCode)
+			}
+
+			request, err := http.NewRequest(http.MethodPost, "https://api.example.com/v1", bytes.NewReader(requestBody))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -177,22 +206,13 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			if response.Trailer.Get("Grpc-Status") != "7" {
 				t.Fatalf("trailers=%v", response.Trailer)
 			}
-
-			bodylessRequest, err := http.NewRequest(http.MethodPost, "https://api.example.com/bodyless", nil)
-			if err != nil {
-				t.Fatal(err)
+			if got, want := upstreamV1Calls.Load(), int32(index+1); got != want {
+				t.Fatalf("upstream /v1 calls=%d, want %d (request body was retried unsafely)", got, want)
 			}
-			bodylessRequest.Header.Set("Te", "trailers")
-			bodylessResponse, err := clientTransport.RoundTrip(bodylessRequest)
-			if err != nil {
-				t.Fatalf("HTTP/3 bodyless round trip: %v", err)
-			}
-			defer bodylessResponse.Body.Close()
-			if _, err := io.ReadAll(bodylessResponse.Body); err != nil {
-				t.Fatal(err)
-			}
-			if bodylessResponse.StatusCode != http.StatusNotModified {
-				t.Fatalf("bodyless status=%d", bodylessResponse.StatusCode)
+			if version == quic.Version1 {
+				if got := relayAssociations.Load(); got != 2 {
+					t.Fatalf("two requests opened %d upstream UDP associations, want v1 probe plus one reused v2 association", got)
+				}
 			}
 
 			oversizedRequest, err := http.NewRequest(http.MethodGet, "https://api.example.com/oversized-header", nil)
@@ -213,6 +233,98 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("revocation on existing UDP association", func(t *testing.T) {
+		target := socksTarget{Host: "api.example.com", Port: 443}
+		packetConn, err := dialSOCKS5UDP(context.Background(), clientProxy, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer packetConn.Close()
+		quicTransport := &quic.Transport{Conn: packetConn}
+		defer quicTransport.Close()
+		newClientTransport := func() *http3.Transport {
+			return &http3.Transport{
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: target.Host},
+				QUICConfig:      &quic.Config{Versions: []quic.Version{quic.Version2}},
+				Dial: func(ctx context.Context, _ string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
+					return quicTransport.Dial(ctx, target, tlsConfig, quicConfig)
+				},
+			}
+		}
+		clientTransport := newClientTransport()
+		request, err := http.NewRequest(http.MethodGet, "https://api.example.com/bodyless", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Te", "trailers")
+		response, err := clientTransport.RoundTrip(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadAll(response.Body); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNotModified {
+			t.Fatalf("pre-revocation status = %d", response.StatusCode)
+		}
+
+		disabledCfg := cfg
+		disabledCfg.Modules = append([]Module(nil), cfg.Modules...)
+		disabledCfg.Modules[0].Enabled = false
+		disabledBody, err := json.Marshal(disabledCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, disabledBody, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := store.Current()
+		if err != nil || activeInterceptHost(loaded, target.Host) {
+			t.Fatalf("revoked config was not loaded: active=%t err=%v", activeInterceptHost(loaded, target.Host), err)
+		}
+
+		request, err = http.NewRequest(http.MethodGet, "https://api.example.com/bodyless", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Te", "trailers")
+		response, err = clientTransport.RoundTrip(request)
+		if err != nil {
+			t.Fatalf("existing QUIC connection did not return a fail-closed HTTP response: %v", err)
+		}
+		_, _ = io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusMisdirectedRequest {
+			t.Fatalf("post-revocation existing-connection status = %d", response.StatusCode)
+		}
+		if err := clientTransport.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		newConnectionTransport := newClientTransport()
+		defer newConnectionTransport.Close()
+		requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		request, err = http.NewRequestWithContext(requestCtx, http.MethodGet, "https://api.example.com/bodyless", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response, err := newConnectionTransport.RoundTrip(request); err == nil {
+			response.Body.Close()
+			t.Fatal("revoked SNI completed a new QUIC handshake on the old UDP association")
+		}
+
+		if err := os.WriteFile(configPath, configBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		restored, err := store.Current()
+		if err != nil || !activeInterceptHost(restored, target.Host) {
+			t.Fatalf("test config was not restored: active=%t err=%v", activeInterceptHost(restored, target.Host), err)
+		}
+	})
 
 	t.Run("fallback protection", func(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
@@ -252,23 +364,25 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	})
 }
 
-func startTestSOCKSUDPRelay(t *testing.T, upstream *net.UDPAddr, username, password string) (string, func()) {
+func startTestSOCKSUDPRelay(t *testing.T, upstream *net.UDPAddr, username, password string) (string, *atomic.Int32, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:17890")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	associations := &atomic.Int32{}
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
+			associations.Add(1)
 			go serveTestSOCKSUDPAssociation(ctx, conn, upstream, username, password)
 		}
 	}()
-	return listener.Addr().String(), func() {
+	return listener.Addr().String(), associations, func() {
 		cancel()
 		_ = listener.Close()
 	}

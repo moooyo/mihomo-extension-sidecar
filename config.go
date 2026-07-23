@@ -52,6 +52,9 @@ type Config struct {
 	MITM           MITMSettings `json:"mitm"`
 	Modules        []Module     `json:"modules,omitempty"`
 	runtime        *compiledScriptConfig
+	// generation is assigned by configStore and advances only when validated
+	// document content changes. Directly decoded test/check configs leave it zero.
+	generation uint64
 }
 
 type ProxyConfig struct {
@@ -90,6 +93,15 @@ type ScriptRule struct {
 	BodyMode     string      `json:"body_mode"`
 	TimeoutMS    int         `json:"timeout_ms"`
 	MaxBodyBytes int64       `json:"max_body_bytes"`
+	// program and settings belong to the immutable compiled config snapshot.
+	program  *goja.Program
+	settings map[string]any
+}
+
+type scriptProgramKey struct {
+	moduleID string
+	actionID string
+	digest   string
 }
 
 type LocationValue struct {
@@ -273,10 +285,27 @@ type Module struct {
 }
 
 func loadConfig(path string) (Config, error) {
-	body, err := readConfigBounded(path)
+	body, err := readConfigDocument(path)
 	if err != nil {
-		return Config{}, fmt.Errorf("read config: %w", err)
+		return Config{}, err
 	}
+	return decodeConfig(body)
+}
+
+func readConfigDocument(path string) ([]byte, error) {
+	body, _, err := readConfigDocumentWithInfo(path)
+	return body, err
+}
+
+func readConfigDocumentWithInfo(path string) ([]byte, os.FileInfo, error) {
+	body, info, err := readConfigBoundedWithOpenInfo(path, os.Open)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read config: %w", err)
+	}
+	return body, info, nil
+}
+
+func decodeConfig(body []byte) (Config, error) {
 	if err := rejectDuplicateJSONKeys(body); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
@@ -289,10 +318,11 @@ func loadConfig(path string) (Config, error) {
 	if err := requireJSONEOF(decoder); err != nil {
 		return Config{}, err
 	}
-	if err := cfg.Validate(); err != nil {
+	programs := make(map[scriptProgramKey]*goja.Program)
+	if err := cfg.validate(programs); err != nil {
 		return Config{}, err
 	}
-	runtime, err := compileScriptConfig(cfg)
+	runtime, err := compileScriptConfigWithPrograms(cfg, programs)
 	if err != nil {
 		return Config{}, fmt.Errorf("compile config runtime: %w", err)
 	}
@@ -328,41 +358,46 @@ func readConfigBounded(path string) ([]byte, error) {
 }
 
 func readConfigBoundedWithOpen(path string, openFile func(string) (*os.File, error)) ([]byte, error) {
+	body, _, err := readConfigBoundedWithOpenInfo(path, openFile)
+	return body, err
+}
+
+func readConfigBoundedWithOpenInfo(path string, openFile func(string) (*os.File, error)) ([]byte, os.FileInfo, error) {
 	pathInfo, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !pathInfo.Mode().IsRegular() {
-		return nil, errors.New("config path is not a regular file")
+		return nil, nil, errors.New("config path is not a regular file")
 	}
 	// Windows resolves the file ID stored in FileInfo lazily. Comparing the
 	// pre-open value with itself pins that identity before the path can change.
 	if !os.SameFile(pathInfo, pathInfo) {
-		return nil, errors.New("could not establish config file identity")
+		return nil, nil, errors.New("could not establish config file identity")
 	}
 	file, err := openFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !openedInfo.Mode().IsRegular() {
-		return nil, errors.New("opened config is not a regular file")
+		return nil, nil, errors.New("opened config is not a regular file")
 	}
 	if !os.SameFile(pathInfo, openedInfo) {
-		return nil, errors.New("config path changed while opening")
+		return nil, nil, errors.New("config path changed while opening")
 	}
 	body, err := io.ReadAll(io.LimitReader(file, maxConfigBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(body) > maxConfigBytes {
-		return nil, fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
+		return nil, nil, fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
 	}
-	return body, nil
+	return body, openedInfo, nil
 }
 
 func rejectDuplicateJSONKeys(body []byte) error {
@@ -437,6 +472,10 @@ func requireJSONEOF(decoder *json.Decoder) error {
 }
 
 func (c Config) Validate() error {
+	return c.validate(nil)
+}
+
+func (c Config) validate(programs map[scriptProgramKey]*goja.Program) error {
 	if c.Version != configVersion {
 		return fmt.Errorf("config version must be %d", configVersion)
 	}
@@ -458,7 +497,7 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.TLSCert) == "" || strings.TrimSpace(c.TLSKey) == "" {
 		return errors.New("tls_cert and tls_key are required")
 	}
-	if err := validateModules(c.Modules); err != nil {
+	if err := validateModulesWithPrograms(c.Modules, programs); err != nil {
 		return err
 	}
 	if err := validateExecutionOrder(c.Modules, c.ExecutionOrder); err != nil {
@@ -782,6 +821,10 @@ func hostCoveredBy(patterns []string, candidate string) bool {
 }
 
 func validateModules(modules []Module) error {
+	return validateModulesWithPrograms(modules, nil)
+}
+
+func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey]*goja.Program) error {
 	if len(modules) > 64 {
 		return errors.New("at most 64 interception extensions are allowed")
 	}
@@ -863,8 +906,12 @@ func validateModules(modules []Module) error {
 				return fmt.Errorf("extension %q action %q script snapshot is invalid", module.ID, rule.ID)
 			}
 			filename := firstNonEmpty(rule.ScriptURL, "extension:"+module.ID+"/"+rule.ID)
-			if _, err := goja.Compile(filename, rule.ScriptBody, false); err != nil {
+			program, err := goja.Compile(filename, rule.ScriptBody, false)
+			if err != nil {
 				return fmt.Errorf("extension %q action %q script does not compile: %w", module.ID, rule.ID, err)
+			}
+			if programs != nil {
+				programs[scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}] = program
 			}
 			if rule.BodyMode != "none" && rule.BodyMode != "text" && rule.BodyMode != "binary" {
 				return fmt.Errorf("extension %q action %q body mode is invalid", module.ID, rule.ID)
@@ -1298,24 +1345,40 @@ func certificateDigest(cfg Config) string {
 }
 
 type configStore struct {
-	path string
+	path         string
+	readDocument func(string) ([]byte, os.FileInfo, error)
 
-	mu         sync.Mutex
-	modTime    time.Time
-	badModTime time.Time
-	cfg        Config
+	mu               sync.Mutex
+	modTime          time.Time
+	goodSize         int64
+	goodFile         os.FileInfo
+	badModTime       time.Time
+	badSize          int64
+	badFile          os.FileInfo
+	readErrorModTime time.Time
+	readErrorSize    int64
+	readErrorFile    os.FileInfo
+	contentDigest    [sha256.Size]byte
+	cfg              Config
+	logs             engineLogPublisher
 }
 
 func newConfigStore(path string) (*configStore, error) {
-	cfg, err := loadConfig(path)
+	body, info, err := readConfigDocumentWithInfo(path)
 	if err != nil {
 		return nil, err
 	}
-	info, err := os.Stat(path)
+	cfg, err := decodeConfig(body)
 	if err != nil {
-		return nil, fmt.Errorf("stat config: %w", err)
+		return nil, err
 	}
-	return &configStore{path: path, modTime: info.ModTime(), cfg: cfg}, nil
+	cfg.generation = 1
+	store := &configStore{
+		path: path, readDocument: readConfigDocumentWithInfo,
+		contentDigest: sha256.Sum256(body), cfg: cfg,
+	}
+	store.rememberGoodFile(info)
+	return store, nil
 }
 
 func (s *configStore) Current() (Config, error) {
@@ -1325,19 +1388,127 @@ func (s *configStore) Current() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("stat config: %w", err)
 	}
-	if info.ModTime().Equal(s.modTime) {
+	if s.matchesGoodFile(info) {
 		return s.cfg, nil
 	}
-	cfg, err := loadConfig(s.path)
+	if s.matchesBadFile(info) {
+		return s.cfg, nil
+	}
+	readDocument := s.readDocument
+	if readDocument == nil {
+		readDocument = readConfigDocumentWithInfo
+	}
+	body, readInfo, err := readDocument(s.path)
 	if err != nil {
-		if !info.ModTime().Equal(s.badModTime) {
-			log.Printf("intercept: ignoring invalid replacement config and retaining the last valid snapshot: %v", err)
-			s.badModTime = info.ModTime()
+		if !s.matchesReadErrorFile(info) {
+			log.Print("intercept: could not read replacement config; retaining the last valid snapshot")
+			if s.engineLogsEnabled() {
+				s.publishEngineLog("warn", "configuration read failed: "+err.Error())
+			}
+			s.rememberReadErrorFile(info)
 		}
 		return s.cfg, nil
 	}
+	s.clearReadErrorFile()
+	if readInfo == nil {
+		readInfo = info
+	}
+	digest := sha256.Sum256(body)
+	if digest == s.contentDigest {
+		s.rememberGoodFile(readInfo)
+		s.clearBadFile()
+		return s.cfg, nil
+	}
+	cfg, err := decodeConfig(body)
+	if err != nil {
+		log.Print("intercept: ignoring invalid replacement config; retaining the last valid snapshot")
+		if s.engineLogsEnabled() {
+			s.publishEngineLog("error", "configuration replacement rejected: "+err.Error())
+		}
+		s.rememberBadFile(readInfo)
+		return s.cfg, nil
+	}
+	cfg.generation = s.cfg.generation + 1
 	s.cfg = cfg
-	s.modTime = info.ModTime()
-	s.badModTime = time.Time{}
+	s.rememberGoodFile(readInfo)
+	s.contentDigest = digest
+	s.clearBadFile()
+	s.publishEngineLog("info", "configuration reloaded")
 	return cfg, nil
+}
+
+func (s *configStore) setEngineLogPublisher(publisher engineLogPublisher) {
+	s.mu.Lock()
+	s.logs = publisher
+	s.mu.Unlock()
+}
+
+func (s *configStore) publishEngineLog(level, message string) {
+	if s.engineLogsEnabled() {
+		s.logs.Publish(EngineLog{Level: level, Source: "engine", Message: message})
+	}
+}
+
+func (s *configStore) engineLogsEnabled() bool {
+	return engineLogPublishingEnabled(s.logs)
+}
+
+func (s *configStore) matchesGoodFile(info os.FileInfo) bool {
+	return s.goodFile != nil && info.Size() == s.goodSize && info.ModTime().Equal(s.modTime) && os.SameFile(info, s.goodFile)
+}
+
+func (s *configStore) rememberGoodFile(info os.FileInfo) {
+	if !os.SameFile(info, info) {
+		s.modTime = time.Time{}
+		s.goodSize = 0
+		s.goodFile = nil
+		return
+	}
+	s.modTime = info.ModTime()
+	s.goodSize = info.Size()
+	s.goodFile = info
+}
+
+func (s *configStore) matchesBadFile(info os.FileInfo) bool {
+	return s.badFile != nil && info.Size() == s.badSize && info.ModTime().Equal(s.badModTime) && os.SameFile(info, s.badFile)
+}
+
+func (s *configStore) rememberBadFile(info os.FileInfo) {
+	// Windows resolves FileInfo identity lazily. Comparing the value with itself
+	// pins the file ID before an atomic replacement can reuse its modification time.
+	if !os.SameFile(info, info) {
+		s.clearBadFile()
+		return
+	}
+	s.badModTime = info.ModTime()
+	s.badSize = info.Size()
+	s.badFile = info
+}
+
+func (s *configStore) clearBadFile() {
+	s.badModTime = time.Time{}
+	s.badSize = 0
+	s.badFile = nil
+}
+
+func (s *configStore) matchesReadErrorFile(info os.FileInfo) bool {
+	return s.readErrorFile != nil && info.Size() == s.readErrorSize && info.ModTime().Equal(s.readErrorModTime) && os.SameFile(info, s.readErrorFile)
+}
+
+func (s *configStore) rememberReadErrorFile(info os.FileInfo) {
+	// This state suppresses duplicate log lines only. Unlike a decoded invalid
+	// document, an I/O failure is retried on every Current call.
+	if !os.SameFile(info, info) {
+		s.clearReadErrorFile()
+		return
+	}
+	s.readErrorModTime = info.ModTime()
+	s.readErrorSize = info.Size()
+	s.readErrorFile = info
+}
+
+func (s *configStore) clearReadErrorFile() {
+	s.readErrorModTime = time.Time{}
+	s.readErrorSize = 0
+	s.readErrorFile = nil
 }
