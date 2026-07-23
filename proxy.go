@@ -24,6 +24,7 @@ type interceptProxy struct {
 	certificates  *certificateStore
 	upstreamRoots *x509.CertPool
 	scripts       *scriptRuntime
+	tlsErrors     *tlsHandshakeErrorReporter
 	bodySlots     chan struct{}
 
 	transportMu sync.Mutex
@@ -37,6 +38,8 @@ const (
 	maxUpstreamHTTP3Connections           = 64
 	upstreamHTTPIdleTimeout               = 90 * time.Second
 	upstreamHTTP3RecycleTimeout           = 250 * time.Millisecond
+	interceptCertificateTrustLogInterval  = time.Minute
+	interceptCertificateTrustMessage      = "client rejected the interception certificate as untrusted; open Setup Guide, install the current 5gpn interception CA, and enable full trust on the client"
 )
 
 type upstreamTransportGeneration struct {
@@ -55,12 +58,78 @@ type upstreamTransportGeneration struct {
 	retired bool
 }
 
+type tlsHandshakeErrorReporter struct {
+	mu               sync.Mutex
+	lastTrustWarning time.Time
+	now              func() time.Time
+	logs             engineLogPublisher
+	logger           *log.Logger
+}
+
+type tlsHandshakeErrorWriter struct {
+	reporter *tlsHandshakeErrorReporter
+	target   string
+}
+
+func newTLSHandshakeErrorReporter() *tlsHandshakeErrorReporter {
+	return &tlsHandshakeErrorReporter{now: time.Now, logger: log.Default()}
+}
+
+func (r *tlsHandshakeErrorReporter) writer(target string) io.Writer {
+	return &tlsHandshakeErrorWriter{reporter: r, target: target}
+}
+
+func (w *tlsHandshakeErrorWriter) Write(payload []byte) (int, error) {
+	if w != nil && w.reporter != nil {
+		w.reporter.report(w.target, strings.TrimSpace(string(payload)))
+	}
+	return len(payload), nil
+}
+
+func (r *tlsHandshakeErrorReporter) report(target, message string) {
+	if r == nil || message == "" {
+		return
+	}
+	logger := r.logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	logger.Printf("intercept: target=%q %s", target, message)
+	if !strings.Contains(strings.ToLower(message), "remote error: tls: unknown certificate") {
+		return
+	}
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	r.mu.Lock()
+	if !r.lastTrustWarning.IsZero() && now.Before(r.lastTrustWarning.Add(interceptCertificateTrustLogInterval)) {
+		r.mu.Unlock()
+		return
+	}
+	r.lastTrustWarning = now
+	r.mu.Unlock()
+
+	logger.Printf("intercept: target=%q %s", target, interceptCertificateTrustMessage)
+	if engineLogPublishingEnabled(r.logs) {
+		r.logs.Publish(EngineLog{
+			Level: "warn", Source: "engine", URL: "https://" + target,
+			Message: interceptCertificateTrustMessage,
+		})
+	}
+}
+
 func newInterceptProxy(config *configStore, certificates *certificateStore) *interceptProxy {
 	scripts := newScriptRuntime("/var/lib/5gpn-intercept/store.json")
 	return &interceptProxy{
-		config: config, certificates: certificates, scripts: scripts,
+		config: config, certificates: certificates, scripts: scripts, tlsErrors: newTLSHandshakeErrorReporter(),
 		bodySlots: make(chan struct{}, 2), http3Slots: make(chan struct{}, maxUpstreamHTTP3Connections),
 	}
+}
+
+func (p *interceptProxy) setEngineLogPublisher(logs engineLogPublisher) {
+	p.scripts.logs = logs
+	p.tlsErrors.logs = logs
 }
 
 func (p *interceptProxy) Serve(ctx context.Context, listener net.Listener) error {
@@ -124,7 +193,7 @@ func (p *interceptProxy) handleSOCKSConnection(ctx context.Context, conn net.Con
 		if target.Port == 80 {
 			return p.servePlainHTTPConnection(conn)
 		}
-		return p.serveTLSConnection(conn)
+		return p.serveTLSConnection(conn, target.Host)
 	case socksCommandUDP:
 		return p.serveUDPAssociation(ctx, conn)
 	default:
@@ -148,7 +217,7 @@ func (p *interceptProxy) servePlainHTTPConnection(conn net.Conn) error {
 	return err
 }
 
-func (p *interceptProxy) serveTLSConnection(conn net.Conn) error {
+func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error {
 	cfg, err := p.config.Current()
 	if err != nil {
 		return err
@@ -159,6 +228,7 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn) error {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
+		ErrorLog:          log.New(p.tlsErrors.writer(target), "", 0),
 		TLSConfig: &tls.Config{
 			MinVersion:     tls.VersionTLS12,
 			GetCertificate: p.certificates.GetCertificate,

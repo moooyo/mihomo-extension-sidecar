@@ -113,7 +113,7 @@ func main() {
 		logService = nil
 	}
 	proxy := newInterceptProxy(store, certificates)
-	proxy.scripts.logs = logs
+	proxy.setEngineLogPublisher(logs)
 	go stopWhenMITMDisabled(ctx, store, stopRuntime)
 	log.Printf("intercept: modular TLS and HTTP/3 SOCKS5 TCP/UDP service listening on %s (http2=%t quic_fallback_protection=%t)", cfg.Listen, cfg.MITM.HTTP2, cfg.MITM.QUICFallbackProtection)
 	logs.Publish(EngineLog{
