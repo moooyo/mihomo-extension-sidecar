@@ -31,6 +31,12 @@ func main() {
 	printCertificateDigest := flags.Bool("print-certificate-digest", false, "print the canonical certificate SAN digest and exit")
 	printCertificateRequest := flags.Bool("print-certificate-request", false, "print the SAN digest followed by the canonical SAN list and exit")
 	healthcheck := flags.Bool("healthcheck", false, "verify the local SOCKS5 service and exit")
+	bundleStoreDir := flags.String("bundle-store", "/var/lib/5gpn-intercept",
+		"directory this sidecar keeps its own bundle state in")
+	controlSocket := flags.String("control-socket", "/run/5gpn-intercept/control.sock",
+		"machine-only control API socket; empty disables the API")
+	controlPeerUID := flags.Int("control-peer-uid", -1, "only accept control connections from this uid (-1 for any)")
+	controlPeerGID := flags.Int("control-peer-gid", -1, "only accept control connections from this gid (-1 for any)")
 	_ = flags.Parse(os.Args[1:])
 	if *printCertificateHosts || *printCertificateDigest || *printCertificateRequest {
 		cfg, err := loadCertificateConfig(*configPath)
@@ -112,6 +118,39 @@ func main() {
 		log.Print("intercept: engine log service unavailable; continuing without UI log streaming")
 		logService = nil
 	}
+	// The sidecar owns its plugin state. A bundle recovered here is
+	// authoritative and the coordinator's file is not consulted again; a
+	// deployment that has never been pushed one keeps using the file, which is
+	// what makes this a migration rather than a flag day.
+	var control *controlServer
+	if *controlSocket != "" {
+		bundles, err := openBundleStore(*bundleStoreDir)
+		if err != nil {
+			log.Fatalf("intercept: bundle store: %v", err)
+		}
+		manager := newBundleManager(bundles, logs)
+		if err := manager.Recover(); err != nil {
+			// Serving nothing is the safe state: mihomo's capture rules treat a
+			// processor with no bundle as not ready and fail closed, so an
+			// unusable artifact must not also take the process down.
+			log.Printf("intercept: could not recover a bundle, continuing with none: %v", err)
+		}
+		if manager.Active() != nil {
+			store.setBundleSource(manager.Active)
+			log.Printf("intercept: serving pushed bundle %s", manager.ActiveID())
+		} else {
+			// Flip the source the moment the first bundle commits.
+			store.setBundleSource(func() *Config { return manager.Active() })
+		}
+		control = newControlServer(manager, version, *controlPeerUID, *controlPeerGID)
+		go func() {
+			if err := control.Serve(*controlSocket); err != nil {
+				log.Printf("intercept: control API stopped: %v", err)
+			}
+		}()
+		defer control.Close()
+	}
+
 	proxy := newInterceptProxy(store, certificates)
 	proxy.setEngineLogPublisher(logs)
 	go stopWhenMITMDisabled(ctx, store, stopRuntime)

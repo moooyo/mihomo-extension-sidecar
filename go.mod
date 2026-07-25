@@ -1,4 +1,4 @@
-module github.com/moooyo/5gpn/cmd/5gpn-intercept
+module github.com/moooyo/5gpn-intercept
 
 go 1.26.5
 

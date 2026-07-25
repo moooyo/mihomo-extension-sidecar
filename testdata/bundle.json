@@ -1,0 +1,95 @@
+{
+  "version": 5,
+  "listen": "127.0.0.1:18080",
+  "username": "module-in-0000000000000000000000",
+  "password": "module-in-password-0000000000000000",
+  "tls_cert": "/etc/5gpn/intercept/tls/fullchain.pem",
+  "tls_key": "/etc/5gpn/intercept/tls/privkey.pem",
+  "upstream_proxy": {
+    "address": "127.0.0.1:17890",
+    "username": "module-up-0000000000000000000000",
+    "password": "module-up-password-0000000000000000"
+  },
+  "mitm": {
+    "enabled": true,
+    "http2": true,
+    "quic_fallback_protection": true
+  },
+  "execution_order": [
+    "io.5gpn.apple-wloc"
+  ],
+  "modules": [
+    {
+      "id": "io.5gpn.apple-wloc",
+      "extension_version": "1.1.1",
+      "name": "Apple WLOC Location Override",
+      "description": "Rewrites Apple Wi-Fi and cellular location responses to an operator-selected point.",
+      "enabled": true,
+      "imported_at": "2026-07-22T20:14:11Z",
+      "source": {
+        "url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/26b49e3b2f74a7841cbd0324762ffdb82401a71a/apple-wloc/extension.yaml",
+        "digest": "ed223d3ad6b476be6ae62508f452f93198266d2ab6b9044318a210a25e1251d1",
+        "body": "apiVersion: 5gpn.io/v1\nkind: Extension\n\nmetadata:\n  id: io.5gpn.apple-wloc\n  name: Apple WLOC Location Override\n  version: 1.1.1\n  description: Rewrites Apple Wi-Fi and cellular location responses to an operator-selected point.\n\npermissions:\n  persistentStorage: false\n\ntraffic:\n  captureHosts:\n    - gs-loc.apple.com\n    - gs-loc-cn.apple.com\n\nsettings:\n  - key: location\n    type: location\n    label: Target location\n    description: Every authorized device using this extension receives the same configured location.\n    required: true\n    default:\n      accuracy: 25\n  - key: failClosed\n    type: boolean\n    label: Block on transformation failure\n    description: Prevents an unexpected protocol change from returning the original location response.\n    required: true\n    default: true\n\nactions:\n  - id: rewrite-wloc-response\n    phase: response\n    match:\n      hosts:\n        - gs-loc.apple.com\n        - gs-loc-cn.apple.com\n      schemes:\n        - https\n      pathRegex: '^/clls/wloc(\\?.*)?$'\n      statusCodes:\n        - 200\n    script:\n      source: ./wloc.js\n      bodyMode: binary\n      timeoutMs: 1500\n      maxBodyBytes: 8388608\n"
+      },
+      "capture_hosts": [
+        "gs-loc-cn.apple.com",
+        "gs-loc.apple.com"
+      ],
+      "capture_dns": "trust",
+      "settings": [
+        {
+          "key": "location",
+          "type": "location",
+          "label": "Target location",
+          "description": "Every authorized device using this extension receives the same configured location.",
+          "required": true,
+          "default": {
+            "accuracy": 25
+          },
+          "value": {
+            "longitude": 114.158283,
+            "latitude": 22.281833,
+            "accuracy": 25
+          }
+        },
+        {
+          "key": "failClosed",
+          "type": "boolean",
+          "label": "Block on transformation failure",
+          "description": "Prevents an unexpected protocol change from returning the original location response.",
+          "required": true,
+          "default": true,
+          "value": true
+        }
+      ],
+      "actions": [
+        {
+          "id": "rewrite-wloc-response",
+          "phase": "response",
+          "match": {
+            "hosts": [
+              "gs-loc-cn.apple.com",
+              "gs-loc.apple.com"
+            ],
+            "schemes": [
+              "https"
+            ],
+            "path_regex": "^/clls/wloc(\\?.*)?$",
+            "status_codes": [
+              200
+            ]
+          },
+          "script_url": "https://raw.githubusercontent.com/moooyo/5gpn-extensions/26b49e3b2f74a7841cbd0324762ffdb82401a71a/apple-wloc/wloc.js",
+          "script_digest": "ebc545511ccb8e66c05bd40198d357ea38d9f62f0aece7a37fc9639a905e94a8",
+          "script_body": "// Derived from the MIT-licensed FFF686868/proxypin-wloc-spoofer v5.4.2 source.\n// See THIRD_PARTY_NOTICES.md for attribution and license details.\n\nfunction concatBytes(parts) {\n  let length = 0\n  for (const part of parts) length += part.length\n  const output = new Uint8Array(length)\n  let offset = 0\n  for (const part of parts) {\n    output.set(part, offset)\n    offset += part.length\n  }\n  return output\n}\n\nfunction bytesEqual(left, right) {\n  if (left.length !== right.length) return false\n  for (let index = 0; index < left.length; index += 1) {\n    if (left[index] !== right[index]) return false\n  }\n  return true\n}\n\nfunction decodeVarint(bytes, offset) {\n  let value = 0n\n  for (let index = 0; index < 10; index += 1) {\n    if (offset + index >= bytes.length) throw new Error('unexpected end of protobuf varint')\n    const byte = bytes[offset + index]\n    if (index === 9 && byte > 1) throw new Error('protobuf varint overflows uint64')\n    value |= BigInt(byte & 0x7f) << BigInt(7 * index)\n    if (byte < 0x80) return { value, length: index + 1 }\n  }\n  throw new Error('protobuf varint is too long')\n}\n\nfunction encodeVarint(input) {\n  let value = BigInt.asUintN(64, input)\n  const output = []\n  while (value >= 0x80n) {\n    output.push(Number(value & 0x7fn) | 0x80)\n    value >>= 7n\n  }\n  output.push(Number(value))\n  return new Uint8Array(output)\n}\n\nfunction encodeVarintField(number, value) {\n  return concatBytes([encodeVarint(BigInt(number) << 3n), encodeVarint(value)])\n}\n\nfunction encodeLengthField(number, value) {\n  return concatBytes([\n    encodeVarint((BigInt(number) << 3n) | 2n),\n    encodeVarint(BigInt(value.length)),\n    value,\n  ])\n}\n\nfunction parseFields(bytes) {\n  const fields = []\n  let offset = 0\n  while (offset < bytes.length) {\n    const start = offset\n    const key = decodeVarint(bytes, offset)\n    offset += key.length\n    const numberValue = key.value >> 3n\n    if (numberValue === 0n || numberValue > 536870911n) throw new Error('protobuf field number is invalid')\n    const number = Number(numberValue)\n    const wireType = Number(key.value & 7n)\n    let valueStart = offset\n    let valueEnd = offset\n    if (wireType === 0) {\n      const value = decodeVarint(bytes, offset)\n      valueEnd = offset + value.length\n    } else if (wireType === 1) {\n      valueEnd = offset + 8\n    } else if (wireType === 2) {\n      const length = decodeVarint(bytes, offset)\n      offset += length.length\n      valueStart = offset\n      valueEnd = offset + Number(length.value)\n    } else if (wireType === 5) {\n      valueEnd = offset + 4\n    } else {\n      throw new Error(`unsupported protobuf wire type ${wireType}`)\n    }\n    if (valueEnd > bytes.length) throw new Error('unexpected end of protobuf field')\n    offset = valueEnd\n    fields.push({\n      number,\n      wireType,\n      value: bytes.subarray(valueStart, valueEnd),\n      raw: bytes.subarray(start, offset),\n    })\n  }\n  return fields\n}\n\nfunction isMAC(bytes) {\n  let separators = 0\n  let digits = 0\n  for (let index = 0; index < bytes.length; index += 1) {\n    const byte = bytes[index]\n    if (byte === 58) {\n      if (digits < 1 || digits > 2) return false\n      separators += 1\n      digits = 0\n      continue\n    }\n    const decimal = byte >= 48 && byte <= 57\n    const lower = byte >= 97 && byte <= 102\n    const upper = byte >= 65 && byte <= 70\n    if (!decimal && !lower && !upper) return false\n    digits += 1\n    if (digits > 2) return false\n  }\n  return separators === 5 && digits >= 1 && digits <= 2\n}\n\nfunction normalizeTarget(target) {\n  const longitude = Number(target.longitude)\n  const latitude = Number(target.latitude)\n  if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {\n    throw new Error('target longitude is invalid')\n  }\n  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {\n    throw new Error('target latitude is invalid')\n  }\n\n  let accuracy = Number(target.accuracy)\n  if (!Number.isFinite(accuracy) || accuracy <= 0) accuracy = 25\n  accuracy = Math.max(1, Math.min(10000, Math.round(accuracy)))\n  return { longitude, latitude, accuracy }\n}\n\nfunction patchLocation(bytes, target, stats) {\n  const fields = parseFields(bytes)\n  const hasLatitude = fields.some((field) => field.number === 1 && field.wireType === 0)\n  const hasLongitude = fields.some((field) => field.number === 2 && field.wireType === 0)\n  if (!hasLatitude || !hasLongitude) return bytes\n  const latitude = BigInt.asUintN(64, BigInt(Math.round(target.latitude * 1e8)))\n  const longitude = BigInt.asUintN(64, BigInt(Math.round(target.longitude * 1e8)))\n  const parts = fields.map((field) => {\n    if (field.number === 1 && field.wireType === 0) return encodeVarintField(1, latitude)\n    if (field.number === 2 && field.wireType === 0) return encodeVarintField(2, longitude)\n    if (field.number === 3 && field.wireType === 0) return encodeVarintField(3, BigInt(target.accuracy))\n    return field.raw\n  })\n  stats.locations += 1\n  return concatBytes(parts)\n}\n\nfunction patchWiFi(bytes, target, stats) {\n  const fields = parseFields(bytes)\n  let looksLikeWiFi = false\n  for (const field of fields) {\n    if (field.number === 1 && field.wireType === 2) looksLikeWiFi = isMAC(field.value)\n  }\n  if (!looksLikeWiFi) return bytes\n  let changed = false\n  const parts = fields.map((field) => {\n    if (field.number !== 2 || field.wireType !== 2) return field.raw\n    try {\n      const patched = patchLocation(field.value, target, stats)\n      if (!bytesEqual(patched, field.value)) changed = true\n      return encodeLengthField(field.number, patched)\n    } catch (_) {\n      stats.skipped += 1\n      return field.raw\n    }\n  })\n  if (changed) stats.wifi += 1\n  return concatBytes(parts)\n}\n\nfunction patchCell(bytes, target, stats) {\n  const fields = parseFields(bytes)\n  let changed = false\n  const parts = fields.map((field) => {\n    if (field.number !== 5 || field.wireType !== 2) return field.raw\n    try {\n      const patched = patchLocation(field.value, target, stats)\n      if (!bytesEqual(patched, field.value)) changed = true\n      return encodeLengthField(field.number, patched)\n    } catch (_) {\n      stats.skipped += 1\n      return field.raw\n    }\n  })\n  if (changed) stats.cell += 1\n  return concatBytes(parts)\n}\n\nfunction patchRoot(bytes, target, stats) {\n  const fields = parseFields(bytes)\n  const parts = fields.map((field) => {\n    if (field.number === 2 && field.wireType === 2) {\n      return encodeLengthField(field.number, patchWiFi(field.value, target, stats))\n    }\n    if ((field.number === 22 || field.number === 24) && field.wireType === 2) {\n      return encodeLengthField(field.number, patchCell(field.value, target, stats))\n    }\n    return field.raw\n  })\n  return concatBytes(parts)\n}\n\nfunction patchFramed(bytes, target, stats) {\n  if (bytes.length < 10) throw new Error('body is too short for framed WLOC')\n  const length = bytes[8] * 256 + bytes[9]\n  if (length <= 0 || 10 + length > bytes.length) throw new Error('invalid framed WLOC length')\n  const payload = bytes.subarray(10, 10 + length)\n  const patched = patchRoot(payload, target, stats)\n  if (stats.locations === 0 || bytesEqual(payload, patched)) throw new Error('framed payload has no patchable location')\n  if (patched.length > 65535) throw new Error('patched framed payload is too large')\n  return concatBytes([\n    bytes.subarray(0, 8),\n    new Uint8Array([patched.length >> 8, patched.length & 0xff]),\n    patched,\n    bytes.subarray(10 + length),\n  ])\n}\n\nfunction patchWLOC(bytes, target) {\n  if (!(bytes instanceof Uint8Array) || bytes.length === 0) throw new Error('empty WLOC response')\n  const stats = { wifi: 0, cell: 0, locations: 0, skipped: 0 }\n  return { body: patchFramed(bytes, target, stats), stats }\n}\n\nfunction transform(context) {\n  const location = context.settings.location\n  const failClosed = context.settings.failClosed !== false\n  if (!location || location.longitude == null || location.latitude == null) {\n    throw new Error('target location is not configured')\n  }\n  const target = normalizeTarget(location)\n  try {\n    const patched = patchWLOC(context.response.body, target)\n    console.info(`patched locations=${patched.stats.locations} wifi=${patched.stats.wifi} cell=${patched.stats.cell} skipped=${patched.stats.skipped}`)\n    return { response: { body: patched.body } }\n  } catch (error) {\n    if (failClosed) throw error\n    console.warn(`skipped WLOC response: ${error}`)\n    return null\n  }\n}\n",
+          "body_mode": "binary",
+          "timeout_ms": 1500,
+          "max_body_bytes": 8388608
+        }
+      ],
+      "persistent_storage": false,
+      "network_origins": null,
+      "egress_group_required": false
+    }
+  ]
+}

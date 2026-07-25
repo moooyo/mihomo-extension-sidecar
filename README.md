@@ -70,3 +70,90 @@ Useful commands:
 5gpn-intercept --config /etc/5gpn/intercept/config.json --print-certificate-request
 5gpn-intercept --config /etc/5gpn/intercept/config.json --healthcheck
 ```
+
+## Control API
+
+The sidecar is a separately-versioned component: 5gpn drives it through an API
+and no longer reaches into its state. Its Go module is
+`github.com/moooyo/5gpn-intercept`, nothing in 5gpn imports it, and the only
+things crossing the boundary are this API, the SOCKS legs and the certificate
+artifacts — so extracting this directory into its own repository later is a
+move, not a rewrite.
+
+The API is a machine-only `AF_UNIX` socket, default
+`/run/5gpn-intercept/control.sock`. It is created inside a narrowed umask so it
+is never briefly reachable with whatever umask the process inherited, peer
+credentials are checked on **every** accept rather than once at startup, and
+every response is `no-store` — these carry the live bundle identity and the
+process instance, so a cached answer is a wrong answer.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/capabilities` | schema version, build version, process instance, limits |
+| `GET` | `/state` | authoritative readback: active bundle, digest, generation, extension and capture-host counts |
+| `GET` | `/plugins` | per-extension view for the console: name, version, capture hosts, action and setting counts, execution order |
+| `PUT` | `/bundles/{id}` | stage an immutable bundle; returns its digest |
+| `POST` | `/bundles/{id}/commit` | make it live, compare-and-swap against the bundle the caller believes is active |
+| `POST` | `/bundles/{id}/abort` | discard a staged bundle |
+| `DELETE` | `/bundles` | purge all state |
+
+Errors carry a stable `code` so a coordinator branches on the outcome instead of
+parsing prose: `not_found`, `cas_conflict`, `wrong_state`,
+`unsupported_schema`, `store_corrupt`, `internal`.
+
+### Why staging and commit are separate
+
+A staged bundle is durable and validated but serves nothing. That is what makes
+preparation safe to retry: the coordinator can stage speculatively, wait for a
+certificate, and only then commit — and if it crashes in between, nothing it
+prepared was ever live.
+
+Commit carries the bundle the caller believes is active and refuses if that is
+not what is live. A repeat of a commit that already succeeded returns the same
+success rather than a conflict, because a coordinator that lost the response
+must be able to roll forward instead of rolling back something already serving
+traffic.
+
+## State ownership
+
+The sidecar owns its state under `--bundle-store` (default
+`/var/lib/5gpn-intercept`). Bundles are written with atomic rename, an fsync of
+both the file and its directory, and a per-record integrity digest. A store
+written by a newer schema is refused rather than repaired, so a downgrade has to
+be a deliberate purge.
+
+On restart it reloads the bundle it was serving. An unusable artifact is logged
+and skipped rather than fatal: serving nothing is the safe state, because
+mihomo's capture rules treat a processor with no bundle as not ready and fail
+closed on it.
+
+### Migration from the file
+
+Before this API, 5gpn wrote the sidecar's private configuration file and the
+sidecar polled it. That made the on-disk layout the contract: the coordinator
+had to know it, neither side could name a version, and neither could tell an
+operator edit from the other's write.
+
+A deployment that has never been pushed a bundle keeps using the file exactly as
+before. The first successful commit flips the source permanently, so the two
+never both decide; there is no window in which the file and a pushed bundle
+disagree. `--control-socket ""` disables the API entirely and is the rollback
+position.
+
+```text
+5gpn-intercept \
+  --config /etc/5gpn/intercept/config.json \
+  --bundle-store /var/lib/5gpn-intercept \
+  --control-socket /run/5gpn-intercept/control.sock \
+  --control-peer-uid "$(id -u gpn-dns)"
+```
+
+## Tests
+
+```sh
+gofmt -l . && go vet ./... && go test -race ./...
+```
+
+`testdata/bundle.json` is derived from real operator state rather than
+hand-written, because a hand-written fixture only exercises the fields whoever
+wrote it remembered.

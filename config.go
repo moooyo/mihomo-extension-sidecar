@@ -1361,6 +1361,22 @@ type configStore struct {
 	contentDigest    [sha256.Size]byte
 	cfg              Config
 	logs             engineLogPublisher
+
+	// bundleSource, when set, is the authoritative configuration and the file
+	// is not consulted at all.
+	//
+	// This is the migration seam. Before the control API the coordinator wrote
+	// this process's private file and it polled; a deployment that has never
+	// been pushed a bundle keeps working exactly that way. The first push flips
+	// the source permanently, so the two never both decide.
+	bundleSource func() *Config
+}
+
+// setBundleSource installs the pushed-bundle source.
+func (s *configStore) setBundleSource(source func() *Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bundleSource = source
 }
 
 func newConfigStore(path string) (*configStore, error) {
@@ -1384,6 +1400,11 @@ func newConfigStore(path string) (*configStore, error) {
 func (s *configStore) Current() (Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.bundleSource != nil {
+		if cfg := s.bundleSource(); cfg != nil {
+			return *cfg, nil
+		}
+	}
 	info, err := os.Stat(s.path)
 	if err != nil {
 		return Config{}, fmt.Errorf("stat config: %w", err)
