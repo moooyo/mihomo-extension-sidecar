@@ -1,0 +1,5 @@
+# Build artefacts. A 25MB Windows binary reached the first commit because
+# `git add -A` does not distinguish what you wrote from what you compiled.
+*.exe
+5gpn-intercept
+5gpn-intercept-linux-*
