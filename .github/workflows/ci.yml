@@ -35,3 +35,8 @@ jobs:
       # control-server interleavings the plain suite runs straight past.
       - name: go test -race
         run: go test -race ./... -count=1
+      # The policy assertions about this component's own source. They came from
+      # the gateway's suite when this was a subdirectory of it; running them here
+      # is what makes them this component's to keep passing.
+      - name: Policy assertions
+        run: bash tests/test_sidecar_policy.sh
