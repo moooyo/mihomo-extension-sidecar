@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testBundleDocument returns a valid version-5 document carrying one real
@@ -305,11 +306,20 @@ func serveControlAPI(t *testing.T, m *bundleManager) *http.Client {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		},
 	}}
-	// Wait for the listener rather than sleeping blindly.
-	for i := 0; i < 100; i++ {
+	// Wait for the listener rather than sleeping blindly — but actually wait.
+	// Spinning without yielding burns through the iterations in microseconds,
+	// long before the goroutine has bound, and then hands back a client whose
+	// first request fails with a dial error that looks like a bug in the code
+	// under test rather than in this helper.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
 		if _, err := os.Stat(sock); err == nil {
 			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the control socket %s never appeared", sock)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	return client
 }
