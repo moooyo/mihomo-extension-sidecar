@@ -1,4 +1,4 @@
-module github.com/moooyo/5gpn-intercept
+module github.com/moooyo/mihomo-extension-sidecar
 
 go 1.26.5
 

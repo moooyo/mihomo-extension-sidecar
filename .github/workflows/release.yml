@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - id: release
+        # Same grammar as the gateway's: X.Y.Z is a release, X.Y.Z-beta.N is a
+        # prerelease. Anything else is refused rather than guessed at, so a
+        # mistyped tag cannot quietly publish as stable.
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          number='(0|[1-9][0-9]*)'
+          if [[ "$tag" =~ ^${number}\.${number}\.${number}$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$tag" =~ ^${number}\.${number}\.${number}-beta\.([1-9][0-9]*)$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported release tag: $tag" >&2
+            exit 1
+          fi
+
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [classify, gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${VER}" -o 5gpn-intercept-linux-amd64 .
+          sha256sum 5gpn-intercept-linux-amd64 > checksums.txt
+      # The gateway's installer verifies this binary by digest, so the asset
+      # name is a contract: renaming it breaks every installer that pins it.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ needs.classify.outputs.prerelease }}
+          make_latest: ${{ needs.classify.outputs.prerelease == 'false' }}
+          fail_on_unmatched_files: true
+          files: |
+            5gpn-intercept-linux-amd64
+            checksums.txt

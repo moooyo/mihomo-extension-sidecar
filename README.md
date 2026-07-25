@@ -1,81 +1,24 @@
 # 5gpn-intercept
 
-`5gpn-intercept` is the allowlisted transformation sidecar for explicitly
-enabled native interception extensions. It is not an open proxy and does not fetch extension
-or script content at runtime.
+The allowlisted transformation sidecar, maintained independently of the gateway
+that drives it.
 
-The service remains stopped unless the version-5 configuration's MITM master
-and at least one extension are enabled. It then accepts authenticated SOCKS5 on `127.0.0.1:18080`. TCP CONNECT
-on port 80 serves plain HTTP; port 443 terminates TLS with HTTP/1.1 and,
-optionally, HTTP/2. An authenticated UDP
-ASSOCIATE receives a private ephemeral loopback socket. It either terminates
-IETF QUIC v1/v2 with HTTP/3 or discards matched packets for client TCP fallback,
-according to `quic_fallback_protection`. Legacy GQUIC is not claimed. A
-hostname target and the eventual TLS/QUIC SNI must
-match the active extension capture-host set. Pure-IP SOCKS targets are accepted only until
-the authenticated application handshake supplies an allowlisted SNI.
+It was extracted from `moooyo/5gpn` — first as `cmd/5gpn-intercept`, then as
+`plugin-sidecar/` — and this repository carries that history. The split is not
+cosmetic: the sidecar and the gateway share no Go types, only a versioned
+control-API wire format, so the thing that keeps them working together is a
+schema number rather than a compiler. Separating the repositories makes that
+boundary the only one there is.
 
-Every upstream connection returns through the authenticated mihomo mixed
-listener at `127.0.0.1:17890`. TCP uses SOCKS5 CONNECT and HTTP/3 uses a custom
-SOCKS5 UDP `net.PacketConn`; the sidecar has no direct origin egress path. The
-HTTP/3 client prefers QUIC v1 and retries v2 only on version negotiation before
-request transmission.
-
-Native `5gpn.io/v1` manifests are compiled by `5gpn-dns` into bounded immutable
-JSON snapshots in `/etc/5gpn/intercept/config.json`. The sidecar receives only
-normalized capture hosts, structured action matchers, typed settings, explicit
-permissions, exact approved network origins, safe upstream mappings, operator
-egress bindings, explicit execution order, and immutable scripts. Every action runs
-in a fresh goja VM through `transform(context)` with bounded source/body sizes,
-execution time, and backtracking-regexp time. There is no ambient network,
-filesystem, process, timer, or module-loader access. A module that declared
-network origins receives synchronous `context.network.request` and may return a
-request-phase URL rewrite to one of those same exact origins. Cross-origin
-rewrites require a canonical absolute URL, cannot contain userinfo or a
-fragment, and cannot downgrade an intercepted HTTPS request to HTTP. They keep
-the request method, decoded body, and end-to-end headers; consequently Cookie,
-Authorization, and any other visible credentials may be sent to the reviewed
-origin. Framing and hop-by-hop headers remain runtime-owned. Both explicit
-network calls and rewritten requests return through the authenticated upstream
-mihomo SOCKS5 listener. Ambient `fetch` and sockets remain unavailable. String
-and Uint8Array bodies decode identity, gzip, deflate, and Brotli within
-expanded-size limits. When explicitly permitted, `context.storage` writes only
-to the bounded service-owned `/var/lib/5gpn-intercept/store.json`.
-
-Structured script-console output and action lifecycle events are retained only
-in a 1000-entry in-memory ring; arbitrary script console text is never written
-to journald. The sidecar exposes that live, read-only stream on the fixed
-`/run/5gpn-intercept/logs.sock` Unix socket. The socket is mode `0660` inside a
-systemd-owned mode-`0750` runtime directory and serves only `GET /health` plus
-the RFC 6455 `GET /logs` upgrade. At most eight log WebSockets may be active;
-new connections start at the current tail and never replay disconnected data.
-URL metadata strips userinfo, query strings, and fragments. No TCP log
-listener, disk log, or additional dependency is used. Log IPC failure is
-non-fatal to the interception data plane.
-
-The runtime leaf must be a non-CA certificate covering only enabled native
-extension capture-host patterns. The sidecar cannot access the private
-root CA signing key. The root-owned certificate publisher derives the canonical
-SAN list from the validated sidecar binary and acknowledges its digest through
-`/etc/5gpn/intercept/cert-state`.
-
-Useful commands:
-
-```text
-5gpn-intercept --version
-5gpn-intercept --config /etc/5gpn/intercept/config.json --check-config
-5gpn-intercept --config /etc/5gpn/intercept/config.json --check-enabled
-5gpn-intercept --config /etc/5gpn/intercept/config.json --print-certificate-hosts
-5gpn-intercept --config /etc/5gpn/intercept/config.json --print-certificate-digest
-5gpn-intercept --config /etc/5gpn/intercept/config.json --print-certificate-request
-5gpn-intercept --config /etc/5gpn/intercept/config.json --healthcheck
-```
+The binary, the service name and the runtime paths stay `5gpn-intercept`. They
+are what installed gateways and their unit files refer to, and the Go module
+path is the only identifier that follows the repository.
 
 ## Control API
 
 The sidecar is a separately-versioned component: 5gpn drives it through an API
 and no longer reaches into its state. Its Go module is
-`github.com/moooyo/5gpn-intercept`, nothing in 5gpn imports it, and the only
+`github.com/moooyo/mihomo-extension-sidecar`, nothing in 5gpn imports it, and the only
 things crossing the boundary are this API, the SOCKS legs and the certificate
 artifacts — so extracting this directory into its own repository later is a
 move, not a rewrite.
