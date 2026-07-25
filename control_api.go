@@ -246,11 +246,14 @@ func (c *controlServer) handlePurge(w http.ResponseWriter, r *http.Request) {
 // process happened to inherit.
 func listenControlSocket(path string, peerUID, peerGID int) (net.Listener, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// 0750: the coordinator runs as a different user and must be able to enter
+	// the directory to reach the socket. It is granted the sidecar's group by
+	// its unit; nobody else can enter at all.
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("control socket: create %s: %w", dir, err)
 	}
 	// A stale socket from a previous process would make bind fail. Removing it
-	// is safe because the directory is 0700 and owned by this user.
+	// is safe because the directory is not world-writable and this user owns it.
 	if err := syscall.Unlink(path); err != nil && !os.IsNotExist(err) && !strings.Contains(err.Error(), "no such file") {
 		log.Printf("intercept: control socket unlink %s: %v", path, err)
 	}
