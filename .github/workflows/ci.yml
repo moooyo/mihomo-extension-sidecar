@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The release workflow runs this as its gate. A called workflow has to say so
+  # explicitly, and without it the caller does not fail a job — it fails to
+  # parse, producing a run with no jobs at all.
+  workflow_call:
 
 permissions:
   contents: read
