@@ -37,7 +37,19 @@ func main() {
 		"machine-only control API socket; empty disables the API")
 	controlPeerUID := flags.Int("control-peer-uid", -1, "only accept control connections from this uid (-1 for any)")
 	controlPeerGID := flags.Int("control-peer-gid", -1, "only accept control connections from this gid (-1 for any)")
+	controlPeerUser := flags.String("control-peer-user", "",
+		"only accept control connections from this user; resolved at startup, mutually exclusive with --control-peer-uid")
+	controlPeerGroup := flags.String("control-peer-group", "",
+		"only accept control connections from this group; resolved at startup, mutually exclusive with --control-peer-gid")
 	_ = flags.Parse(os.Args[1:])
+
+	// Resolved before anything else starts. A named peer that does not exist is
+	// a configuration error, and continuing with an unrestricted socket because
+	// the lookup failed would invert what naming a peer is for.
+	peerUID, peerGID, err := resolvePeerIdentity(*controlPeerUser, *controlPeerGroup, *controlPeerUID, *controlPeerGID)
+	if err != nil {
+		log.Fatalf("intercept: %v", err)
+	}
 	if *printCertificateHosts || *printCertificateDigest || *printCertificateRequest {
 		cfg, err := loadCertificateConfig(*configPath)
 		if err != nil {
@@ -142,7 +154,7 @@ func main() {
 			// Flip the source the moment the first bundle commits.
 			store.setBundleSource(func() *Config { return manager.Active() })
 		}
-		control = newControlServer(manager, version, *controlPeerUID, *controlPeerGID)
+		control = newControlServer(manager, version, peerUID, peerGID)
 		go func() {
 			if err := control.Serve(*controlSocket); err != nil {
 				log.Printf("intercept: control API stopped: %v", err)
