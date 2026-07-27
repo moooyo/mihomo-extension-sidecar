@@ -28,6 +28,12 @@ type bundleManager struct {
 	activeID     atomic.Pointer[string]
 	activeDigest atomic.Pointer[string]
 
+	// migrated latches the first time this process makes a bundle live. It is what
+	// tells configStore that the coordinator's file is a seam already crossed: a
+	// purge withdraws the bundle, it does not restore the document the bundle
+	// migrated away from.
+	migrated atomic.Bool
+
 	// instanceID is fresh per process. A coordinator that sees it change knows
 	// this sidecar restarted and that nothing it attested before still holds.
 	instanceID string
@@ -85,10 +91,16 @@ func (m *bundleManager) ActiveDigest() string {
 	return ""
 }
 
+// Migrated reports whether this process has ever made a bundle live. Unlike
+// Active it never goes back to false, so a caller can tell a withdrawal from a
+// deployment that has never been pushed a bundle.
+func (m *bundleManager) Migrated() bool { return m.migrated.Load() }
+
 func (m *bundleManager) setActive(id, digest string, cfg *Config) {
 	m.active.Store(cfg)
 	m.activeID.Store(&id)
 	m.activeDigest.Store(&digest)
+	m.migrated.Store(true)
 }
 
 // Recover loads the bundle this sidecar was serving before it restarted.

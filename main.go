@@ -130,10 +130,11 @@ func main() {
 		log.Print("intercept: engine log service unavailable; continuing without UI log streaming")
 		logService = nil
 	}
-	// The sidecar owns its plugin state. A bundle recovered here is
-	// authoritative and the coordinator's file is not consulted again; a
-	// deployment that has never been pushed one keeps using the file, which is
-	// what makes this a migration rather than a flag day.
+	// The sidecar owns its plugin state. The coordinator's file is consulted only
+	// until the first bundle is served; from that moment the manager decides,
+	// including when a purge leaves it with nothing. A deployment that has never
+	// been pushed a bundle keeps using the file, which is what makes this a
+	// migration rather than a flag day.
 	var control *controlServer
 	if *controlSocket != "" {
 		bundles, err := openBundleStore(*bundleStoreDir)
@@ -147,12 +148,11 @@ func main() {
 			// unusable artifact must not also take the process down.
 			log.Printf("intercept: could not recover a bundle, continuing with none: %v", err)
 		}
+		// Flips the moment the first bundle is served, whether that is one
+		// recovered here or the first one pushed.
+		store.setBundleSource(func() (*Config, bool) { return manager.Active(), manager.Migrated() })
 		if manager.Active() != nil {
-			store.setBundleSource(manager.Active)
 			log.Printf("intercept: serving pushed bundle %s", manager.ActiveID())
-		} else {
-			// Flip the source the moment the first bundle commits.
-			store.setBundleSource(func() *Config { return manager.Active() })
 		}
 		control = newControlServer(manager, version, peerUID, peerGID)
 		go func() {
@@ -219,6 +219,11 @@ func checkInterceptHealth(ctx context.Context, cfg Config) error {
 func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.CancelFunc) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
+	// A withdrawn bundle makes Current fail on every tick, so the summary is
+	// reported once per outage rather than four times a second. Serving nothing is
+	// not a reason to stop: the control socket is how a new bundle arrives, and
+	// mihomo already fails closed on a processor that is not ready.
+	reported := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -226,9 +231,13 @@ func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.
 		case <-ticker.C:
 			cfg, err := store.Current()
 			if err != nil {
-				log.Print("intercept: could not refresh MITM state")
+				if !reported {
+					log.Print("intercept: could not refresh MITM state")
+					reported = true
+				}
 				continue
 			}
+			reported = false
 			if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
 				log.Print("intercept: no active interception extension; stopping service")
 				stop()

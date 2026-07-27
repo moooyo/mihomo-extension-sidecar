@@ -1379,18 +1379,40 @@ type configStore struct {
 	cfg              Config
 	logs             engineLogPublisher
 
-	// bundleSource, when set, is the authoritative configuration and the file
-	// is not consulted at all.
+	// bundleSource, when set, reports the pushed bundle and whether this process
+	// has ever made one live.
 	//
 	// This is the migration seam. Before the control API the coordinator wrote
-	// this process's private file and it polled; a deployment that has never
-	// been pushed a bundle keeps working exactly that way. The first push flips
-	// the source permanently, so the two never both decide.
-	bundleSource func() *Config
+	// this process's private file and it polled; a deployment that has never been
+	// pushed a bundle keeps working exactly that way. The first push flips the
+	// source permanently, so the two never both decide: once a bundle has been
+	// live, a withdrawal means "serve nothing", not "go back to the document the
+	// bundle migrated away from".
+	bundleSource func() (*Config, bool)
+	// bundle is the activation being served, retained only to recognise the next
+	// one. Every activation is a distinct allocation and this store holds a
+	// reference to the one it compares against, so a later allocation can never
+	// alias it. Released on withdrawal, so a purge still frees the compiled
+	// scripts it was holding.
+	bundle *Config
+	// generation numbers the snapshots this store hands out. One counter serves
+	// both sources, so the one-way handover from the file to a pushed bundle can
+	// only move it forward and equal generations always mean the same snapshot —
+	// which is exactly what the upstream transport pool compares.
+	generation uint64
 }
 
-// setBundleSource installs the pushed-bundle source.
-func (s *configStore) setBundleSource(source func() *Config) {
+// errNoActiveBundle means a pushed bundle has been withdrawn and this sidecar has
+// nothing to serve. Every caller of Current already fails closed on an error,
+// which is what "serves nothing" has to mean.
+var errNoActiveBundle = errors.New("no active bundle")
+
+// setBundleSource installs the pushed-bundle source. The source reports the live
+// bundle and, second, whether one has ever been live in this process. That second
+// answer only ever latches from false to true, so "no bundle now, but one has
+// been" is always recognised as a withdrawal rather than as a deployment that was
+// never migrated.
+func (s *configStore) setBundleSource(source func() (*Config, bool)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.bundleSource = source
@@ -1408,7 +1430,7 @@ func newConfigStore(path string) (*configStore, error) {
 	cfg.generation = 1
 	store := &configStore{
 		path: path, readDocument: readConfigDocumentWithInfo,
-		contentDigest: sha256.Sum256(body), cfg: cfg,
+		contentDigest: sha256.Sum256(body), cfg: cfg, generation: cfg.generation,
 	}
 	store.rememberGoodFile(info)
 	return store, nil
@@ -1418,8 +1440,21 @@ func (s *configStore) Current() (Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.bundleSource != nil {
-		if cfg := s.bundleSource(); cfg != nil {
-			return *cfg, nil
+		cfg, migrated := s.bundleSource()
+		if cfg != nil {
+			if cfg != s.bundle {
+				s.bundle = cfg
+				s.generation++
+			}
+			active := *cfg
+			active.generation = s.generation
+			return active, nil
+		}
+		if migrated {
+			// The seam is already crossed. A withdrawal means serve nothing, not
+			// fall back to the document the bundle migrated away from.
+			s.bundle = nil
+			return Config{}, errNoActiveBundle
 		}
 	}
 	info, err := os.Stat(s.path)
@@ -1466,7 +1501,8 @@ func (s *configStore) Current() (Config, error) {
 		s.rememberBadFile(readInfo)
 		return s.cfg, nil
 	}
-	cfg.generation = s.cfg.generation + 1
+	s.generation++
+	cfg.generation = s.generation
 	s.cfg = cfg
 	s.rememberGoodFile(readInfo)
 	s.contentDigest = digest

@@ -629,3 +629,86 @@ func TestCommitPrunesSupersededRecordsButKeepsRollbackDepth(t *testing.T) {
 		t.Fatalf("rolling back one generation failed: %v", err)
 	}
 }
+
+// Purge documents that the sidecar "then serves nothing, which mihomo's capture
+// rules treat as not-ready and fail closed on". It did not: configStore.Current
+// fell through to os.Stat and handed back the pre-migration file, so after a
+// coordinator withdrew every bundle the data plane kept intercepting with the
+// document the bundle had migrated away from — while GET /state reported nothing
+// active.
+func TestWithdrawingEveryBundleServesNothingRatherThanTheFile(t *testing.T) {
+	fileConfig := validNativeConfig()
+	fileConfig.UpstreamProxy.Username = "file-upstream-0000"
+	encoded, err := json.Marshal(fileConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newConfigStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundles, err := openBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newBundleManager(bundles, nil)
+	store.setBundleSource(func() (*Config, bool) { return manager.Active(), manager.Migrated() })
+
+	// Before the first push the file is still the answer. That seam is the whole
+	// point of the migration and must survive.
+	before, err := store.Current()
+	if err != nil {
+		t.Fatalf("a deployment that was never pushed a bundle stopped working: %v", err)
+	}
+	if before.UpstreamProxy.Username != "file-upstream-0000" {
+		t.Fatalf("pre-migration config = %q", before.UpstreamProxy.Username)
+	}
+
+	document, err := os.ReadFile(filepath.Join("testdata", "bundle.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Stage("bundle-live", document); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Commit("bundle-live", ""); err != nil {
+		t.Fatal(err)
+	}
+	pushed, err := store.Current()
+	if err != nil {
+		t.Fatalf("a committed bundle did not serve: %v", err)
+	}
+	if pushed.UpstreamProxy.Username == "file-upstream-0000" {
+		t.Fatal("a committed bundle did not replace the file")
+	}
+	// One counter serves both sources, so the handover only moves forward.
+	if pushed.generation <= before.generation {
+		t.Fatalf("generation went from %d to %d across the handover", before.generation, pushed.generation)
+	}
+
+	if err := manager.Purge(); err != nil {
+		t.Fatal(err)
+	}
+	withdrawn, err := store.Current()
+	if !errors.Is(err, errNoActiveBundle) {
+		t.Fatalf("after a purge Current returned %q (err=%v), want errNoActiveBundle",
+			withdrawn.UpstreamProxy.Username, err)
+	}
+
+	// And the seam stays closed: a later file edit must not resurrect it either.
+	fileConfig.UpstreamProxy.Username = "file-upstream-0001"
+	edited, err := json.Marshal(fileConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, edited, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Current(); !errors.Is(err, errNoActiveBundle) {
+		t.Fatalf("editing the file after a purge resurrected it: err=%v", err)
+	}
+}
