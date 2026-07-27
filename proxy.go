@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -119,8 +120,18 @@ func (r *tlsHandshakeErrorReporter) report(target, message string) {
 	}
 }
 
-func newInterceptProxy(config *configStore, certificates *certificateStore) *interceptProxy {
-	scripts := newScriptRuntime("/var/lib/5gpn-intercept/store.json")
+// interceptStoreFile is the extensions' persistent store, kept in the same state
+// directory as the bundle store.
+//
+// It is a sibling of meta.json and pointer.json rather than a path of its own so
+// that --bundle-store moves all of this sidecar's durable state at once. Naming
+// the directory twice is how an operator ends up with extension state orphaned in
+// the directory they thought they had moved away from, and with two instances
+// silently overwriting each other's store.json.
+const interceptStoreFile = "store.json"
+
+func newInterceptProxy(config *configStore, certificates *certificateStore, stateDir string) *interceptProxy {
+	scripts := newScriptRuntime(filepath.Join(stateDir, interceptStoreFile))
 	return &interceptProxy{
 		config: config, certificates: certificates, scripts: scripts, tlsErrors: newTLSHandshakeErrorReporter(),
 		bodySlots: make(chan struct{}, 2), http3Slots: make(chan struct{}, maxUpstreamHTTP3Connections),

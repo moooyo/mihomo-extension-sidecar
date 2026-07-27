@@ -32,7 +32,7 @@ func main() {
 	printCertificateRequest := flags.Bool("print-certificate-request", false, "print the SAN digest followed by the canonical SAN list and exit")
 	healthcheck := flags.Bool("healthcheck", false, "verify the local SOCKS5 service and exit")
 	bundleStoreDir := flags.String("bundle-store", "/var/lib/5gpn-intercept",
-		"directory this sidecar keeps its own bundle state in")
+		"directory this sidecar keeps its own durable state in: bundles and extension storage")
 	controlSocket := flags.String("control-socket", "/run/5gpn-intercept/control.sock",
 		"machine-only control API socket; empty disables the API")
 	controlPeerUID := flags.Int("control-peer-uid", -1, "only accept control connections from this uid (-1 for any)")
@@ -163,7 +163,14 @@ func main() {
 		defer control.Close()
 	}
 
-	proxy := newInterceptProxy(store, certificates)
+	// The extension store is derived from this directory whether or not the
+	// control API is enabled, so the emptiness openBundleStore rejects has to be
+	// rejected here too: filepath.Join("", ...) is a relative path, and durable
+	// state would land in whatever working directory the unit happened to have.
+	if *bundleStoreDir == "" {
+		log.Fatal("intercept: --bundle-store must not be empty")
+	}
+	proxy := newInterceptProxy(store, certificates, *bundleStoreDir)
 	proxy.setEngineLogPublisher(logs)
 	go stopWhenMITMDisabled(ctx, store, stopRuntime)
 	log.Printf("intercept: modular TLS and HTTP/3 SOCKS5 TCP/UDP service listening on %s (http2=%t quic_fallback_protection=%t)", cfg.Listen, cfg.MITM.HTTP2, cfg.MITM.QUICFallbackProtection)

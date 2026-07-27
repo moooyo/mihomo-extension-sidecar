@@ -128,7 +128,7 @@ func TestHTTP3MITMThroughSOCKSUDP(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	proxyDone := make(chan error, 1)
-	proxy := newInterceptProxy(store, certificates)
+	proxy := newInterceptProxy(store, certificates, t.TempDir())
 	proxy.upstreamRoots = roots
 	go func() { proxyDone <- proxy.Serve(ctx, listener) }()
 	t.Cleanup(func() {
@@ -522,4 +522,49 @@ func loadTestKeyPair(t *testing.T, certPath, keyPath string) tls.Certificate {
 		t.Fatal(err)
 	}
 	return certificate
+}
+
+// The sidecar's durable state is one directory, so --bundle-store has to move
+// all of it. Before this was wired the extension store was a hardcoded absolute
+// path: moving --bundle-store left extension state orphaned in the old
+// directory, savePersistent's MkdirAll resurrected that directory on the next
+// write, and two instances pointed at different bundle stores overwrote each
+// other's store.json.
+func TestExtensionStoreFollowsTheBundleStoreDirectory(t *testing.T) {
+	dir := t.TempDir()
+	proxy := newInterceptProxy(nil, nil, dir)
+	if want := filepath.Join(dir, interceptStoreFile); proxy.scripts.statePath != want {
+		t.Fatalf("extension store path = %q, want %q", proxy.scripts.statePath, want)
+	}
+
+	if err := proxy.scripts.savePersistent(&persistentSnapshot{modules: map[string]map[string]string{
+		"io.5gpn.alpha": {"token": "kept"},
+	}}); err != nil {
+		t.Fatalf("persist extension state: %v", err)
+	}
+
+	// Colocation is safe: artifacts live in bundles/ and List reads only that
+	// subdirectory, so store.json cannot surface as a bundle id.
+	store, err := openBundleStore(dir)
+	if err != nil {
+		t.Fatalf("open a bundle store in the same directory: %v", err)
+	}
+	stored, err := store.List()
+	if err != nil {
+		t.Fatalf("list bundles: %v", err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("the extension store surfaced as a bundle: %v", stored)
+	}
+
+	// The operator-visible property: a restart against the same directory finds
+	// the state, and a separate directory is genuinely separate.
+	restarted := newInterceptProxy(nil, nil, dir)
+	if got := restarted.scripts.persistent.Load().modules["io.5gpn.alpha"]["token"]; got != "kept" {
+		t.Fatalf("extension state did not survive a restart in the same directory: %q", got)
+	}
+	elsewhere := newInterceptProxy(nil, nil, t.TempDir())
+	if got := elsewhere.scripts.persistent.Load().modules["io.5gpn.alpha"]["token"]; got != "" {
+		t.Fatalf("a separate --bundle-store saw the first directory's state: %q", got)
+	}
 }
