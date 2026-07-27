@@ -65,8 +65,13 @@ grep -Fq 'script=%q' "$SIDECAR_RUNTIME" \
 grep -Fq 'engine log service unavailable; continuing without UI log streaming' "$SIDECAR_MAIN" \
     && grep -Fq 'engine log service stopped unexpectedly; data plane remains active' "$SIDECAR_MAIN" \
     || fail "engine log IPC failures can still stop the interception data plane"
-grep -Fq 'log.Print("intercept: request transformation failed")' "$SIDECAR_PROXY" \
-    && grep -Fq 'log.Print("intercept: response transformation failed")' "$SIDECAR_PROXY" \
+# The whole call is pinned, not just its prefix: the failure these two lines
+# describe is allowed to name the host and the protocol, exactly as every other
+# exit in the same handler does, but must never format the error value, which
+# quotes script-controlled text. The cause goes to the engine log instead, where
+# truncateEngineLogField bounds it.
+grep -Fq 'log.Printf("intercept: request transformation failed host=%s protocol=%s", host, r.Proto)' "$SIDECAR_PROXY" \
+    && grep -Fq 'log.Printf("intercept: response transformation failed host=%s protocol=%s", host, r.Proto)' "$SIDECAR_PROXY" \
     || fail "script transformation details can still reach journald"
 grep -Fq 'log.Print("intercept: could not read replacement config; retaining the last valid snapshot")' "$SIDECAR_CONFIG" \
     && grep -Fq 'log.Print("intercept: ignoring invalid replacement config; retaining the last valid snapshot")' "$SIDECAR_CONFIG" \

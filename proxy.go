@@ -26,7 +26,11 @@ type interceptProxy struct {
 	upstreamRoots *x509.CertPool
 	scripts       *scriptRuntime
 	tlsErrors     *tlsHandshakeErrorReporter
-	bodySlots     chan struct{}
+	// logs is set by setEngineLogPublisher alongside scripts.logs and
+	// tlsErrors.logs. A proxy assembled field by field in a test has to set it
+	// too, or its capacity and transformation reports go nowhere.
+	logs      engineLogPublisher
+	bodySlots chan struct{}
 
 	transportMu sync.Mutex
 	upstream    *upstreamTransportGeneration
@@ -53,6 +57,11 @@ const (
 	// progressing transfer is never truncated.
 	interceptTransferStallTimeout = 90 * time.Second
 	interceptTransferWriteChunk   = 32 << 10
+	// A reservation is held until its request finishes, so a saturated pool does
+	// not clear inside this window. What the wait buys is the burst that clears in
+	// milliseconds; waiting longer would only pin this request's connection, and
+	// its upstream one, behind a shortage it cannot outlast.
+	moduleBodySlotWait = 250 * time.Millisecond
 
 	upstreamHTTP3RecycleTimeout          = 250 * time.Millisecond
 	interceptCertificateTrustLogInterval = time.Minute
@@ -155,6 +164,7 @@ func newInterceptProxy(config *configStore, certificates *certificateStore, stat
 }
 
 func (p *interceptProxy) setEngineLogPublisher(logs engineLogPublisher) {
+	p.logs = logs
 	p.scripts.logs = logs
 	p.tlsErrors.logs = logs
 }
@@ -405,7 +415,8 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestProbe := moduleRequestProbe(r, host)
 	requestRules := matchingScriptRules(cfg, "request", requestProbe)
 	bodySlotHeld := requestNeedsModuleBodyReservation(r, requestRules)
-	if bodySlotHeld && !p.acquireBodySlot() {
+	if bodySlotHeld && !p.acquireBodySlot(r.Context()) {
+		p.reportModuleBodyCapacityBusy(r, host, "request", requestProbe)
 		http.Error(w, "interception body capacity is busy", http.StatusServiceUnavailable)
 		return
 	}
@@ -423,7 +434,8 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if prepareErr != nil {
-		log.Print("intercept: request transformation failed")
+		p.reportTransformFailure("request", requestProbe.URL, prepareErr)
+		log.Printf("intercept: request transformation failed host=%s protocol=%s", host, r.Proto)
 		http.Error(w, "interception request transformation failed", http.StatusBadGateway)
 		return
 	}
@@ -443,8 +455,13 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	responseRules := matchingScriptRules(cfg, "response", responseProbe)
 	if !bodySlotHeld && len(responseRules) > 0 {
-		if !p.acquireBodySlot() {
-			http.Error(w, "interception body capacity is busy", http.StatusServiceUnavailable)
+		// The upstream leg has already run, so a capacity rejection here cannot be
+		// an "unavailable, try again": the request was made. This is the same
+		// condition as any other unrunnable response action and takes the same
+		// fail-closed exit rather than passing the raw response through.
+		if !p.acquireBodySlot(r.Context()) {
+			p.reportModuleBodyCapacityBusy(r, host, "response", responseProbe)
+			http.Error(w, "interception response transformation failed", http.StatusBadGateway)
 			return
 		}
 		bodySlotHeld = true
@@ -452,7 +469,8 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	transformed, transformErr := p.transformModuleResponse(outbound, response, cfg, responseRules)
 	if transformErr != nil {
-		log.Print("intercept: response transformation failed")
+		p.reportTransformFailure("response", responseProbe.URL, transformErr)
+		log.Printf("intercept: response transformation failed host=%s protocol=%s", host, r.Proto)
 		http.Error(w, "interception response transformation failed", http.StatusBadGateway)
 		return
 	}
@@ -522,7 +540,7 @@ func (w *transferDeadlineWriter) Write(payload []byte) (int, error) {
 	return written, nil
 }
 
-func (p *interceptProxy) acquireBodySlot() bool {
+func (p *interceptProxy) acquireBodySlot(ctx context.Context) bool {
 	if p.bodySlots == nil {
 		return true
 	}
@@ -530,8 +548,47 @@ func (p *interceptProxy) acquireBodySlot() bool {
 	case p.bodySlots <- struct{}{}:
 		return true
 	default:
+	}
+	// Bounded wait rather than an immediate refusal, the same shape
+	// acquireHTTP3ConnectionSlot uses for the other capacity limit in this file.
+	timer := time.NewTimer(moduleBodySlotWait)
+	defer timer.Stop()
+	select {
+	case p.bodySlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
 		return false
 	}
+}
+
+// A capacity rejection is the one handler exit that is not a fault, which is what
+// makes it easy to lose: report it on the operator log like every other exit, and
+// on the engine log stream the console reads, so an extension that stopped
+// running is visible as something other than silence.
+func (p *interceptProxy) reportModuleBodyCapacityBusy(r *http.Request, host, phase string, probe scriptMessage) {
+	log.Printf("intercept: module body capacity is busy host=%s protocol=%s phase=%s", host, r.Proto, phase)
+	if !engineLogPublishingEnabled(p.logs) {
+		return
+	}
+	p.logs.Publish(EngineLog{
+		Level: "warn", Source: "engine", Phase: phase, URL: sanitizeEngineLogURL(probe.URL),
+		Message: "interception body capacity is busy; the matched extension action did not run",
+	})
+}
+
+// A transformation error can quote a script's own exception text and the URL a
+// script asked to rewrite to, so the cause goes to the engine log, where
+// truncateEngineLogField bounds the message, and never to journald.
+func (p *interceptProxy) reportTransformFailure(phase, requestURL string, err error) {
+	if !engineLogPublishingEnabled(p.logs) {
+		return
+	}
+	p.logs.Publish(EngineLog{
+		Level: "error", Source: "engine", Phase: phase, URL: sanitizeEngineLogURL(requestURL),
+		Message: phase + " transformation failed: " + err.Error(),
+	})
 }
 
 func (p *interceptProxy) releaseBodySlot() {

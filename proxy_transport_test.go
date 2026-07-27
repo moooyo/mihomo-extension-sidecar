@@ -361,3 +361,48 @@ func TestUpstreamDialBoundsTheSOCKSHandshake(t *testing.T) {
 	}
 	t.Logf("stalled SOCKS handshake cut after %s: %v", elapsed.Round(time.Millisecond), err)
 }
+
+// acquireBodySlot used to be a bare select/default: the first request to find
+// the pool full was refused outright, even though reservations routinely clear
+// in milliseconds. acquireHTTP3ConnectionSlot, the other capacity limit in this
+// file, already waits with a timer and a ctx.Done. This one now matches it.
+func TestAcquireBodySlotWaitsForABurstToClear(t *testing.T) {
+	t.Parallel()
+	proxy := &interceptProxy{bodySlots: make(chan struct{}, 2)}
+	proxy.bodySlots <- struct{}{}
+	proxy.bodySlots <- struct{}{}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		proxy.releaseBodySlot()
+	}()
+	started := time.Now()
+	if !proxy.acquireBodySlot(context.Background()) {
+		t.Fatal("a slot that freed well inside the wait window was still refused")
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond {
+		t.Fatalf("acquired after %s without waiting", elapsed)
+	}
+
+	// A pool that stays full still refuses, and bounded: the reservation is held
+	// for the whole request, so waiting longer would only pin this connection
+	// behind a shortage it cannot outlast.
+	started = time.Now()
+	if proxy.acquireBodySlot(context.Background()) {
+		t.Fatal("a full pool admitted a third reservation")
+	}
+	if elapsed := time.Since(started); elapsed > moduleBodySlotWait*4 {
+		t.Fatalf("refusal took %s, want about %s", elapsed, moduleBodySlotWait)
+	}
+
+	// A client that goes away stops waiting immediately.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	started = time.Now()
+	if proxy.acquireBodySlot(canceled) {
+		t.Fatal("a canceled request took a reservation")
+	}
+	if elapsed := time.Since(started); elapsed > moduleBodySlotWait/2 {
+		t.Fatalf("a canceled request waited %s", elapsed)
+	}
+}
