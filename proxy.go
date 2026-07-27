@@ -1055,6 +1055,22 @@ func responseTrailerValues(trailers http.Header, name string) []string {
 	return values
 }
 
+// Neither the HTTP/2 nor the HTTP/3 response writer implements io.ReaderFrom, and
+// no upstream body implements io.WriterTo, so io.Copy would allocate a fresh
+// 32 KiB buffer for every streamed response on those legs. io.CopyBuffer consults
+// both interfaces before it looks at the buffer, so the HTTP/1 writer keeps its
+// own ReadFrom fast path and never reaches this pool.
+//
+// Reuse across responses is the only thing new here: io.Copy already reuses one
+// buffer for every write of a single response, so a writer that retained the
+// slice past Write would have been broken before this change too.
+var streamingResponseBuffers = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 32<<10)
+		return &buffer
+	},
+}
+
 func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int, method string, response *http.Response) error {
 	responseHeaders, err := exportedHeaders(response.Header)
 	if err != nil {
@@ -1080,7 +1096,9 @@ func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int
 			return err
 		}
 	}
-	if _, err := io.Copy(w, response.Body); err != nil {
+	buffer := streamingResponseBuffers.Get().(*[]byte)
+	defer streamingResponseBuffers.Put(buffer)
+	if _, err := io.CopyBuffer(w, response.Body, *buffer); err != nil {
 		return err
 	}
 	responseTrailers, err := exportedTrailers(response.Trailer)
