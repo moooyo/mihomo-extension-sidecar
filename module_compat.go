@@ -103,14 +103,17 @@ func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOpti
 		return nil, err
 	}
 
-	if options.storage != nil {
-		store, err := compatPersistentStore(vm, options.storage)
-		if err != nil {
-			return nil, err
-		}
-		if err := vm.Set("$persistentStore", store); err != nil {
-			return nil, err
-		}
+	// $persistentStore is referenced unconditionally by the bundles' storage
+	// layer, so it always exists. Without the storage permission it is a
+	// truthful null store — reads miss and writes report failure — rather than
+	// an undefined global that throws inside the bundle's own catch and makes
+	// the action look like it simply chose not to transform anything.
+	store, err := compatPersistentStore(vm, options.storage)
+	if err != nil {
+		return nil, err
+	}
+	if err := vm.Set("$persistentStore", store); err != nil {
+		return nil, err
 	}
 
 	if options.requester != nil {
@@ -127,8 +130,19 @@ func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOpti
 
 // compatPersistentStore adapts the bounded native storage object to the
 // read/write pair the bundles use. Note the argument order: write takes the
-// value first.
+// value first. A nil storage object means the extension has no storage
+// permission, and the store reports that honestly instead of being absent.
 func compatPersistentStore(vm *goja.Runtime, storage *goja.Object) (*goja.Object, error) {
+	store := vm.NewObject()
+	if storage == nil {
+		if err := store.Set("read", func(goja.FunctionCall) goja.Value { return goja.Null() }); err != nil {
+			return nil, err
+		}
+		if err := store.Set("write", func(goja.FunctionCall) goja.Value { return vm.ToValue(false) }); err != nil {
+			return nil, err
+		}
+		return store, nil
+	}
 	get, ok := goja.AssertFunction(storage.Get("get"))
 	if !ok {
 		return nil, errors.New("storage object has no get function")
@@ -137,7 +151,6 @@ func compatPersistentStore(vm *goja.Runtime, storage *goja.Object) (*goja.Object
 	if !ok {
 		return nil, errors.New("storage object has no set function")
 	}
-	store := vm.NewObject()
 	if err := store.Set("read", func(call goja.FunctionCall) goja.Value {
 		value, err := get(goja.Undefined(), call.Argument(0))
 		if err != nil {

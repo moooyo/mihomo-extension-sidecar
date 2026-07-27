@@ -314,3 +314,26 @@ func TestCompatResultUnwrapsAHostImportedBody(t *testing.T) {
 		t.Fatalf("body = %q, want %q", got, "imported")
 	}
 }
+
+func TestCompatPersistentStoreExistsWithoutTheStoragePermission(t *testing.T) {
+	t.Parallel()
+	// The bundles' storage layer references $persistentStore unconditionally.
+	// An undefined global throws inside their own catch, and the action then
+	// completes with the response untouched — which reads as "the bundle chose
+	// not to transform anything" rather than as a failure.
+	options := compatFixtureOptions()
+	options.storage = nil
+	result, err := runCompatScript(t, `$done({
+  body: JSON.stringify({
+    read: $persistentStore.read("k"),
+    wrote: $persistentStore.write("v", "k"),
+  }),
+})`, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported, _ := stringAnyMap(result.Export())
+	if exported["body"] != `{"read":null,"wrote":false}` {
+		t.Fatalf("null store reported %v, want a miss and a failed write", exported["body"])
+	}
+}

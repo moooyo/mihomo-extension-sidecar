@@ -155,28 +155,45 @@ Implemented and tested:
   budget, deadline behavior.
 - `module_compat.go` — the globals above, the `$done` completion model,
   `$argument` serialization, and result translation.
+- `module_webapi.go` — `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
+  installed only for proxy-compat actions.
 - `ScriptRule.Entry` — `""` keeps the native contract, `"proxy-compat"` runs a
   bundle.
 
 Verified against the real asset: `v3.2.0-beta2/response.bundle.js` (251,617
-bytes) compiles, runs its async pipeline, calls `$done`, and produces a result
-the action path accepts. That run found one bug the mock scripts could not:
-`scriptMessageObject` imports the body once as a goja value, and a bundle that
-returns `$response` unchanged leaves it wrapped, so compat results unwrap any
-member that is still a goja value.
+bytes) runs both published actions end to end.
+
+- Availability: `["currentWeather"]` becomes the full upstream capability union
+  — `airQuality`, `forecastDaily`, `forecastHourly`, `forecastPeriodic`,
+  `historicalComparisons`, `weatherChanges`, `forecastNextHour`,
+  `weatherAlerts`, `weatherAlertNotifications`, `news`.
+- Binary weather: a 188-byte FlatBuffer is decoded, run through the air-quality
+  pipeline, and re-encoded to 256 bytes.
+
+Running the real bundle found three things the mock scripts could not:
+
+1. `scriptMessageObject` imports the body once as a goja value, and a bundle
+   that returns `$response` unchanged leaves it wrapped, so compat results
+   unwrap any member that is still a goja value.
+2. goja has no `URL`. `new URL($request.url)` threw a `ReferenceError` inside
+   the bundle's own `catch`, and the action then completed with the response
+   untouched — indistinguishable from a bundle that decided not to transform
+   anything. The same applies to `TextDecoder`, which the FlatBuffers runtime
+   constructs for every ByteBuffer.
+3. `$persistentStore` is referenced unconditionally by the bundles' storage
+   layer, so it now always exists. Without the storage permission it is a
+   truthful null store rather than an undefined global.
+
+The failure mode those three share is worth remembering: a missing global
+surfaces as a silent no-op, because the bundle catches its own errors and still
+calls `$done`. Any future gap will look like "the bundle chose not to act",
+not like a crash. Turning `LogLevel` up to `ALL` and reading the engine log
+ring is how to tell the difference.
 
 Not done:
 
-- The availability transformation did not apply in the synthetic harness — the
-  body came back byte-identical with and without storage, and with either
-  header case. The runtime completed correctly, so this is a bundle
-  configuration question: it needs a realistic `$argument` and request headers
-  before the merge path is exercised. Diagnose before shipping anything that
-  depends on it.
-- Contract changes: network capability instead of an origin allowlist, remote
-  script loading with trust on first use, and surfacing the entry mode in the
-  manifest. These touch `5gpn-dns`, the Console, and
-  `docs/native-extensions.md`.
-- `$prefs`, `$task`, `$loon`, `$rocket`, and `Egern` remain undefined by
-  design; defining any of them changes the persona.
+- Contract changes beyond the two that landed (script entry, network
+  capability): remote-script trust on first use, and surfacing the entry mode
+  and the broader network grant in the Console and Telegram review copy.
+- No deployment has run this yet. Everything above is local.
 

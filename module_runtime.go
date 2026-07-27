@@ -151,6 +151,13 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	if err := loop.installTimerAPI(vm); err != nil {
 		return scriptResult{}, err
 	}
+	if rule.Entry == scriptEntryProxyCompat {
+		// Published bundles assume a browser-ish global set. Native scripts keep
+		// the smaller surface they were reviewed against.
+		if err := installWebAPI(vm); err != nil {
+			return scriptResult{}, err
+		}
+	}
 	installConsoleAPI(vm, r.logs, EngineLog{
 		Source: "script", Extension: module.ID, Action: rule.ID, Phase: rule.Phase,
 		URL: request.URL, ScriptDigest: rule.ScriptDigest,
