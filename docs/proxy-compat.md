@@ -149,7 +149,34 @@ These are policy decisions, not runtime mechanics:
 
 ## Status
 
-- `module_async.go` — implemented and tested: event loop, promise settling,
-  timers, budget, deadline behavior.
-- Compat globals — specified here, not yet implemented.
-- Contract changes — not started; they touch `5gpn-dns` and the Console.
+Implemented and tested:
+
+- `module_async.go` — event loop, promise settling, timers, per-action timer
+  budget, deadline behavior.
+- `module_compat.go` — the globals above, the `$done` completion model,
+  `$argument` serialization, and result translation.
+- `ScriptRule.Entry` — `""` keeps the native contract, `"proxy-compat"` runs a
+  bundle.
+
+Verified against the real asset: `v3.2.0-beta2/response.bundle.js` (251,617
+bytes) compiles, runs its async pipeline, calls `$done`, and produces a result
+the action path accepts. That run found one bug the mock scripts could not:
+`scriptMessageObject` imports the body once as a goja value, and a bundle that
+returns `$response` unchanged leaves it wrapped, so compat results unwrap any
+member that is still a goja value.
+
+Not done:
+
+- The availability transformation did not apply in the synthetic harness — the
+  body came back byte-identical with and without storage, and with either
+  header case. The runtime completed correctly, so this is a bundle
+  configuration question: it needs a realistic `$argument` and request headers
+  before the merge path is exercised. Diagnose before shipping anything that
+  depends on it.
+- Contract changes: network capability instead of an origin allowlist, remote
+  script loading with trust on first use, and surfacing the entry mode in the
+  manifest. These touch `5gpn-dns`, the Console, and
+  `docs/native-extensions.md`.
+- `$prefs`, `$task`, `$loon`, `$rocket`, and `Egern` remain undefined by
+  design; defining any of them changes the persona.
+
