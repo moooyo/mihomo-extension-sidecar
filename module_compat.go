@@ -1,13 +1,22 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/dop251/goja"
 )
+
+// scriptEntryProxyCompat selects the published proxy-client bundle contract
+// instead of the native transform(context) entry point.
+const scriptEntryProxyCompat = "proxy-compat"
 
 // surgePersonaVersion is reported through $environment["surge-version"].
 //
@@ -276,6 +285,92 @@ func compatResponseBody(vm *goja.Runtime, body []byte, binary bool) (goja.Value,
 	return value, nil
 }
 
+// executeProxyCompat runs a published proxy-client bundle. The bundle returns
+// immediately, leaves work pending on the event loop, and signals completion by
+// calling $done, so the action waits on that rather than on a returned value.
+func (r *scriptRuntime) executeProxyCompat(
+	ctx context.Context,
+	vm *goja.Runtime,
+	loop *asyncLoop,
+	program *goja.Program,
+	module Module,
+	rule ScriptRule,
+	settings map[string]any,
+	requestObject map[string]any,
+	contextObject map[string]any,
+	requester *moduleNetworkRequester,
+	responsePhase bool,
+) (scriptResult, error) {
+	options := compatOptions{
+		request:   requestObject,
+		argument:  serializeCompatArgument(settings),
+		startTime: time.Now(),
+		requester: requester,
+	}
+	if responseObject, ok := contextObject["response"].(map[string]any); ok {
+		options.response = responseObject
+	}
+	if storage, ok := contextObject["storage"].(*goja.Object); ok {
+		options.storage = storage
+	}
+	entry, err := installProxyCompatAPI(vm, loop, options)
+	if err != nil {
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+	}
+	if _, err := vm.RunProgram(program); err != nil {
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+	}
+	if err := loop.wait(ctx, entry.settled); err != nil {
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+	}
+	return parseCompatScriptResult(entry.result, responsePhase)
+}
+
+// serializeCompatArgument renders typed settings into the key="value" string
+// the published sgmodule passes, because the bundle runs its own parser over it
+// rather than accepting a decoded object.
+func serializeCompatArgument(settings map[string]any) string {
+	keys := make([]string, 0, len(settings))
+	for key := range settings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var builder strings.Builder
+	for _, key := range keys {
+		if builder.Len() > 0 {
+			builder.WriteByte('&')
+		}
+		builder.WriteString(key)
+		builder.WriteString(`="`)
+		builder.WriteString(compatArgumentValue(settings[key]))
+		builder.WriteString(`"`)
+	}
+	return builder.String()
+}
+
+func compatArgumentValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.NewReplacer(`"`, "", "&", "", "\r", "", "\n", "").Replace(typed)
+	case bool:
+		return strconv.FormatBool(typed)
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(typed)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return strings.NewReplacer(`"`, "", "&", "").Replace(string(encoded))
+	}
+}
+
 func flatCompatHeaders(headers map[string][]string) map[string]string {
 	flat := make(map[string]string, len(headers))
 	for name, values := range headers {
@@ -284,4 +379,48 @@ func flatCompatHeaders(headers map[string][]string) map[string]string {
 		}
 	}
 	return flat
+}
+
+// parseCompatScriptResult converts the value handed to $done into an action
+// result. A bundle passes the response projection itself rather than the
+// {response: {...}} envelope the native contract uses, so the value is treated
+// as the patch. `bodyBytes` is accepted alongside `body` because the bundles
+// mirror a binary payload into both fields.
+func parseCompatScriptResult(value goja.Value, responsePhase bool) (scriptResult, error) {
+	result := scriptResult{}
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return result, nil
+	}
+	patch, ok := stringAnyMap(value.Export())
+	if !ok {
+		return result, errors.New("$done requires an object, null, or undefined")
+	}
+	projection := make(map[string]any, len(patch))
+	for key, raw := range patch {
+		switch key {
+		case "status", "headers", "body", "trailers":
+			projection[key] = raw
+		case "bodyBytes":
+			// body wins when a bundle sets both, matching how the util mirrors
+			// a binary payload before completing.
+			if _, exists := projection["body"]; !exists {
+				projection["body"] = raw
+			}
+		case "statusCode":
+			if _, exists := projection["status"]; !exists {
+				projection["status"] = raw
+			}
+		default:
+			// Bundles carry transport hints such as policy or url through the
+			// same object. They are runtime-owned here, so they are ignored
+			// rather than failing the action.
+		}
+	}
+	if body, exists := projection["body"]; exists && body == nil {
+		delete(projection, "body")
+	}
+	if err := applyNativePatch(&result, projection, responsePhase); err != nil {
+		return scriptResult{}, err
+	}
+	return result, nil
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -212,5 +214,67 @@ func TestCompatRequestOptionsAcceptABareURL(t *testing.T) {
 	}
 	if options["url"] != "https://api.example.net/v1" || options["method"] != "GET" {
 		t.Fatalf("options = %v, want the url with a GET method", options)
+	}
+}
+
+func TestProxyCompatBundleRunsThroughExecute(t *testing.T) {
+	t.Parallel()
+	// The published bundle shape end to end: async work, completion through
+	// $done from a .finally, and a response projection rather than the native
+	// {response: {...}} envelope.
+	source := `
+(async () => {
+  const suffix = await Promise.resolve("!")
+  $response = { ...$response, body: $response.body + suffix, headers: { "X-Compat": "1" }, status: 203 }
+})().finally(() => $done($response))
+`
+	rule := nativeRuntimeRule(source, "response", "text")
+	rule.Entry = scriptEntryProxyCompat
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header), Body: []byte("ok")}
+	result, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), rule, request, &response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(result.Body); got != "ok!" {
+		t.Fatalf("body = %q, want %q", got, "ok!")
+	}
+	if result.StatusCode != 203 {
+		t.Fatalf("status = %d, want 203", result.StatusCode)
+	}
+	if result.Headers.Get("X-Compat") != "1" {
+		t.Fatalf("headers = %v, want X-Compat", result.Headers)
+	}
+}
+
+func TestProxyCompatBundleThatNeverCompletesHitsTheDeadline(t *testing.T) {
+	t.Parallel()
+	source := `(async () => { await new Promise(() => {}) })()`
+	rule := nativeRuntimeRule(source, "response", "text")
+	rule.Entry = scriptEntryProxyCompat
+	rule.TimeoutMS = 120
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header), Body: []byte("ok")}
+	started := time.Now()
+	if _, err := newScriptRuntime().execute(context.Background(), Config{}, nil, nativeRuntimeModule(), rule, request, &response); err == nil {
+		t.Fatal("expected a bundle that never calls $done to hit the action deadline")
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("action took %s, want it bounded by the deadline", elapsed)
+	}
+}
+
+func TestSerializeCompatArgumentIsStableAndBounded(t *testing.T) {
+	t.Parallel()
+	// The bundle parses this string itself, so separators inside a value would
+	// let one setting inject another.
+	argument := serializeCompatArgument(map[string]any{
+		"mode":    `cle"an&injected="x`,
+		"enabled": true,
+		"level":   float64(2),
+	})
+	want := `enabled="true"&level="2"&mode="clean injected=x"`
+	if argument != strings.ReplaceAll(want, " ", "") {
+		t.Fatalf("argument = %q, want %q", argument, strings.ReplaceAll(want, " ", ""))
 	}
 }

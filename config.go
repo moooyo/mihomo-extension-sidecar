@@ -91,8 +91,14 @@ type ScriptRule struct {
 	ScriptDigest string      `json:"script_digest"`
 	ScriptBody   string      `json:"script_body"`
 	BodyMode     string      `json:"body_mode"`
-	TimeoutMS    int         `json:"timeout_ms"`
-	MaxBodyBytes int64       `json:"max_body_bytes"`
+	// Entry selects the script contract. The empty value is the native
+	// transform(context) entry point; "proxy-compat" runs a published
+	// proxy-client bundle, which signals completion by calling $done. The mode
+	// cannot be inferred from the source, because it changes how the action
+	// completes and what its result means.
+	Entry        string `json:"entry,omitempty"`
+	TimeoutMS    int    `json:"timeout_ms"`
+	MaxBodyBytes int64  `json:"max_body_bytes"`
 	// program and settings belong to the immutable compiled config snapshot.
 	program  *goja.Program
 	settings map[string]any
@@ -932,6 +938,9 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			}
 			if rule.BodyMode != "none" && rule.BodyMode != "text" && rule.BodyMode != "binary" {
 				return fmt.Errorf("extension %q action %q body mode is invalid", module.ID, rule.ID)
+			}
+			if rule.Entry != "" && rule.Entry != scriptEntryProxyCompat {
+				return fmt.Errorf("extension %q action %q entry mode is invalid", module.ID, rule.ID)
 			}
 			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
 				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)

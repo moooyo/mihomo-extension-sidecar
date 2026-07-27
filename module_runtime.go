@@ -178,10 +178,13 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	if module.PersistentStorage {
 		contextObject["storage"] = r.storageObject(vm, module.ID)
 	}
+	var requester *moduleNetworkRequester
 	if len(module.NetworkOrigins) > 0 {
 		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, r.networkSlots)
 		defer closeNetwork()
 		contextObject["network"] = network
+		requester = newModuleNetworkRequester(actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, r.networkSlots)
+		defer requester.Close()
 	}
 
 	stopInterrupt := context.AfterFunc(actionCtx, func() {
@@ -191,6 +194,11 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		stopInterrupt()
 		vm.ClearInterrupt()
 	}()
+
+	if rule.Entry == scriptEntryProxyCompat {
+		return r.executeProxyCompat(actionCtx, vm, loop, program, module, rule, settings, requestObject, contextObject, requester, response != nil)
+	}
+
 	_, runErr := vm.RunProgram(program)
 	if runErr != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, runErr)
