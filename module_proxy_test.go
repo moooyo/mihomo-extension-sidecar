@@ -1752,3 +1752,68 @@ func TestGzipDoesNotLetAnOriginSkipAResponseAction(t *testing.T) {
 		t.Fatalf("over-limit body accepted: plain=%v gzip=%v", plainErr, gzipErr)
 	}
 }
+
+// The upstream Accept-Encoding override exists so transformModuleResponse can
+// decode what it is handed, and decodeContentBody understands only gzip, deflate
+// and br. An exchange no response action can run on has nothing to decode, so
+// forcing identity there only costs the metered origin leg its compression — and
+// answers a client that explicitly refused identity with it anyway.
+func TestAcceptEncodingIsPinnedOnlyWhenAResponseActionCouldRun(t *testing.T) {
+	t.Parallel()
+	source := `function transform() { return {} }`
+	base := nativeRuntimeModule()
+	base.Enabled = true
+
+	withRule := func(rule ScriptRule) Config {
+		module := base
+		module.Scripts = []ScriptRule{rule}
+		return Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	}
+	statusScoped := nativeRuntimeRule(source, "response", "text")
+	statusScoped.Match.StatusCodes = []int{200}
+
+	message := scriptMessage{
+		URL: "https://api.example.com/v1", Method: http.MethodGet,
+		Headers: http.Header{"Accept-Encoding": []string{"gzip, br"}},
+	}
+
+	// A response rule scoped to a status code still counts at request time: the
+	// status is not knowable yet, so it has to be treated as a possible match.
+	if got := forwardRequestHeaders(withRule(statusScoped), message).Get("Accept-Encoding"); got != "identity" {
+		t.Fatalf("a status-scoped response action did not pin identity: Accept-Encoding=%q", got)
+	}
+	// A request-phase-only extension never reads the response body.
+	if got := forwardRequestHeaders(withRule(nativeRuntimeRule(source, "request", "text")), message).Get("Accept-Encoding"); got != "gzip, br" {
+		t.Fatalf("a request-only extension pinned identity: Accept-Encoding=%q", got)
+	}
+	// So does a host this extension does not capture.
+	elsewhere := message
+	elsewhere.URL = "https://other.example.com/v1"
+	if got := forwardRequestHeaders(withRule(statusScoped), elsewhere).Get("Accept-Encoding"); got != "gzip, br" {
+		t.Fatalf("an uncaptured host pinned identity: Accept-Encoding=%q", got)
+	}
+}
+
+// The request-time probe ignores status codes because none exists yet. That must
+// stay an explicit argument rather than being inferred from StatusCode == 0:
+// net/http accepts "HTTP/1.1 000" and hands back a response whose StatusCode is
+// genuinely 0, so inferring would run a status-scoped action on exactly the
+// response an operator wrote status_codes to exclude.
+func TestStatusScopedRulesDoNotMatchAGenuineZeroStatus(t *testing.T) {
+	t.Parallel()
+	source := `function transform() { return {} }`
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	rule := nativeRuntimeRule(source, "response", "text")
+	rule.Match.StatusCodes = []int{200}
+	module.Scripts = []ScriptRule{rule}
+	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+
+	zero := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, StatusCode: 0}
+	if matched := matchingScriptRules(cfg, "response", zero); len(matched) != 0 {
+		t.Fatalf("a status-scoped action ran on a status-0 response: %d rules matched", len(matched))
+	}
+	if matched := matchingScriptRulesWithStatus(cfg, "response", zero, false); len(matched) != 1 {
+		t.Fatalf("the request-time probe dropped a status-scoped rule: %d rules matched", len(matched))
+	}
+}

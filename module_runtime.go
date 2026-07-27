@@ -1088,6 +1088,22 @@ func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*
 }
 
 func matchingScriptRules(cfg Config, phase string, message scriptMessage) []matchedScriptRule {
+	return matchingScriptRulesWithStatus(cfg, phase, message, true)
+}
+
+// matchingScriptRulesWithStatus matches rules against message, treating
+// message.StatusCode as known only when matchStatus is set.
+//
+// The request phase probes for response rules before any status exists, and
+// there a rule constrained by status_codes has to count as a possible match
+// rather than be dropped for failing to equal zero.
+//
+// The flag cannot be replaced by reading a zero StatusCode as "unknown": an
+// origin answering "HTTP/1.1 000" gives net/http a response whose StatusCode is
+// genuinely 0, and that value reaches the response-phase match. Inferring the
+// phase from the value would run a status-scoped action on a response the
+// operator wrote status_codes precisely to exclude.
+func matchingScriptRulesWithStatus(cfg Config, phase string, message scriptMessage, matchStatus bool) []matchedScriptRule {
 	parsed, err := url.Parse(message.URL)
 	if err != nil {
 		return nil
@@ -1122,7 +1138,7 @@ func matchingScriptRules(cfg Config, phase string, message scriptMessage) []matc
 			if len(rule.Match.Methods) > 0 && !containsString(rule.Match.Methods, message.Method) {
 				continue
 			}
-			if len(rule.Match.StatusCodes) > 0 && !containsInt(rule.Match.StatusCodes, message.StatusCode) {
+			if matchStatus && len(rule.Match.StatusCodes) > 0 && !containsInt(rule.Match.StatusCodes, message.StatusCode) {
 				continue
 			}
 			if compiledRule.path.MatchString(path) {

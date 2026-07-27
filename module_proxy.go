@@ -119,7 +119,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	message.Headers = requestHeaders
 	incomingHadBodySection := requestHasBodySection(incoming)
 	if requestCanStreamWithoutModuleBuffer(incoming, requestRules) {
-		outbound, streamErr := streamingModuleRequest(w, incoming, message)
+		outbound, streamErr := streamingModuleRequest(w, incoming, cfg, message)
 		return outbound, false, false, streamErr
 	}
 	conditionalStream := requestCanConditionallyStreamWithModuleActions(incoming, requestRules)
@@ -199,19 +199,19 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			message.Body = body
 			bodyBufferRetained = true
 		default:
-			outbound, streamErr := streamingModuleRequest(w, incoming, message)
+			outbound, streamErr := streamingModuleRequest(w, incoming, cfg, message)
 			return outbound, false, false, streamErr
 		}
 	}
 
-	outbound, err := bufferedModuleRequest(incoming, message, incomingHadBodySection)
+	outbound, err := bufferedModuleRequest(incoming, cfg, message, incomingHadBodySection)
 	if err != nil {
 		return nil, false, bodyBufferRetained, err
 	}
 	return outbound, false, bodyBufferRetained, nil
 }
 
-func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, message scriptMessage) (*http.Request, error) {
+func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg Config, message scriptMessage) (*http.Request, error) {
 	parsedURL, err := url.Parse(message.URL)
 	if err != nil {
 		return nil, err
@@ -220,7 +220,7 @@ func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, messa
 	outbound.URL = parsedURL
 	outbound.Host = parsedURL.Host
 	outbound.RequestURI = ""
-	outbound.Header = cloneProxyHeaders(message.Headers)
+	outbound.Header = forwardRequestHeaders(cfg, message)
 	if requestHasBodySection(incoming) {
 		outbound.Body = &requestTrailerBody{
 			ReadCloser:  http.MaxBytesReader(w, incoming.Body, maxModuleHTTPBody),
@@ -228,12 +228,31 @@ func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, messa
 			destination: outbound.Trailer,
 		}
 	}
-	sanitizeForwardRequestHeaders(outbound.Header)
-	outbound.Header.Set("Accept-Encoding", "identity")
 	return outbound, nil
 }
 
-func bufferedModuleRequest(incoming *http.Request, message scriptMessage, incomingHadBodySection bool) (*http.Request, error) {
+// forwardRequestHeaders builds the headers for the upstream leg of message.
+//
+// Accept-Encoding is pinned to identity only when a response action could still
+// run on this exchange, because transformModuleResponse has to decode the
+// upstream body and decodeContentBody understands only gzip, deflate and br.
+// When nothing will read that body, the client's own negotiation is forwarded
+// untouched so the metered origin leg stays compressed — and so a client that
+// explicitly refused identity is not answered with it anyway.
+//
+// message already carries the post-rewrite URL and method the response phase
+// will match on, so this probe is a superset of the response-time match; the
+// status code is the only thing unknown here, which matchStatus=false covers.
+func forwardRequestHeaders(cfg Config, message scriptMessage) http.Header {
+	headers := cloneProxyHeaders(message.Headers)
+	sanitizeForwardRequestHeaders(headers)
+	if len(matchingScriptRulesWithStatus(cfg, "response", message, false)) > 0 {
+		headers.Set("Accept-Encoding", "identity")
+	}
+	return headers
+}
+
+func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMessage, incomingHadBodySection bool) (*http.Request, error) {
 	parsedURL, err := url.Parse(message.URL)
 	if err != nil {
 		return nil, err
@@ -242,9 +261,7 @@ func bufferedModuleRequest(incoming *http.Request, message scriptMessage, incomi
 	outbound.URL = parsedURL
 	outbound.Host = parsedURL.Host
 	outbound.RequestURI = ""
-	outbound.Header = cloneProxyHeaders(message.Headers)
-	sanitizeForwardRequestHeaders(outbound.Header)
-	outbound.Header.Set("Accept-Encoding", "identity")
+	outbound.Header = forwardRequestHeaders(cfg, message)
 	outbound.Body = io.NopCloser(bytes.NewReader(message.Body))
 	outbound.ContentLength = int64(len(message.Body))
 	outbound.GetBody = func() (io.ReadCloser, error) {
