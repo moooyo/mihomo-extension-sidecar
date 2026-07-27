@@ -514,3 +514,45 @@ func TestReadbackNeverStraddlesAnActivation(t *testing.T) {
 	}
 	t.Logf("%d readbacks, %d torn", reads, torn)
 }
+
+// A coordinator replaying its transaction re-stages the id it is about to
+// commit, and that id is often the one already serving. Recording the live
+// bundle in the staged set listed it under stagedBundles forever: Commit's
+// idempotent repeat returns before the staged set is touched, and Abort then
+// refuses the id for being active.
+func TestReStagingTheLiveBundleDoesNotListItAsStaged(t *testing.T) {
+	store, err := openBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newBundleManager(store, nil)
+	document, err := os.ReadFile(filepath.Join("testdata", "bundle.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Stage("bundle-live", document); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Commit("bundle-live", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Readback("test").Staged; len(got) != 0 {
+		t.Fatalf("a committed bundle stayed in the staged set: %v", got)
+	}
+
+	// The replay: same id, same document, after the commit landed.
+	if _, err := manager.Stage("bundle-live", document); err != nil {
+		t.Fatalf("re-staging the live bundle failed: %v", err)
+	}
+	rb := manager.Readback("test")
+	if len(rb.Staged) != 0 {
+		t.Fatalf("re-staging the live bundle listed it as staged: %v", rb.Staged)
+	}
+	if rb.ActiveBundle != "bundle-live" {
+		t.Fatalf("re-staging disturbed the live bundle: %q", rb.ActiveBundle)
+	}
+	// And the coordinator can still finish its replay.
+	if _, err := manager.Commit("bundle-live", "bundle-live"); err != nil {
+		t.Fatalf("replayed commit failed: %v", err)
+	}
+}

@@ -139,7 +139,15 @@ func (m *bundleManager) Stage(id string, document []byte) (string, error) {
 		if existing.Digest != digest {
 			return "", fmt.Errorf("%w: bundle %s already exists with a different document", errBundleWrongState, id)
 		}
-		m.staged[id] = &cfg
+		// Only a record that is actually staged joins the staged set. A
+		// coordinator replaying its transaction re-stages the id it is about to
+		// commit, and that id is often the one already serving: recording the live
+		// bundle here would list it under stagedBundles and leave it there,
+		// because Commit's idempotent repeat returns before the staged set is
+		// touched — and abort then refuses it for being active.
+		if existing.State == bundleStaged {
+			m.staged[id] = &cfg
+		}
 		return digest, nil
 	} else if !errors.Is(err, errBundleNotFound) {
 		return "", err
