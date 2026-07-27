@@ -335,7 +335,8 @@ func (p *interceptProxy) transformModuleResponse(
 	responseMessage.Headers = responseHeaders
 	encoding, err := normalizedContentEncoding(responseMessage.Headers)
 	if err != nil {
-		return nil, err
+		p.reportSkippedResponseActions(request, scripts, err)
+		return nil, nil
 	}
 	body, err := readBounded(response.Body, maxModuleHTTPBody)
 	if err != nil {
@@ -344,11 +345,22 @@ func (p *interceptProxy) transformModuleResponse(
 	if encoding == "" && isGzip(body) {
 		encoding = "gzip"
 	}
-	body, err = decodeContentBody(body, encoding, maxModuleHTTPBody)
+	decoded, err := decodeContentBody(body, encoding, maxModuleHTTPBody)
 	if err != nil {
-		return nil, err
+		// An upstream body this sidecar cannot decode cannot be projected into a
+		// script message, and refusing to serve it turns an origin's choice of
+		// coding into a 502 for a request that already succeeded. readBounded
+		// only returns once the upstream reader reached EOF, so everything the
+		// origin sent is in body: hand it back for the caller to stream, keeping
+		// the upstream closer so the connection is still released.
+		response.Body = struct {
+			io.Reader
+			io.Closer
+		}{bytes.NewReader(body), response.Body}
+		p.reportSkippedResponseActions(request, scripts, err)
+		return nil, nil
 	}
-	responseMessage.Body = body
+	responseMessage.Body = decoded
 	responseTrailers, err := exportedTrailers(response.Trailer)
 	if err != nil {
 		return nil, fmt.Errorf("upstream response trailers: %w", err)
@@ -396,6 +408,25 @@ func (p *interceptProxy) transformModuleResponse(
 		Trailer:    responseMessage.Trailers,
 		Body:       responseMessage.Body,
 	}, nil
+}
+
+// reportSkippedResponseActions records that a response streamed through with its
+// matched actions unrun, because the sidecar could not decode the coding the
+// origin chose. Reported per action on its own log stream, the way the runtime
+// reports an action that timed out or was canceled, so the extension an operator
+// is debugging names itself rather than leaving a silent passthrough.
+func (p *interceptProxy) reportSkippedResponseActions(request *http.Request, scripts []matchedScriptRule, reason error) {
+	if !engineLogPublishingEnabled(p.scripts.logs) {
+		return
+	}
+	for _, matched := range scripts {
+		p.scripts.logs.Publish(EngineLog{
+			Level: "warn", Source: "engine", Extension: matched.Module.ID, Action: matched.Rule.ID,
+			Phase: matched.Rule.Phase, URL: sanitizeEngineLogURL(request.URL.String()),
+			ScriptDigest: matched.Rule.ScriptDigest,
+			Message:      "action skipped: " + reason.Error(),
+		})
+	}
 }
 
 func writeBufferedModuleResponse(w http.ResponseWriter, method string, status int, headers, trailers http.Header, body []byte) error {

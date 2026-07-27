@@ -1654,3 +1654,101 @@ func TestResponseActionLimitDoesNotBoundTheUpstreamBody(t *testing.T) {
 		t.Fatal("a body_mode=text action accepted a body over its own max_body_bytes")
 	}
 }
+
+// An origin is free to ignore the Accept-Encoding this sidecar sends. When it
+// answers in a coding decodeContentBody does not implement, the response cannot
+// be projected into a script message — but refusing to serve it turned the
+// origin's choice into a 502 for a request that had already succeeded. It
+// streams through instead, untouched, with the skip reported per action.
+func TestUndecodableUpstreamCodingStreamsThroughInsteadOf502(t *testing.T) {
+	t.Parallel()
+	source := `function transform() { return {response: {body: "rewritten"}} }`
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	rule := nativeRuntimeRule(source, "response", "text")
+	module.Scripts = []ScriptRule{rule}
+	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	scripts := []matchedScriptRule{{Module: module, Rule: rule}}
+
+	for _, encoding := range []string{"zstd", "gzip, br"} {
+		payload := []byte("bytes-the-sidecar-cannot-decode")
+		request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
+		header := make(http.Header)
+		header.Set("Content-Encoding", encoding)
+		response := &http.Response{
+			StatusCode: http.StatusOK, Header: header,
+			Body: io.NopCloser(bytes.NewReader(payload)),
+		}
+		transformed, err := (&interceptProxy{scripts: newScriptRuntime()}).transformModuleResponse(request, response, cfg, scripts)
+		if err != nil {
+			t.Fatalf("Content-Encoding %q became an error: %v", encoding, err)
+		}
+		if transformed != nil {
+			t.Fatalf("Content-Encoding %q produced a transformed response: %+v", encoding, transformed)
+		}
+		// The caller streams response.Body, so every byte the origin sent has to
+		// still be there along with the coding that describes them.
+		streamed, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("Content-Encoding %q: replaying the body: %v", encoding, err)
+		}
+		if !bytes.Equal(streamed, payload) {
+			t.Fatalf("Content-Encoding %q streamed %q, want %q", encoding, streamed, payload)
+		}
+		if got := response.Header.Get("Content-Encoding"); got != encoding {
+			t.Fatalf("Content-Encoding rewritten to %q, want %q", got, encoding)
+		}
+	}
+}
+
+// The passthrough branch above must not become a way for an origin to make an
+// action not run. Landing it before max_body_bytes stopped bounding the upstream
+// read would have done exactly that: a body over the rule's limit failed inside
+// decodeContentBody, which returns the same error for "cannot decode" as for
+// "too large", so gzipping a response silently skipped the action that plaintext
+// would have run. With the read bounded by the global cap instead, a decodable
+// body always reaches the per-rule check and both encodings agree.
+func TestGzipDoesNotLetAnOriginSkipAResponseAction(t *testing.T) {
+	t.Parallel()
+	source := `function transform() { return {response: {body: "rewritten"}} }`
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	rule := nativeRuntimeRule(source, "response", "text")
+	rule.MaxBodyBytes = 1024
+	module.Scripts = []ScriptRule{rule}
+	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	scripts := []matchedScriptRule{{Module: module, Rule: rule}}
+
+	plain := bytes.Repeat([]byte("x"), 4096)
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(body []byte, encoding string) error {
+		request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
+		header := make(http.Header)
+		if encoding != "" {
+			header.Set("Content-Encoding", encoding)
+		}
+		response := &http.Response{
+			StatusCode: http.StatusOK, Header: header,
+			Body: io.NopCloser(bytes.NewReader(body)),
+		}
+		transformed, err := (&interceptProxy{scripts: newScriptRuntime()}).transformModuleResponse(request, response, cfg, scripts)
+		if err == nil && transformed == nil {
+			t.Fatalf("Content-Encoding %q: the action was silently skipped", encoding)
+		}
+		return err
+	}
+
+	plainErr := run(plain, "")
+	gzipErr := run(compressed.Bytes(), "gzip")
+	if plainErr == nil || gzipErr == nil {
+		t.Fatalf("over-limit body accepted: plain=%v gzip=%v", plainErr, gzipErr)
+	}
+}
