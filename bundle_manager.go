@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -231,7 +232,79 @@ func (m *bundleManager) Commit(id, expectedActive string) (string, error) {
 	m.setActive(id, rec.Digest, &cfg)
 	delete(m.staged, id)
 	m.publish("info", fmt.Sprintf("committed bundle %s as generation %d", id, generation))
+	m.pruneSuperseded(current)
 	return rec.Digest, nil
+}
+
+// bundleRetainedGenerations is how many superseded records a commit leaves
+// behind. It must be at least 1: the bundle this commit just replaced is what the
+// pointer's Previous names, and rolling back one step is the rollback a
+// coordinator actually performs.
+//
+// Nothing pruned them before, so the store grew by one full document copy per
+// commit for the life of the deployment, and store writes are fsynced, so a full
+// disk makes the next commit fail — the operation an operator needs when
+// something is already wrong. The depth is named rather than assumed because the
+// rollback it protects is wider than the store's own comment claims: Commit
+// accepts any stored id, not only the one it replaced, so this is how many
+// generations a coordinator can walk back without re-uploading.
+const bundleRetainedGenerations = 3
+
+// pruneSuperseded drops superseded records past the retained depth.
+//
+// It runs after the swap and never fails the commit: what it removes is not
+// serving anything, and a store that cannot be swept is no reason to reject a
+// bundle that already is. The set is recomputed from the store rather than
+// remembered, and Delete is idempotent on a missing file and fsyncs the
+// directory, so a sweep interrupted halfway is finished by the next commit and a
+// store that arrived with a backlog is drained by the first one.
+//
+// justSuperseded is retained by name rather than by sort. ActivatedAt has
+// one-second resolution, so a burst of commits inside one second cannot be
+// ordered by it, and that tie must never fall on the record the pointer's
+// Previous names.
+//
+// Staged records are never swept. A stage is a durable promise the coordinator is
+// meant to be able to come back to, which is the whole reason staging and commit
+// are separate; abort is how it withdraws one.
+func (m *bundleManager) pruneSuperseded(justSuperseded string) {
+	ids, err := m.store.List()
+	if err != nil {
+		m.publish("warn", "could not list bundles to prune: "+err.Error())
+		return
+	}
+	older := bundleRetainedGenerations - 1
+	activated := make(map[string]int64, len(ids))
+	for _, id := range ids {
+		if id == justSuperseded {
+			continue
+		}
+		if rec, err := m.store.Get(id); err == nil && rec.State == bundleSuperseded {
+			activated[id] = rec.ActivatedAt
+		}
+	}
+	if len(activated) <= older {
+		return
+	}
+	superseded := make([]string, 0, len(activated))
+	for id := range activated {
+		superseded = append(superseded, id)
+	}
+	// Within one second the ids only decide which of two things nobody is serving
+	// is the one kept, so any total order will do.
+	sort.Slice(superseded, func(i, j int) bool {
+		if a, b := activated[superseded[i]], activated[superseded[j]]; a != b {
+			return a > b
+		}
+		return superseded[i] > superseded[j]
+	})
+	for _, id := range superseded[older:] {
+		if err := m.store.Delete(id); err != nil {
+			m.publish("warn", "could not prune superseded bundle "+id+": "+err.Error())
+			return
+		}
+		m.publish("info", "pruned superseded bundle "+id)
+	}
 }
 
 // Abort discards a staged bundle. It refuses anything already live: an active

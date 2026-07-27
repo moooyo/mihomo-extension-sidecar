@@ -37,7 +37,7 @@ process instance, so a cached answer is a wrong answer.
 | `GET` | `/plugins` | per-extension view for the console: name, version, capture hosts, action and setting counts, execution order |
 | `PUT` | `/bundles/{id}` | stage an immutable bundle; returns its digest |
 | `POST` | `/bundles/{id}/commit` | make it live, compare-and-swap against the bundle the caller believes is active |
-| `POST` | `/bundles/{id}/abort` | discard a staged bundle |
+| `POST` | `/bundles/{id}/abort` | discard a staged bundle, or reclaim a superseded one |
 | `DELETE` | `/bundles` | purge all state |
 
 Errors carry a stable `code` so a coordinator branches on the outcome instead of
@@ -70,6 +70,13 @@ On restart it reloads the bundle it was serving. An unusable artifact is logged
 and skipped rather than fatal: serving nothing is the safe state, because
 mihomo's capture rules treat a processor with no bundle as not ready and fail
 closed on it.
+
+A commit keeps the last few superseded records and prunes the rest. That depth is
+the rollback budget: a commit accepts any id still in the store, not only the one
+it replaced, so it is how many generations a coordinator can walk back without
+re-uploading. Staged records are never pruned — a stage is a durable promise it
+can come back to, and `abort` is how it withdraws one. `abort` also reclaims a
+superseded record, which is the targeted alternative to `DELETE /bundles`.
 
 ### The sidecar does not consult a mihomo generation socket
 

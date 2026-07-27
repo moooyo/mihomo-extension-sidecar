@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -554,5 +555,77 @@ func TestReStagingTheLiveBundleDoesNotListItAsStaged(t *testing.T) {
 	// And the coordinator can still finish its replay.
 	if _, err := manager.Commit("bundle-live", "bundle-live"); err != nil {
 		t.Fatalf("replayed commit failed: %v", err)
+	}
+}
+
+// Nothing ever pruned superseded records: bundleStore.Delete had exactly one
+// non-test caller, in Abort, and no ticker or sweep touched the store. Every
+// commit left a full document copy behind for the life of the deployment, and
+// store writes are fsynced, so a full disk makes the next commit fail — the
+// operation an operator needs when something is already wrong.
+func TestCommitPrunesSupersededRecordsButKeepsRollbackDepth(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openBundleStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newBundleManager(store, nil)
+	document, err := os.ReadFile(filepath.Join("testdata", "bundle.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A stage that is never committed must survive every sweep: it is a durable
+	// promise the coordinator can come back to.
+	if _, err := manager.Stage("bundle-abandoned", document); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := ""
+	ids := []string{}
+	for index := 0; index < bundleRetainedGenerations+4; index++ {
+		id := fmt.Sprintf("bundle-%04d", index)
+		ids = append(ids, id)
+		if _, err := manager.Stage(id, document); err != nil {
+			t.Fatalf("stage %s: %v", id, err)
+		}
+		if _, err := manager.Commit(id, previous); err != nil {
+			t.Fatalf("commit %s: %v", id, err)
+		}
+		previous = id
+	}
+
+	stored, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]struct{}{}
+	for _, id := range stored {
+		kept[id] = struct{}{}
+	}
+	if _, ok := kept["bundle-abandoned"]; !ok {
+		t.Fatal("an uncommitted stage was pruned")
+	}
+	active := ids[len(ids)-1]
+	if _, ok := kept[active]; !ok {
+		t.Fatalf("the active bundle %s was pruned", active)
+	}
+	// The pointer's Previous has to remain resolvable: one step back is the
+	// rollback a coordinator actually performs.
+	ptr, err := store.Pointer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := kept[ptr.Previous]; !ok {
+		t.Fatalf("the pointer names Previous=%q but it was pruned", ptr.Previous)
+	}
+	// active + retained superseded + the abandoned stage.
+	if want := bundleRetainedGenerations + 2; len(stored) != want {
+		t.Fatalf("store holds %d records (%v), want %d", len(stored), stored, want)
+	}
+	// And a retained superseded bundle is still committable, which is what the
+	// depth is for.
+	if _, err := manager.Commit(ptr.Previous, active); err != nil {
+		t.Fatalf("rolling back one generation failed: %v", err)
 	}
 }
