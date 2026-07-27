@@ -442,3 +442,75 @@ func decodeBody(t *testing.T, resp *http.Response, v any) {
 		t.Fatalf("decode %s: %v", resp.Request.URL.Path, err)
 	}
 }
+
+// bundleReadback is documented as the authoritative answer to what this sidecar
+// is serving, and a coordinator decides roll-forward or rollback from it. The
+// active identity is three separate atomics that setActive writes in sequence,
+// so reading them outside m.mu reported one bundle's id with another's digest or
+// generation. go test -race cannot see this: every access is atomic and the race
+// is logical.
+func TestReadbackNeverStraddlesAnActivation(t *testing.T) {
+	store, err := openBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newBundleManager(store, nil)
+
+	type activation struct {
+		id         string
+		digest     string
+		generation uint64
+	}
+	activations := []activation{
+		{id: "bundle-aaaa", digest: "digest-aaaa", generation: 1},
+		{id: "bundle-bbbb", digest: "digest-bbbb", generation: 2},
+	}
+	expected := map[string]activation{}
+	for _, a := range activations {
+		expected[a.id] = a
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for index := 0; ; index++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			a := activations[index%len(activations)]
+			manager.mu.Lock()
+			manager.setActive(a.id, a.digest, &Config{generation: a.generation})
+			manager.mu.Unlock()
+		}
+	}()
+
+	reads, torn := 0, 0
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		rb := manager.Readback("test")
+		if rb.ActiveBundle == "" {
+			continue
+		}
+		reads++
+		want, ok := expected[rb.ActiveBundle]
+		if !ok {
+			t.Fatalf("readback reported an id nothing ever activated: %q", rb.ActiveBundle)
+		}
+		if rb.ActiveDigest != want.digest || rb.Generation != want.generation {
+			torn++
+		}
+	}
+	close(stop)
+	<-done
+
+	if reads < 1000 {
+		t.Fatalf("only %d readbacks observed; the test did not exercise the race", reads)
+	}
+	if torn != 0 {
+		t.Fatalf("%d of %d readbacks straddled an activation", torn, reads)
+	}
+	t.Logf("%d readbacks, %d torn", reads, torn)
+}

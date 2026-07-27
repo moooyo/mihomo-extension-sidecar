@@ -275,13 +275,17 @@ type bundleReadback struct {
 
 // Readback reports the live state.
 func (m *bundleManager) Readback(version string) bundleReadback {
+	// The active triple is three separate atomics written in sequence by
+	// setActive, so reading them outside m.mu can report one bundle's id with
+	// another's digest or generation — and this struct is documented as the
+	// authoritative answer a coordinator uses to decide roll-forward or
+	// rollback. go test -race cannot see it: every access is atomic, and the
+	// race is logical. m.store.List stays outside the lock; it is disk I/O.
 	m.mu.Lock()
 	staged := make([]string, 0, len(m.staged))
 	for id := range m.staged {
 		staged = append(staged, id)
 	}
-	m.mu.Unlock()
-
 	rb := bundleReadback{
 		Schema:       bundleStoreSchema,
 		InstanceID:   m.instanceID,
@@ -302,6 +306,8 @@ func (m *bundleManager) Readback(version string) bundleReadback {
 		}
 		rb.CaptureHosts = len(hosts)
 	}
+	m.mu.Unlock()
+
 	if stored, err := m.store.List(); err == nil {
 		rb.Stored = stored
 	}
