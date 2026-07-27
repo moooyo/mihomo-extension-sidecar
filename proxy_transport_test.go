@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -310,4 +311,53 @@ func assertNoSOCKSTarget(t *testing.T, targets <-chan socksTarget) {
 		t.Fatalf("unexpected SOCKS connection to %+v", got)
 	case <-time.After(150 * time.Millisecond):
 	}
+}
+
+// dialSOCKS5TCP bounds its connect but not the SOCKS exchange that follows, and
+// no transport timeout starts until the dial returns. Production calls it with
+// no deadline above it, so a mihomo that accepts the connection and never speaks
+// SOCKS pinned the dial, its handler goroutine and the connection forever.
+func TestUpstreamDialBoundsTheSOCKSHandshake(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out upstreamHandshakeTimeout")
+	}
+	t.Parallel()
+	silent, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	go func() {
+		for {
+			conn, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			// Accept and say nothing, ever.
+			defer conn.Close()
+		}
+	}()
+
+	module := Module{ID: "io.example.fixture", Enabled: true, CaptureHosts: []string{"api.example.com"}}
+	cfg := Config{
+		MITM:          MITMSettings{Enabled: true},
+		UpstreamProxy: ProxyConfig{Address: silent.Addr().String(), Username: "upstream-user-1234", Password: "upstream-password-1234567"},
+		Modules:       []Module{module}, ExecutionOrder: []string{module.ID},
+	}
+	transport := (&interceptProxy{}).newHTTPTransportForProjection(newUpstreamTransportProjection(cfg))
+	defer transport.CloseIdleConnections()
+
+	started := time.Now()
+	// context.Background is the production condition: nothing above the dial
+	// carries a deadline.
+	conn, err := transport.DialContext(context.Background(), "tcp", "api.example.com:443")
+	elapsed := time.Since(started)
+	if err == nil {
+		conn.Close()
+		t.Fatal("a silent SOCKS peer completed a handshake")
+	}
+	if elapsed > upstreamHandshakeTimeout+5*time.Second {
+		t.Fatalf("stalled SOCKS handshake took %s, want about %s", elapsed, upstreamHandshakeTimeout)
+	}
+	t.Logf("stalled SOCKS handshake cut after %s: %v", elapsed.Round(time.Millisecond), err)
 }

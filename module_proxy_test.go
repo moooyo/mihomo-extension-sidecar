@@ -190,6 +190,13 @@ func TestMainHTTPTransportBoundsResponseHeaders(t *testing.T) {
 		transport.IdleConnTimeout != upstreamHTTPIdleTimeout {
 		t.Fatalf("idle pool is not bounded: %+v", transport)
 	}
+	// Bytes were bounded; time was not. An upstream that accepts a request and
+	// never answers held a handler goroutine and its mihomo SOCKS connection for
+	// as long as it liked.
+	if transport.ResponseHeaderTimeout != upstreamResponseHeaderTimeout ||
+		transport.TLSHandshakeTimeout != upstreamHandshakeTimeout {
+		t.Fatalf("upstream leg is not bounded in time: %+v", transport)
+	}
 }
 
 func TestPrepareModuleRequestStreamsUnmatchedHTTPBody(t *testing.T) {

@@ -38,6 +38,15 @@ const (
 	maxIdleUpstreamHTTPConnectionsPerHost = 8
 	maxUpstreamHTTP3Connections           = 64
 	upstreamHTTPIdleTimeout               = 90 * time.Second
+	// A handshake through the mihomo leg is the same order of work as the connect
+	// in front of it, which dialSOCKS5TCP already caps at 10s, and it is what
+	// net/http's own DefaultTransport allows.
+	upstreamHandshakeTimeout = 10 * time.Second
+	// Time to first byte only: ResponseHeaderTimeout starts after the request
+	// body has been written, so a slow upload never starts this clock. 90s is the
+	// silence budget this file already spends three times, and it sits above the
+	// common origin-side ceilings a proxy meets.
+	upstreamResponseHeaderTimeout = 90 * time.Second
 	upstreamHTTP3RecycleTimeout           = 250 * time.Millisecond
 	interceptCertificateTrustLogInterval  = time.Minute
 	interceptCertificateTrustMessage      = "client rejected the interception certificate as untrusted; open Setup Guide, install the current 5gpn interception CA, and enable full trust on the client"
@@ -713,6 +722,8 @@ func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransp
 		MaxIdleConnsPerHost:    maxIdleUpstreamHTTPConnectionsPerHost,
 		IdleConnTimeout:        upstreamHTTPIdleTimeout,
 		MaxResponseHeaderBytes: maxModuleNetworkHeaderBytes,
+		ResponseHeaderTimeout:  upstreamResponseHeaderTimeout,
+		TLSHandshakeTimeout:    upstreamHandshakeTimeout,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    p.upstreamRoots,
@@ -726,7 +737,12 @@ func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransp
 			if !permitted {
 				return nil, errors.New("upstream TCP target is outside the active extension allowlist")
 			}
-			return dialSOCKS5TCP(ctx, projection.proxy, target)
+			// dialSOCKS5TCP bounds only the connect. Without a deadline on the
+			// context its greeting, auth and CONNECT exchange with mihomo waits
+			// forever, and no transport timeout starts until it returns.
+			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
+			defer cancel()
+			return dialSOCKS5TCP(dialCtx, projection.proxy, target)
 		},
 	}
 }
@@ -757,7 +773,9 @@ func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGenerati
 				return nil, err
 			}
 			releaseSlot := func() { <-slots }
-			packetConn, err := dialSOCKS5UDP(ctx, generation.projection.proxy, target)
+			dialCtx, cancel := context.WithTimeout(ctx, upstreamHandshakeTimeout)
+			defer cancel()
+			packetConn, err := dialSOCKS5UDP(dialCtx, generation.projection.proxy, target)
 			if err != nil {
 				releaseSlot()
 				return nil, err
