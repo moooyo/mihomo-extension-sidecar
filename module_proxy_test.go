@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -1823,4 +1824,79 @@ func TestStatusScopedRulesDoNotMatchAGenuineZeroStatus(t *testing.T) {
 	if matched := matchingScriptRulesWithStatus(cfg, "response", zero, false); len(matched) != 1 {
 		t.Fatalf("the request-time probe dropped a status-scoped rule: %d rules matched", len(matched))
 	}
+}
+
+type countingConn struct {
+	net.Conn
+	read int64
+}
+
+func (c *countingConn) Read(buffer []byte) (int, error) {
+	count, err := c.Conn.Read(buffer)
+	atomic.AddInt64(&c.read, int64(count))
+	return count, err
+}
+
+// ServeHTTP wraps r.Body to re-arm a stall deadline per read, and has to hand
+// the original back before returning. net/http decides whether to drain an
+// unread request body by type-asserting Request.Body to its own concrete type
+// (chunkWriter.writeHeader), so a wrapper left in place makes it fall to the
+// default branch and pull up to maxPostHandlerReadBytes off the wire — for an
+// upload this sidecar has already rejected as oversize.
+func TestOversizeUploadIsNotDrainedFromTheWire(t *testing.T) {
+	cfg := validNativeConfig()
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newConfigStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &interceptProxy{config: store, scripts: newScriptRuntime(), bodySlots: make(chan struct{}, 2)}
+
+	client, server := net.Pipe()
+	counting := &countingConn{Conn: server}
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = proxy.servePlainHTTPConnection(counting)
+	}()
+
+	header := fmt.Sprintf("POST /upload HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: %d\r\n\r\n",
+		maxModuleHTTPBody+1)
+	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(client, header); err != nil {
+		t.Fatal(err)
+	}
+	// Offer body bytes the server must not take. Writes block on an unread pipe,
+	// so this stops on its own once the response has been written.
+	go func() {
+		chunk := bytes.Repeat([]byte("x"), 16<<10)
+		for {
+			if _, err := client.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+
+	status, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the response: %v", err)
+	}
+	if !strings.Contains(status, "502") {
+		t.Fatalf("oversize upload status line = %q, want 502", strings.TrimSpace(status))
+	}
+	consumed := atomic.LoadInt64(&counting.read) - int64(len(header))
+	if consumed != 0 {
+		t.Fatalf("the server drained %d body bytes of an upload it had already rejected", consumed)
+	}
+	_ = client.Close()
+	<-served
 }

@@ -47,9 +47,16 @@ const (
 	// silence budget this file already spends three times, and it sits above the
 	// common origin-side ceilings a proxy meets.
 	upstreamResponseHeaderTimeout = 90 * time.Second
-	upstreamHTTP3RecycleTimeout           = 250 * time.Millisecond
-	interceptCertificateTrustLogInterval  = time.Minute
-	interceptCertificateTrustMessage      = "client rejected the interception certificate as untrusted; open Setup Guide, install the current 5gpn interception CA, and enable full trust on the client"
+	// The data plane's silence budget for a peer that goes quiet inside a request
+	// rather than between them, which is the same 90s the three idle timeouts
+	// above already spend. Re-armed per read and per write, so a slow but
+	// progressing transfer is never truncated.
+	interceptTransferStallTimeout = 90 * time.Second
+	interceptTransferWriteChunk   = 32 << 10
+
+	upstreamHTTP3RecycleTimeout          = 250 * time.Millisecond
+	interceptCertificateTrustLogInterval = time.Minute
+	interceptCertificateTrustMessage     = "client rejected the interception certificate as untrusted; open Setup Guide, install the current 5gpn interception CA, and enable full trust on the client"
 )
 
 type upstreamTransportGeneration struct {
@@ -372,6 +379,20 @@ func discardQUICAssociation(ctx context.Context, control net.Conn, packetConn ne
 
 func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := canonicalHost(r.Host)
+	if requestHasPayload(r) {
+		controller := http.NewResponseController(w)
+		// Armed before the first read as well: when this handler answers without
+		// draining the body, net/http drains up to maxPostHandlerReadBytes of it
+		// outside the wrapper, and the synthetic-response path relies on that.
+		_ = controller.SetReadDeadline(time.Now().Add(interceptTransferStallTimeout))
+		serverBody := r.Body
+		r.Body = &transferDeadlineBody{ReadCloser: serverBody, controller: controller, timeout: interceptTransferStallTimeout}
+		// Handed back so net/http still recognises its own body type after the
+		// handler returns: chunkWriter.writeHeader only skips draining an already
+		// rejected oversize upload when Request.Body is the concrete type it
+		// created, and that is what keeps those bytes off the wire.
+		defer func() { r.Body = serverBody }()
+	}
 	cfg, err := p.config.Current()
 	if err != nil {
 		http.Error(w, "interception configuration unavailable", http.StatusServiceUnavailable)
@@ -447,6 +468,58 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("intercept: upstream response copy failed host=%s protocol=%s: %v", host, r.Proto, copyErr)
 		panic(http.ErrAbortHandler)
 	}
+}
+
+// handleSOCKSConnection clears the SOCKS-phase deadline before the HTTP phase
+// begins, and MaxBytesReader bounds only bytes, so a downstream peer that stops
+// sending its request body or stops reading its response otherwise pins this
+// handler and its mihomo SOCKS connection for as long as it likes. Re-arming per
+// read and per write is what a flat ReadTimeout/WriteTimeout cannot do: a bound
+// large enough for a legitimate 64 MiB transfer over a slow link is no bound at
+// all, and a flat write deadline would truncate a long download.
+//
+// This is the shape the engine log socket already uses for its own frames, and
+// going through ResponseController covers all three servers: net/http applies it
+// to the connection, HTTP/2 and http3 to the one stream.
+type transferDeadlineBody struct {
+	io.ReadCloser
+	controller *http.ResponseController
+	timeout    time.Duration
+}
+
+func (b *transferDeadlineBody) Read(buffer []byte) (int, error) {
+	_ = b.controller.SetReadDeadline(time.Now().Add(b.timeout))
+	return b.ReadCloser.Read(buffer)
+}
+
+type transferDeadlineWriter struct {
+	io.Writer
+	controller *http.ResponseController
+	timeout    time.Duration
+}
+
+// A Write must place every byte it is given, so unlike a Read it can outlive any
+// single window: writeBufferedModuleResponse hands over a whole body at once, and
+// io.Copy collapses to a single Write whenever the source implements WriterTo.
+// Re-arm per chunk, the unit io.Copy already moves.
+func (w *transferDeadlineWriter) Write(payload []byte) (int, error) {
+	written := 0
+	for written < len(payload) {
+		chunk := payload[written:]
+		if len(chunk) > interceptTransferWriteChunk {
+			chunk = chunk[:interceptTransferWriteChunk]
+		}
+		_ = w.controller.SetWriteDeadline(time.Now().Add(w.timeout))
+		count, err := w.Writer.Write(chunk)
+		written += count
+		if err != nil {
+			return written, err
+		}
+		if count < len(chunk) {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
 }
 
 func (p *interceptProxy) acquireBodySlot() bool {
@@ -1090,6 +1163,7 @@ var streamingResponseBuffers = sync.Pool{
 }
 
 func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int, method string, response *http.Response) error {
+	controller := http.NewResponseController(w)
 	responseHeaders, err := exportedHeaders(response.Header)
 	if err != nil {
 		return fmt.Errorf("upstream response headers: %w", err)
@@ -1110,13 +1184,14 @@ func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int
 	}
 	w.WriteHeader(response.StatusCode)
 	if forceChunked {
-		if err := http.NewResponseController(w).Flush(); err != nil {
+		if err := controller.Flush(); err != nil {
 			return err
 		}
 	}
 	buffer := streamingResponseBuffers.Get().(*[]byte)
 	defer streamingResponseBuffers.Put(buffer)
-	if _, err := io.CopyBuffer(w, response.Body, *buffer); err != nil {
+	streamed := &transferDeadlineWriter{Writer: w, controller: controller, timeout: interceptTransferStallTimeout}
+	if _, err := io.CopyBuffer(streamed, response.Body, *buffer); err != nil {
 		return err
 	}
 	responseTrailers, err := exportedTrailers(response.Trailer)
@@ -1127,7 +1202,7 @@ func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int
 		return errors.New("response trailers require a response body section")
 	}
 	if len(responseTrailerNames(responseTrailers)) > 0 {
-		if err := http.NewResponseController(w).Flush(); err != nil {
+		if err := controller.Flush(); err != nil {
 			return err
 		}
 	}

@@ -446,6 +446,7 @@ func (p *interceptProxy) reportSkippedResponseActions(request *http.Request, scr
 }
 
 func writeBufferedModuleResponse(w http.ResponseWriter, method string, status int, headers, trailers http.Header, body []byte) error {
+	controller := http.NewResponseController(w)
 	canHaveBody := responseCanHaveBody(method, status)
 	if len(body) > 0 && !canHaveBody {
 		return http.ErrBodyNotAllowed
@@ -462,7 +463,8 @@ func writeBufferedModuleResponse(w http.ResponseWriter, method string, status in
 	}
 	w.WriteHeader(status)
 	if len(body) > 0 {
-		written, err := w.Write(body)
+		buffered := &transferDeadlineWriter{Writer: w, controller: controller, timeout: interceptTransferStallTimeout}
+		written, err := buffered.Write(body)
 		if err != nil {
 			return err
 		}
@@ -471,7 +473,7 @@ func writeBufferedModuleResponse(w http.ResponseWriter, method string, status in
 		}
 	}
 	if len(declared) > 0 {
-		if err := http.NewResponseController(w).Flush(); err != nil {
+		if err := controller.Flush(); err != nil {
 			return err
 		}
 	}
