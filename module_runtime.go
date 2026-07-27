@@ -146,6 +146,11 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		return scriptResult{}, err
 	}
 	vm := goja.New()
+	loop := newAsyncLoop()
+	defer loop.close()
+	if err := loop.installTimerAPI(vm); err != nil {
+		return scriptResult{}, err
+	}
 	installConsoleAPI(vm, r.logs, EngineLog{
 		Source: "script", Extension: module.ID, Action: rule.ID, Phase: rule.Phase,
 		URL: request.URL, ScriptDigest: rule.ScriptDigest,
@@ -198,7 +203,11 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	if callErr != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, callErr)
 	}
-	return parseNativeScriptResult(value, response != nil)
+	settled, settleErr := settlePromise(actionCtx, vm, loop, value)
+	if settleErr != nil {
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, settleErr)
+	}
+	return parseNativeScriptResult(settled, response != nil)
 }
 
 func scriptProgram(module Module, rule ScriptRule) (*goja.Program, error) {
