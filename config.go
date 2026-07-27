@@ -271,23 +271,28 @@ func routingJSONNull(raw json.RawMessage) bool {
 }
 
 type Module struct {
-	ID                  string          `json:"id"`
-	Version             string          `json:"extension_version"`
-	Name                string          `json:"name"`
-	Description         string          `json:"description,omitempty"`
-	Enabled             bool            `json:"enabled"`
-	ImportedAt          string          `json:"imported_at"`
-	Source              ModuleSource    `json:"source"`
-	CaptureHosts        []string        `json:"capture_hosts"`
-	CaptureDNS          string          `json:"capture_dns"`
-	HostMappings        []HostMapping   `json:"upstream_mappings,omitempty"`
-	RoutingRules        RoutingRules    `json:"routing_rules,omitempty"`
-	Settings            []ModuleSetting `json:"settings,omitempty"`
-	Scripts             []ScriptRule    `json:"actions,omitempty"`
-	PersistentStorage   bool            `json:"persistent_storage"`
-	NetworkOrigins      []string        `json:"network_origins"`
-	EgressGroupRequired bool            `json:"egress_group_required"`
-	EgressGroup         string          `json:"egress_group,omitempty"`
+	ID                string          `json:"id"`
+	Version           string          `json:"extension_version"`
+	Name              string          `json:"name"`
+	Description       string          `json:"description,omitempty"`
+	Enabled           bool            `json:"enabled"`
+	ImportedAt        string          `json:"imported_at"`
+	Source            ModuleSource    `json:"source"`
+	CaptureHosts      []string        `json:"capture_hosts"`
+	CaptureDNS        string          `json:"capture_dns"`
+	HostMappings      []HostMapping   `json:"upstream_mappings,omitempty"`
+	RoutingRules      RoutingRules    `json:"routing_rules,omitempty"`
+	Settings          []ModuleSetting `json:"settings,omitempty"`
+	Scripts           []ScriptRule    `json:"actions,omitempty"`
+	PersistentStorage bool            `json:"persistent_storage"`
+	NetworkOrigins    []string        `json:"network_origins"`
+	// NetworkAny grants the network capability without an exact origin list.
+	// It exists for extensions whose reachable hosts are operator-configured
+	// and therefore cannot be enumerated, and it is a strictly broader grant
+	// than NetworkOrigins: every management surface must review it as such.
+	NetworkAny          bool   `json:"network_any,omitempty"`
+	EgressGroupRequired bool   `json:"egress_group_required"`
+	EgressGroup         string `json:"egress_group,omitempty"`
 }
 
 func loadConfig(path string) (Config, error) {
