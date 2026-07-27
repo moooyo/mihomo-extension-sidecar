@@ -31,9 +31,14 @@ type bundleManager struct {
 	// this sidecar restarted and that nothing it attested before still holds.
 	instanceID string
 
-	// staged holds decoded-but-not-live bundles so a commit does not have to
-	// re-read and re-decode.
-	staged map[string]*Config
+	// staged names the bundles this process staged and has not committed or
+	// aborted yet. It deliberately holds no configuration: the decoded one used to
+	// live here so a commit could skip re-reading, which made a bundle that was
+	// staged and then abandoned cost tens of kilobytes of resident heap — a
+	// decoded Config with its compiled goja programs and regexes — for as long as
+	// the process ran, with nothing to bound it. Commit re-reads the record
+	// instead, which is what it already did for a bundle staged before a restart.
+	staged map[string]struct{}
 
 	logs engineLogPublisher
 }
@@ -42,7 +47,7 @@ func newBundleManager(store *bundleStore, logs engineLogPublisher) *bundleManage
 	return &bundleManager{
 		store:      store,
 		instanceID: newInstanceID(),
-		staged:     map[string]*Config{},
+		staged:     map[string]struct{}{},
 		logs:       logs,
 	}
 }
@@ -146,7 +151,7 @@ func (m *bundleManager) Stage(id string, document []byte) (string, error) {
 		// because Commit's idempotent repeat returns before the staged set is
 		// touched — and abort then refuses it for being active.
 		if existing.State == bundleStaged {
-			m.staged[id] = &cfg
+			m.staged[id] = struct{}{}
 		}
 		return digest, nil
 	} else if !errors.Is(err, errBundleNotFound) {
@@ -160,7 +165,7 @@ func (m *bundleManager) Stage(id string, document []byte) (string, error) {
 	if err := m.store.Put(rec); err != nil {
 		return "", err
 	}
-	m.staged[id] = &cfg
+	m.staged[id] = struct{}{}
 	m.publish("info", fmt.Sprintf("staged bundle %s (%d extensions)", id, len(cfg.Modules)))
 	return digest, nil
 }
@@ -191,21 +196,20 @@ func (m *bundleManager) Commit(id, expectedActive string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cfg, ok := m.staged[id]
-	if !ok {
-		decoded, err := decodeConfig(rec.Document)
-		if err != nil {
-			return "", fmt.Errorf("bundle %s no longer decodes: %w", id, err)
-		}
-		cfg = &decoded
+	// Read and decoded here, the same way Recover does it, rather than taken from
+	// a cache the stage filled. Caching saved one decode out of a commit that
+	// spends most of its time in fsync-and-rename cycles, and cost a resident
+	// decoded Config per abandoned stage.
+	cfg, err := decodeConfig(rec.Document)
+	if err != nil {
+		return "", fmt.Errorf("bundle %s no longer decodes: %w", id, err)
 	}
 
 	generation := uint64(1)
 	if prev := m.active.Load(); prev != nil {
 		generation = prev.generation + 1
 	}
-	next := *cfg
-	next.generation = generation
+	cfg.generation = generation
 
 	rec.State = bundleActive
 	rec.ActivatedAt = time.Now().Unix()
@@ -224,7 +228,7 @@ func (m *bundleManager) Commit(id, expectedActive string) (string, error) {
 		}
 	}
 
-	m.setActive(id, rec.Digest, &next)
+	m.setActive(id, rec.Digest, &cfg)
 	delete(m.staged, id)
 	m.publish("info", fmt.Sprintf("committed bundle %s as generation %d", id, generation))
 	return rec.Digest, nil
@@ -261,7 +265,7 @@ func (m *bundleManager) Purge() error {
 	empty := ""
 	m.activeID.Store(&empty)
 	m.activeDigest.Store(&empty)
-	m.staged = map[string]*Config{}
+	m.staged = map[string]struct{}{}
 	m.publish("warn", "purged all bundle state")
 	return m.store.Purge()
 }
