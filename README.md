@@ -60,15 +60,42 @@ traffic.
 ## State ownership
 
 The sidecar owns its state under `--bundle-store` (default
-`/var/lib/5gpn-intercept`). Bundles are written with atomic rename, an fsync of
-both the file and its directory, and a per-record integrity digest. A store
-written by a newer schema is refused rather than repaired, so a downgrade has to
-be a deliberate purge.
+`/var/lib/5gpn-intercept`): both the bundles and the extensions' persistent
+storage, so moving the flag moves all of it. Bundles are written with atomic
+rename, an fsync of both the file and its directory, and a per-record integrity
+digest. A store written by a newer schema is refused rather than repaired, so a
+downgrade has to be a deliberate purge.
 
 On restart it reloads the bundle it was serving. An unusable artifact is logged
 and skipped rather than fatal: serving nothing is the safe state, because
 mihomo's capture rules treat a processor with no bundle as not ready and fail
 closed on it.
+
+### The sidecar does not consult a mihomo generation socket
+
+Revocation is a push. A bundle stops being served when the coordinator commits a
+different one or calls `DELETE /bundles`, and mihomo fails closed on a processor
+that reports none. There is no second opinion asked of the gateway at request
+time.
+
+This is worth stating because the repository once claimed otherwise. Commit
+`658b400` said "the processor now resolves the generation it is allowed to work
+under from mihomo's read-only generation socket, at every boundary", and added a
+`mihomo_generation.go` that implemented exactly that. Nothing ever called it, and
+nothing ever created the socket it dialled — the commit added those two files and
+changed nothing else. The design it belonged to was replaced by this component
+owning its own bundle store, so the file has been deleted rather than wired up:
+wiring it up would reintroduce the second commit point the file itself forbade,
+and its `capture()` treats an unreadable socket as a refusal, so enabling it
+against a socket no one creates would fail closed on every request.
+
+Two functions that look similarly unused are **not** dead and must not be
+removed: `activeModuleUpstreamTarget` and `mappedInterceptTarget` have no
+production caller because production dialling goes through
+`upstreamTargetProjection`, but they are the naive reference implementation that
+`transport_projection_test.go` differentially tests the compiled matcher against.
+Deleting them removes the only cross-check between the two allowlist
+implementations.
 
 ### Migration from the file
 
