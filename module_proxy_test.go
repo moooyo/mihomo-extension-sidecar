@@ -1608,3 +1608,49 @@ func (w *controlledResponseWriter) Write(body []byte) (int, error) {
 func (w *controlledResponseWriter) FlushError() error {
 	return w.flushErr
 }
+
+// MaxBodyBytes bounds the projection an action is handed, not what the upstream
+// is allowed to send. Reading the upstream response with it made the smallest
+// legal value a ceiling on the whole response: readBounded failed before the
+// per-rule check could exempt a "none" mode action, and because the upstream
+// request had already succeeded the client got a 502 for a response the
+// extension never even looked at.
+func TestResponseActionLimitDoesNotBoundTheUpstreamBody(t *testing.T) {
+	t.Parallel()
+	source := `function transform() { return {response: {headers: {"X-Marked": ["1"]}}} }`
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	rule := nativeRuntimeRule(source, "response", "none")
+	rule.MaxBodyBytes = 1024
+	module.Scripts = []ScriptRule{rule}
+	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	scripts := []matchedScriptRule{{Module: module, Rule: rule}}
+
+	for _, size := range []int{1024, 1025, 64 << 10} {
+		request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
+		response := &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), size))),
+		}
+		transformed, err := (&interceptProxy{scripts: newScriptRuntime()}).transformModuleResponse(request, response, cfg, scripts)
+		if err != nil {
+			t.Fatalf("a %d byte upstream body failed a body_mode=none action with max_body_bytes=%d: %v", size, rule.MaxBodyBytes, err)
+		}
+		if transformed == nil || transformed.Header.Get("X-Marked") != "1" {
+			t.Fatalf("a %d byte upstream body did not run the action: transformed=%+v", size, transformed)
+		}
+	}
+
+	// The per-rule limit still applies to an action that does read the body.
+	reading := rule
+	reading.BodyMode = "text"
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
+	response := &http.Response{
+		StatusCode: http.StatusOK, Header: make(http.Header),
+		Body: io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), 1025))),
+	}
+	_, err := (&interceptProxy{scripts: newScriptRuntime()}).transformModuleResponse(request, response, cfg, []matchedScriptRule{{Module: module, Rule: reading}})
+	if err == nil {
+		t.Fatal("a body_mode=text action accepted a body over its own max_body_bytes")
+	}
+}

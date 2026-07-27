@@ -322,15 +322,12 @@ func (p *interceptProxy) transformModuleResponse(
 		URL: request.URL.String(), Method: request.Method, StatusCode: response.StatusCode,
 		Headers: cloneProxyHeaders(response.Header),
 	}
-	limit := int64(1024)
-	for _, matched := range scripts {
-		if matched.Rule.MaxBodyBytes > limit {
-			limit = matched.Rule.MaxBodyBytes
-		}
-	}
-	if limit > maxModuleHTTPBody {
-		limit = maxModuleHTTPBody
-	}
+	// MaxBodyBytes bounds what an action is willing to be handed, not what the
+	// upstream is allowed to send. Reading with it made the smallest legal value
+	// a ceiling on the whole response: readBounded failed before the per-rule
+	// check below could exempt a "none" mode action, and the upstream request had
+	// already succeeded, so the client got a 502. The request path already reads
+	// with the global cap and checks per rule afterwards.
 	responseHeaders, err := exportedHeaders(response.Header)
 	if err != nil {
 		return nil, fmt.Errorf("upstream response headers: %w", err)
@@ -340,14 +337,14 @@ func (p *interceptProxy) transformModuleResponse(
 	if err != nil {
 		return nil, err
 	}
-	body, err := readBounded(response.Body, limit)
+	body, err := readBounded(response.Body, maxModuleHTTPBody)
 	if err != nil {
 		return nil, err
 	}
 	if encoding == "" && isGzip(body) {
 		encoding = "gzip"
 	}
-	body, err = decodeContentBody(body, encoding, limit)
+	body, err = decodeContentBody(body, encoding, maxModuleHTTPBody)
 	if err != nil {
 		return nil, err
 	}
