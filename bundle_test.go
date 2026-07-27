@@ -116,8 +116,11 @@ func TestBundleCommitCASAndIdempotence(t *testing.T) {
 	if m.ActiveID() != "b1" {
 		t.Fatalf("active = %q, want b1", m.ActiveID())
 	}
-	if cfg := m.Active(); cfg == nil || cfg.generation != 1 {
-		t.Fatalf("generation = %v, want 1", cfg)
+	// The manager counts its own activations. Config.generation belongs to
+	// configStore, which is the only thing that sees both this manager and the
+	// file it migrated away from.
+	if m.Active() == nil || m.Generation() != 1 {
+		t.Fatalf("generation = %d, want 1", m.Generation())
 	}
 
 	// A coordinator that lost the response repeats the call. It must get the
@@ -146,8 +149,8 @@ func TestBundleCommitAdvancesGeneration(t *testing.T) {
 	if _, err := m.Commit("b2", "b1"); err != nil {
 		t.Fatalf("commit b2: %v", err)
 	}
-	if cfg := m.Active(); cfg == nil || cfg.generation != 2 {
-		t.Fatalf("generation did not advance: %v", cfg)
+	if m.Active() == nil || m.Generation() != 2 {
+		t.Fatalf("generation did not advance: %d", m.Generation())
 	}
 	// The superseded bundle is retained so a rollback does not need the
 	// coordinator to re-upload it.
@@ -458,13 +461,12 @@ func TestReadbackNeverStraddlesAnActivation(t *testing.T) {
 	manager := newBundleManager(store, nil)
 
 	type activation struct {
-		id         string
-		digest     string
-		generation uint64
+		id     string
+		digest string
 	}
 	activations := []activation{
-		{id: "bundle-aaaa", digest: "digest-aaaa", generation: 1},
-		{id: "bundle-bbbb", digest: "digest-bbbb", generation: 2},
+		{id: "bundle-aaaa", digest: "digest-aaaa"},
+		{id: "bundle-bbbb", digest: "digest-bbbb"},
 	}
 	expected := map[string]activation{}
 	for _, a := range activations {
@@ -483,7 +485,7 @@ func TestReadbackNeverStraddlesAnActivation(t *testing.T) {
 			}
 			a := activations[index%len(activations)]
 			manager.mu.Lock()
-			manager.setActive(a.id, a.digest, &Config{generation: a.generation})
+			manager.setActive(a.id, a.digest, &Config{})
 			manager.mu.Unlock()
 		}
 	}()
@@ -500,7 +502,7 @@ func TestReadbackNeverStraddlesAnActivation(t *testing.T) {
 		if !ok {
 			t.Fatalf("readback reported an id nothing ever activated: %q", rb.ActiveBundle)
 		}
-		if rb.ActiveDigest != want.digest || rb.Generation != want.generation {
+		if rb.ActiveDigest != want.digest {
 			torn++
 		}
 	}

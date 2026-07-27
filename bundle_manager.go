@@ -38,6 +38,12 @@ type bundleManager struct {
 	// this sidecar restarted and that nothing it attested before still holds.
 	instanceID string
 
+	// generation counts activations of this manager, for the readback the
+	// coordinator reconciles against. It is not the data plane's comparison key:
+	// configStore assigns that, because it is the only thing that sees both this
+	// manager and the file it migrated away from.
+	generation atomic.Uint64
+
 	// staged names the bundles this process staged and has not committed or
 	// aborted yet. It deliberately holds no configuration: the decoded one used to
 	// live here so a commit could skip re-reading, which made a bundle that was
@@ -96,6 +102,10 @@ func (m *bundleManager) ActiveDigest() string {
 // deployment that has never been pushed a bundle.
 func (m *bundleManager) Migrated() bool { return m.migrated.Load() }
 
+// Generation reports how many times this process has made a bundle live, or 0
+// when it is serving none.
+func (m *bundleManager) Generation() uint64 { return m.generation.Load() }
+
 func (m *bundleManager) setActive(id, digest string, cfg *Config) {
 	m.active.Store(cfg)
 	m.activeID.Store(&id)
@@ -128,7 +138,7 @@ func (m *bundleManager) Recover() error {
 	if err != nil {
 		return fmt.Errorf("recover bundle %s: %w", ptr.Active, err)
 	}
-	cfg.generation = 1
+	m.generation.Store(1)
 	m.setActive(rec.ID, rec.Digest, &cfg)
 	m.publish("info", "recovered bundle "+rec.ID+" after restart")
 	return nil
@@ -218,12 +228,6 @@ func (m *bundleManager) Commit(id, expectedActive string) (string, error) {
 		return "", fmt.Errorf("bundle %s no longer decodes: %w", id, err)
 	}
 
-	generation := uint64(1)
-	if prev := m.active.Load(); prev != nil {
-		generation = prev.generation + 1
-	}
-	cfg.generation = generation
-
 	rec.State = bundleActive
 	rec.ActivatedAt = time.Now().Unix()
 	if err := m.store.Put(rec); err != nil {
@@ -242,6 +246,7 @@ func (m *bundleManager) Commit(id, expectedActive string) (string, error) {
 	}
 
 	m.setActive(id, rec.Digest, &cfg)
+	generation := m.generation.Add(1)
 	delete(m.staged, id)
 	m.publish("info", fmt.Sprintf("committed bundle %s as generation %d", id, generation))
 	m.pruneSuperseded(current)
@@ -347,6 +352,7 @@ func (m *bundleManager) Purge() error {
 	defer m.mu.Unlock()
 
 	m.active.Store(nil)
+	m.generation.Store(0)
 	empty := ""
 	m.activeID.Store(&empty)
 	m.activeDigest.Store(&empty)
@@ -392,7 +398,7 @@ func (m *bundleManager) Readback(version string) bundleReadback {
 		Version:      version,
 	}
 	if cfg := m.active.Load(); cfg != nil {
-		rb.Generation = cfg.generation
+		rb.Generation = m.Generation()
 		rb.MasterEnabled = cfg.MITM.Enabled
 		rb.Extensions = len(cfg.Modules)
 		hosts := map[string]struct{}{}

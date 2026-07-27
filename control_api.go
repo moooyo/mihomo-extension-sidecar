@@ -215,11 +215,9 @@ func (c *controlServer) handleCommit(w http.ResponseWriter, r *http.Request) {
 		c.writeError(w, err)
 		return
 	}
-	var generation uint64
-	if cfg := c.manager.Active(); cfg != nil {
-		generation = cfg.generation
-	}
-	c.writeJSON(w, http.StatusOK, commitResponse{BundleID: id, Digest: digest, Generation: generation})
+	// The manager owns the count, so it is read back from there rather than from
+	// the snapshot's data-plane generation, which configStore assigns.
+	c.writeJSON(w, http.StatusOK, commitResponse{BundleID: id, Digest: digest, Generation: c.manager.Generation()})
 }
 
 func (c *controlServer) handleAbort(w http.ResponseWriter, r *http.Request) {
