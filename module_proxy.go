@@ -111,7 +111,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	if incoming.ContentLength > maxModuleHTTPBody {
 		return nil, false, false, fmt.Errorf("request exceeds %d bytes", maxModuleHTTPBody)
 	}
-	requestHeaders, err := exportedHeaders(cloneProxyHeaders(incoming.Header))
+	requestHeaders, err := exportedHeaders(incoming.Header)
 	if err != nil {
 		return nil, false, false, fmt.Errorf("request headers: %w", err)
 	}
@@ -337,7 +337,6 @@ func (p *interceptProxy) transformModuleResponse(
 	}
 	responseMessage := scriptMessage{
 		URL: request.URL.String(), Method: request.Method, StatusCode: response.StatusCode,
-		Headers: cloneProxyHeaders(response.Header),
 	}
 	// MaxBodyBytes bounds what an action is willing to be handed, not what the
 	// upstream is allowed to send. Reading with it made the smallest legal value
