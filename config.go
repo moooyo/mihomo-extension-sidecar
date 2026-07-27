@@ -753,6 +753,23 @@ func moduleOwnsHost(module Module, host string) bool {
 	return false
 }
 
+// moduleCapturesHost answers whether host falls inside this module's capture
+// hosts, preferring the snapshot's compiled matcher.
+//
+// Same shape as activeInterceptHost above: compiled matcher when the snapshot has
+// one, linear scan only for a Config that was never compiled. The request path
+// always has one, so computing the scan first and then overwriting it — which is
+// what the callers used to do — walked up to maxModuleCaptureHosts patterns per
+// request for a result nothing ever read.
+func moduleCapturesHost(cfg Config, module Module, host string) bool {
+	if cfg.runtime != nil {
+		if matcher := cfg.runtime.moduleHosts[module.ID]; matcher != nil {
+			return matcher.Match(host)
+		}
+	}
+	return moduleOwnsHost(module, host)
+}
+
 func mappedInterceptTarget(cfg Config, host string) string {
 	host = canonicalHost(host)
 	bestPattern := ""

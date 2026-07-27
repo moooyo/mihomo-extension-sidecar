@@ -31,11 +31,7 @@ func authorizeModuleRequestURLRewriteConfig(cfg Config, module Module, currentUR
 	}
 
 	if targetOrigin == currentOrigin {
-		ownsHost := moduleOwnsHost(module, target.Hostname())
-		if cfg.runtime != nil && cfg.runtime.moduleHosts[module.ID] != nil {
-			ownsHost = cfg.runtime.moduleHosts[module.ID].Match(target.Hostname())
-		}
-		if !ownsHost && !moduleDeclaresNetworkOrigin(module, targetOrigin) {
+		if !moduleCapturesHost(cfg, module, target.Hostname()) && !moduleDeclaresNetworkOrigin(module, targetOrigin) {
 			return nil, errors.New("same-origin rewrite target is outside the extension boundary")
 		}
 		// Same-origin rewrites retain the existing URL representation behavior.
@@ -70,11 +66,7 @@ func authorizeModuleRequestActionURL(cfg Config, module Module, rawURL string) e
 	if err != nil {
 		return fmt.Errorf("current request URL is invalid: %w", err)
 	}
-	ownsHost := moduleOwnsHost(module, parsed.Hostname())
-	if cfg.runtime != nil && cfg.runtime.moduleHosts[module.ID] != nil {
-		ownsHost = cfg.runtime.moduleHosts[module.ID].Match(parsed.Hostname())
-	}
-	if ownsHost || moduleDeclaresNetworkOrigin(module, origin) {
+	if moduleCapturesHost(cfg, module, parsed.Hostname()) || moduleDeclaresNetworkOrigin(module, origin) {
 		return nil
 	}
 	return fmt.Errorf("current request origin %q is outside this extension's capture hosts and declared network origins", origin)
