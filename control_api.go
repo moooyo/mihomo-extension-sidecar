@@ -165,9 +165,10 @@ func (c *controlServer) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *controlServer) handlePlugins(w http.ResponseWriter, r *http.Request) {
+	activeBundle, plugins := c.manager.Plugins()
 	c.writeJSON(w, http.StatusOK, map[string]any{
-		"activeBundle": c.manager.ActiveID(),
-		"plugins":      c.manager.Plugins(),
+		"activeBundle": activeBundle,
+		"plugins":      plugins,
 	})
 }
 

@@ -436,10 +436,20 @@ type pluginStatus struct {
 // The console previously had to infer this from the coordinator's copy of the
 // document. Serving it from the process that actually runs the plugins means
 // what the operator sees is what is executing.
-func (m *bundleManager) Plugins() []pluginStatus {
+// Plugins reports the active bundle id and its per-extension state, in
+// execution order.
+//
+// The id is returned alongside the list, sampled under the same m.mu, because
+// two separate loads from the handler can label one bundle's extensions with
+// another bundle's id.
+func (m *bundleManager) Plugins() (string, []pluginStatus) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	activeID := m.ActiveID()
 	cfg := m.active.Load()
 	if cfg == nil {
-		return []pluginStatus{}
+		return activeID, []pluginStatus{}
 	}
 	order := make(map[string]int, len(cfg.ExecutionOrder))
 	for i, id := range cfg.ExecutionOrder {
@@ -460,7 +470,7 @@ func (m *bundleManager) Plugins() []pluginStatus {
 			Order:        order[mod.ID],
 		})
 	}
-	return out
+	return activeID, out
 }
 
 func (m *bundleManager) publish(level, message string) {
