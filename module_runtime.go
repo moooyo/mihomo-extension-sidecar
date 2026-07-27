@@ -649,7 +649,10 @@ func scriptMessageObject(vm *goja.Runtime, message scriptMessage, bodyMode strin
 	switch bodyMode {
 	case "none":
 	case "text":
-		object["body"] = string(message.Body)
+		// A Go string in the map is re-imported, and re-scanned for its unicode
+		// shape, on every property read. Importing it once here is what the
+		// binary branch below already does.
+		object["body"] = vm.ToValue(string(message.Body))
 	case "binary":
 		constructor, ok := goja.AssertConstructor(vm.Get("Uint8Array"))
 		if !ok {
