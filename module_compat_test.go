@@ -278,3 +278,39 @@ func TestSerializeCompatArgumentIsStableAndBounded(t *testing.T) {
 		t.Fatalf("argument = %q, want %q", argument, strings.ReplaceAll(want, " ", ""))
 	}
 }
+
+func TestCompatResultUnwrapsAHostImportedBody(t *testing.T) {
+	t.Parallel()
+	// scriptMessageObject imports the body once as a goja value. A bundle that
+	// hands $response straight back to $done returns that member unchanged, so
+	// exporting the outer object leaves the body wrapped and the patch would be
+	// rejected as neither a string nor a Uint8Array.
+	vm := goja.New()
+	loop := newAsyncLoop()
+	defer loop.close()
+	options := compatFixtureOptions()
+	options.response = map[string]any{
+		"status":  200,
+		"headers": map[string]any{},
+		"body":    vm.ToValue("imported"),
+	}
+	entry, err := installProxyCompatAPI(vm, loop, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vm.RunString(`$done($response)`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := loop.wait(ctx, entry.settled); err != nil {
+		t.Fatal(err)
+	}
+	result, err := parseCompatScriptResult(entry.result, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := string(result.Body); got != "imported" {
+		t.Fatalf("body = %q, want %q", got, "imported")
+	}
+}

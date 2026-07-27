@@ -371,6 +371,17 @@ func compatArgumentValue(value any) string {
 	}
 }
 
+// unwrapCompatValue exports a value that is still a goja value. The host hands
+// the bundle a $response whose body was imported once as a goja value, and a
+// bundle that passes that object straight back to $done returns the member
+// unchanged, so exporting the outer object leaves it wrapped.
+func unwrapCompatValue(raw any) any {
+	if value, ok := raw.(goja.Value); ok {
+		return value.Export()
+	}
+	return raw
+}
+
 func flatCompatHeaders(headers map[string][]string) map[string]string {
 	flat := make(map[string]string, len(headers))
 	for name, values := range headers {
@@ -399,16 +410,16 @@ func parseCompatScriptResult(value goja.Value, responsePhase bool) (scriptResult
 	for key, raw := range patch {
 		switch key {
 		case "status", "headers", "body", "trailers":
-			projection[key] = raw
+			projection[key] = unwrapCompatValue(raw)
 		case "bodyBytes":
 			// body wins when a bundle sets both, matching how the util mirrors
 			// a binary payload before completing.
 			if _, exists := projection["body"]; !exists {
-				projection["body"] = raw
+				projection["body"] = unwrapCompatValue(raw)
 			}
 		case "statusCode":
 			if _, exists := projection["status"]; !exists {
-				projection["status"] = raw
+				projection["status"] = unwrapCompatValue(raw)
 			}
 		default:
 			// Bundles carry transport hints such as policy or url through the
