@@ -18,7 +18,7 @@ import (
 // A jq action never enters the JavaScript runtime at all. No VM, no event loop,
 // no proxy-client globals: the body is decoded, transformed, and re-encoded.
 const (
-	maxJQProgramBytes = 8192
+	maxJQProgramBytes = 32768
 	maxJQOutputBytes  = 64 << 20
 )
 
