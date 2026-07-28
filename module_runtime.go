@@ -268,6 +268,20 @@ func scriptSettingValues(module Module, rule ScriptRule) (map[string]any, error)
 	return moduleSettingValues(module)
 }
 
+// actionGateOpen reports whether an action's enabled_when permits it to run.
+//
+// Only an explicit false closes the gate. An action with no gate, or one whose
+// setting resolves to anything else, stays compiled: a document that reached
+// this point has already been validated, and between wrongly dropping an action
+// and wrongly keeping one, dropping is the failure an operator cannot see.
+func actionGateOpen(rule ScriptRule, settings map[string]any) bool {
+	if rule.EnabledWhen == "" {
+		return true
+	}
+	enabled, ok := settings[rule.EnabledWhen].(bool)
+	return !ok || enabled
+}
+
 func cloneScriptSettings(settings map[string]any) map[string]any {
 	clone := make(map[string]any, len(settings))
 	for key, value := range settings {
@@ -1111,6 +1125,14 @@ func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*
 			hosts:  compiled.moduleHosts[module.ID],
 		}
 		for _, rule := range module.Scripts {
+			// A closed gate removes the action here rather than at match time:
+			// it never becomes a compiledScriptRule, so nothing matches it and
+			// no request pays for the check. validateActionGate has already
+			// established that the named setting is a required boolean, so an
+			// enabled module always has a value to read.
+			if !actionGateOpen(rule, settings) {
+				continue
+			}
 			path, err := regexp.Compile(rule.Match.PathRegex)
 			if err != nil {
 				return nil, fmt.Errorf("extension %s action %s path_regex: %w", module.ID, rule.ID, err)

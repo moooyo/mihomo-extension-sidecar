@@ -32,7 +32,12 @@ import (
 const (
 	// controlAPISchema is the version this build speaks. A coordinator that
 	// does not understand it must refuse rather than guess.
-	controlAPISchema = 1
+	//
+	// 2 added ScriptRule.enabled_when. The document decoder rejects unknown
+	// fields, so a coordinator that emits it to a schema-1 build loses its whole
+	// configuration rather than one action; the version is what makes that a
+	// refusal at connect time instead.
+	controlAPISchema = 2
 
 	controlMaxRequestBytes = 32 << 20
 	controlReadTimeout     = 30 * time.Second

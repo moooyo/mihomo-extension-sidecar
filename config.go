@@ -85,13 +85,24 @@ type ActionMatch struct {
 }
 
 type ScriptRule struct {
-	ID           string      `json:"id"`
-	Phase        string      `json:"phase"`
-	Match        ActionMatch `json:"match"`
-	ScriptURL    string      `json:"script_url,omitempty"`
-	ScriptDigest string      `json:"script_digest"`
-	ScriptBody   string      `json:"script_body"`
-	BodyMode     string      `json:"body_mode"`
+	ID    string      `json:"id"`
+	Phase string      `json:"phase"`
+	Match ActionMatch `json:"match"`
+	// EnabledWhen names a required boolean setting of the same extension. When
+	// that setting is false the action is not compiled into a matcher at all,
+	// so it never runs and costs nothing per request.
+	//
+	// Upstream plugin formats gate a script entry from outside the script --
+	// Loon writes enable={switch} on the entry rather than passing the key to
+	// it -- and a bundle therefore never reads that key. Without this an
+	// extension carrying such a switch has a setting that silently does
+	// nothing: the entry runs whatever the operator chose, including the
+	// requests it makes to third parties.
+	EnabledWhen  string `json:"enabled_when,omitempty"`
+	ScriptURL    string `json:"script_url,omitempty"`
+	ScriptDigest string `json:"script_digest"`
+	ScriptBody   string `json:"script_body"`
+	BodyMode     string `json:"body_mode"`
 	// Entry selects the script contract. The empty value is the native
 	// transform(context) entry point; "proxy-compat" runs a published
 	// proxy-client bundle, which signals completion by calling $done. The mode
@@ -942,6 +953,9 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if err := validateActionMatch(module.CaptureHosts, rule.Phase, rule.Match); err != nil {
 				return fmt.Errorf("extension %q action %q: %w", module.ID, rule.ID, err)
 			}
+			if err := validateActionGate(module, rule); err != nil {
+				return fmt.Errorf("extension %q action %q: %w", module.ID, rule.ID, err)
+			}
 			if len(rule.ScriptURL) > 4096 || (rule.ScriptURL != "" && !validSnapshotURL(rule.ScriptURL)) {
 				return fmt.Errorf("extension %q action %q URL is invalid", module.ID, rule.ID)
 			}
@@ -1165,6 +1179,44 @@ func validateActionMatch(captureHosts []string, phase string, match ActionMatch)
 		}
 	}
 	return nil
+}
+
+// validateActionGate checks an action's enabled_when against the settings its
+// own extension declares.
+//
+// The named setting must be boolean and required. Required is the load-bearing
+// half: an enabled module's required settings always carry a concrete value, so
+// a gate always has a decidable state. Allowing an optional setting would
+// introduce a third case -- declared, gating an action, and unset -- whose only
+// answers are "run something the operator may have switched off" and "silently
+// drop an action". Refusing it here means neither has to be chosen later.
+func validateActionGate(module Module, rule ScriptRule) error {
+	if rule.EnabledWhen == "" {
+		return nil
+	}
+	if !validSettingKey(rule.EnabledWhen) {
+		return fmt.Errorf("enabled_when %q is not a valid setting key", rule.EnabledWhen)
+	}
+	for _, setting := range module.Settings {
+		if setting.Key != rule.EnabledWhen {
+			continue
+		}
+		if setting.Type != "boolean" {
+			return fmt.Errorf("enabled_when %q names a %s setting; only boolean is supported", rule.EnabledWhen, setting.Type)
+		}
+		if !setting.Required {
+			return fmt.Errorf("enabled_when %q names an optional setting; a gate must name a required one", rule.EnabledWhen)
+		}
+		if !module.Enabled {
+			return nil
+		}
+		var value bool
+		if err := json.Unmarshal(setting.Value, &value); err != nil {
+			return fmt.Errorf("enabled_when %q has no usable boolean value: %w", rule.EnabledWhen, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("enabled_when %q names a setting this extension does not declare", rule.EnabledWhen)
 }
 
 func validateModuleSettings(settings []ModuleSetting, requireReady bool) error {

@@ -1072,3 +1072,82 @@ func TestHostTargetRefusesNonGlobalAddresses(t *testing.T) {
 		}
 	}
 }
+
+// An upstream plugin format gates a script entry from outside the script, so a
+// bundle never reads the key that switches it. Carrying that key as an ordinary
+// setting gave an extension a switch that silently did nothing. These two tests
+// hold the contract that makes it mean something: the gate must name a setting
+// the operator actually has, and a closed gate must remove the action rather
+// than let it run and decline.
+func TestActionGateMustNameARequiredBooleanSetting(t *testing.T) {
+	t.Parallel()
+	booleanSetting := func(required bool, value string) []ModuleSetting {
+		return []ModuleSetting{{
+			Key: "airborne", Type: "boolean", Required: required,
+			Default: json.RawMessage(`true`), Value: json.RawMessage(value),
+		}}
+	}
+
+	cfg := validNativeConfig()
+	cfg.Modules[0].Scripts[0].EnabledWhen = "airborne"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "does not declare") {
+		t.Fatalf("undeclared gate setting error = %v", err)
+	}
+
+	cfg.Modules[0].Scripts[0].EnabledWhen = "not a key"
+	cfg.Modules[0].Settings = booleanSetting(true, `true`)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not a valid setting key") {
+		t.Fatalf("malformed gate key error = %v", err)
+	}
+
+	cfg.Modules[0].Scripts[0].EnabledWhen = "airborne"
+	cfg.Modules[0].Settings = []ModuleSetting{{
+		Key: "airborne", Type: "text", Required: true,
+		Default: json.RawMessage(`"on"`), Value: json.RawMessage(`"on"`),
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "only boolean is supported") {
+		t.Fatalf("non-boolean gate error = %v", err)
+	}
+
+	cfg.Modules[0].Settings = booleanSetting(false, `true`)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must name a required one") {
+		t.Fatalf("optional gate setting error = %v", err)
+	}
+
+	cfg.Modules[0].Settings = booleanSetting(true, `true`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid gate rejected: %v", err)
+	}
+}
+
+func TestClosedActionGateRemovesTheCompiledRule(t *testing.T) {
+	t.Parallel()
+	compiledRules := func(t *testing.T, value string) int {
+		t.Helper()
+		cfg := validNativeConfig()
+		cfg.Modules[0].Settings = []ModuleSetting{{
+			Key: "airborne", Type: "boolean", Required: true,
+			Default: json.RawMessage(`true`), Value: json.RawMessage(value),
+		}}
+		cfg.Modules[0].Scripts[0].EnabledWhen = "airborne"
+		body, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := decodeConfig(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(loaded.runtime.modules) != 1 {
+			t.Fatalf("compiled modules = %d", len(loaded.runtime.modules))
+		}
+		return len(loaded.runtime.modules[0].rules)
+	}
+
+	if got := compiledRules(t, `true`); got != 1 {
+		t.Fatalf("open gate compiled %d rules", got)
+	}
+	if got := compiledRules(t, `false`); got != 0 {
+		t.Fatalf("closed gate compiled %d rules; the action must not be matchable at all", got)
+	}
+}
