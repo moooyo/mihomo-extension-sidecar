@@ -68,7 +68,8 @@ func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOpti
 		return nil, err
 	}
 
-	// The Surge completion branch reads $script.startTime before calling $done.
+	// The completion branch reads $script.startTime before calling $done, on
+	// Loon as well as the personas this runtime does not serve.
 	// A TypeError there would be swallowed by the bundle's .finally() and the
 	// action would hang until its deadline instead of failing.
 	script := vm.NewObject()
@@ -151,8 +152,8 @@ func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOpti
 
 	// The gateway has no channel to deliver an operator notification on, so this
 	// records the call through the action's own console budget rather than
-	// pretending to deliver it. It has to exist: the bundles' Surge branch calls
-	// it from their error and status paths.
+	// pretending to deliver it. It has to exist: the bundles call it from their
+	// error and status paths.
 	notification := vm.NewObject()
 	if err := notification.Set("post", func(call goja.FunctionCall) goja.Value {
 		compatLogNotification(vm, call)
@@ -275,7 +276,7 @@ func compatPersistentStore(vm *goja.Runtime, storage *goja.Object) (*goja.Object
 	return store, nil
 }
 
-// compatHTTPClient exposes the Surge-style callback network API. The blocking
+// compatHTTPClient exposes the callback network API $httpClient names on Loon. The blocking
 // request runs on a worker goroutine and its completion is posted back to the
 // goroutine that owns the VM, because goja is not goroutine-safe.
 func compatHTTPClient(vm *goja.Runtime, loop *asyncLoop, requester *moduleNetworkRequester) (*goja.Object, error) {
@@ -488,10 +489,6 @@ func parseCompatScriptResult(value goja.Value, responsePhase bool) (scriptResult
 			// a binary payload before completing.
 			if _, exists := projection["body"]; !exists {
 				projection["body"] = unwrapCompatValue(raw)
-			}
-		case "statusCode":
-			if _, exists := projection["status"]; !exists {
-				projection["status"] = unwrapCompatValue(raw)
 			}
 		default:
 			// Bundles carry transport hints such as policy or url through the

@@ -69,9 +69,9 @@ func compatHTTPFixture(t *testing.T, handler http.HandlerFunc) (*moduleNetworkRe
 	return requester, "https://api.example.com:" + port
 }
 
-func TestCompatHTTPClientDeliversTheSurgeCallbackShape(t *testing.T) {
+func TestCompatHTTPClientDeliversTheCallbackShape(t *testing.T) {
 	t.Parallel()
-	// Surge hands the callback (error, response, body). The bundles reject on a
+	// $httpClient hands the callback (error, response, body). The bundles reject on a
 	// truthy first argument and otherwise read response.status and the body as
 	// the third argument, so all three positions have to be right.
 	requester, origin := compatHTTPFixture(t, func(w http.ResponseWriter, r *http.Request) {

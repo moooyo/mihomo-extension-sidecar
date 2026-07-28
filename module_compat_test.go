@@ -413,7 +413,7 @@ func TestCompatUtilsUngzipStaysInsideTheActionBudget(t *testing.T) {
 }
 func TestCompatNotificationIsDefinedAndRoutesToConsole(t *testing.T) {
 	t.Parallel()
-	// Both published bundles call $notification.post from their Surge error and
+	// Both published bundles call $notification.post from their error and
 	// status paths. Leaving it undefined throws inside the bundle's own catch,
 	// which then still calls $done — the failure looks like a silent no-op.
 	result, err := runCompatScript(t, `
