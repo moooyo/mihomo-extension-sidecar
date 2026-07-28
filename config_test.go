@@ -1048,7 +1048,7 @@ func TestCompiledConfigPreservesActiveAndMappedHostSemantics(t *testing.T) {
 // behaviour is not.
 func TestHostTargetAcceptsEveryLoonForm(t *testing.T) {
 	for _, target := range []string{
-		"203.0.113.9",       // address
+		"203.0.113.9",        // address
 		"origin.example.com", // alias
 		"server:1.1.1.1",     // resolver
 		"server:1.1.1.1,9.9.9.9",
