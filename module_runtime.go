@@ -140,9 +140,21 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		}
 		r.logs.Publish(event)
 	}()
-	// A jq action is declarative and never reaches the JavaScript runtime: no
-	// VM, no event loop, no proxy-client globals.
-	if rule.JQProgram != "" {
+	// Six declarative kinds, none of which reaches the JavaScript runtime: no
+	// VM, no event loop, no proxy-client globals. Dispatch happens before the
+	// script is compiled, because a declarative action carries none.
+	switch {
+	case rule.Reject:
+		return scriptResult{Abort: true}, nil
+	case rule.Mock != nil:
+		return executeMock(rule, response != nil)
+	case rule.Headers != nil:
+		return executeHeaderEdits(rule, request, response)
+	case rule.Rewrite != nil:
+		return executeRewrite(rule, request)
+	case rule.ReplaceBody != nil:
+		return executeBodyReplace(rule, module, request, response)
+	case rule.JQProgram != "":
 		return r.executeJQ(actionCtx, module, rule, request, response)
 	}
 	program, err := scriptProgram(module, rule)

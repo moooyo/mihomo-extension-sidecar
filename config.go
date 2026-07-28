@@ -105,9 +105,15 @@ type ScriptRule struct {
 	// carried a 57-byte script to do.
 	Reject bool `json:"reject,omitempty"`
 	// Mock answers with a fixed reply instead of running anything.
-	Mock         *MockResponse `json:"mock,omitempty"`
-	TimeoutMS    int           `json:"timeout_ms"`
-	MaxBodyBytes int64         `json:"max_body_bytes"`
+	Mock *MockResponse `json:"mock,omitempty"`
+	// Headers edits header fields on a real message without replacing it.
+	Headers *HeaderEdits `json:"headers,omitempty"`
+	// Rewrite points a request elsewhere, in place or through a redirect.
+	Rewrite *URLRewrite `json:"rewrite,omitempty"`
+	// ReplaceBody edits body bytes with a regular expression.
+	ReplaceBody  *BodyReplace `json:"replace_body,omitempty"`
+	TimeoutMS    int          `json:"timeout_ms"`
+	MaxBodyBytes int64        `json:"max_body_bytes"`
 	// program and settings belong to the immutable compiled config snapshot.
 	program  *goja.Program
 	settings map[string]any
@@ -942,24 +948,39 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			// Four kinds of action, and exactly one applies. Carrying two would
 			// leave which one runs undefined.
 			kinds := 0
-			for _, declared := range []bool{rule.JQProgram != "", rule.Reject, rule.Mock != nil, rule.ScriptBody != "" || rule.ScriptURL != ""} {
+			for _, declared := range []bool{
+				rule.JQProgram != "", rule.Reject, rule.Mock != nil, rule.Headers != nil,
+				rule.Rewrite != nil, rule.ReplaceBody != nil,
+				rule.ScriptBody != "" || rule.ScriptURL != "",
+			} {
 				if declared {
 					kinds++
 				}
 			}
 			if kinds > 1 {
-				return fmt.Errorf("extension %q action %q declares more than one of jq, reject, mock, and a script", module.ID, rule.ID)
+				return fmt.Errorf("extension %q action %q declares more than one action kind", module.ID, rule.ID)
 			}
-			if rule.Entry != "" && (rule.Reject || rule.Mock != nil || rule.JQProgram != "") {
+			declarative := rule.Reject || rule.Mock != nil || rule.JQProgram != "" ||
+				rule.Headers != nil || rule.Rewrite != nil || rule.ReplaceBody != nil
+			if rule.Entry != "" && declarative {
 				return fmt.Errorf("extension %q action %q declares an entry without a script", module.ID, rule.ID)
 			}
 			if rule.Reject {
 				continue
 			}
-			if rule.Mock != nil {
-				if err := rule.Mock.validate(); err != nil {
+			for _, validate := range []func() error{
+				func() error { return rule.Mock.validate() },
+				func() error { return rule.Headers.validate() },
+				func() error { return rule.Rewrite.validate() },
+				func() error { return rule.ReplaceBody.validate() },
+			} {
+				if err := validate(); err != nil {
 					return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
 				}
+			}
+			if rule.Mock != nil || rule.Headers != nil || rule.Rewrite != nil || rule.ReplaceBody != nil {
+				// A rewrite reads the request URL, not a body, so it is the one
+				// kind that may keep bodyMode none while still acting.
 				continue
 			}
 			if rule.JQProgram != "" {
