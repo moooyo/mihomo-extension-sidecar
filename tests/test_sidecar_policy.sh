@@ -77,12 +77,25 @@ grep -Fq 'log.Print("intercept: could not read replacement config; retaining the
     && grep -Fq 'log.Print("intercept: ignoring invalid replacement config; retaining the last valid snapshot")' "$SIDECAR_CONFIG" \
     || fail "config rejection summaries are not journald-safe"
 # Split from the gateway's copy, which scanned both trees. Each repository now
-# asserts this about its own source; the name is assembled at runtime so this
-# file does not itself contain the string it forbids.
-retired_client="$(printf '%s%s' 'lo' 'on')"
-grep -Rni "$retired_client" "$ROOT" \
-    --exclude-dir=.git --exclude-dir=tests --exclude='*.md' 2>/dev/null | grep -q . \
-    && fail "retired third-party plugin compatibility is still present"
+# asserts this about its own source; the names are assembled at runtime so this
+# file does not itself contain the strings it forbids.
+#
+# The blanket name scan this used to be is superseded by the proxy-compat
+# contract, which has to name these clients to explain itself: @nsnanocat/util
+# probes $task, $loon, $rocket and Egern before falling through to
+# $environment["surge-version"], so the runtime must leave them undefined to be
+# read as Surge. Naming them in a comment is required; defining them is the
+# thing that breaks the persona, and that is what is asserted now.
+for retired_global in "$(printf '%s%s' 'lo' 'on')" 'task' 'rocket'; do
+    grep -RnE "vm\.Set\(\"\\\$${retired_global}\"" "$ROOT" \
+        --include='*.go' --exclude-dir=.git 2>/dev/null | grep -q . \
+        && fail "the runtime defines \$${retired_global}, which selects a proxy-client branch it cannot serve"
+done
+grep -RnE 'vm\.Set\("Egern"' "$ROOT" --include='*.go' --exclude-dir=.git 2>/dev/null | grep -q . \
+    && fail "the runtime defines Egern, which selects a proxy-client branch it cannot serve"
+# The persona the compat layer does claim has to stay the one it was built for.
+grep -Fq 'surgePersonaVersion' "$ROOT/module_compat.go" \
+    || fail "the proxy-compat persona constant is gone"
 
 if [[ "$rc" == 0 ]]; then
     echo "test_sidecar_policy: PASS"
