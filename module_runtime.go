@@ -23,6 +23,7 @@ import (
 
 	"github.com/dlclark/regexp2/v2"
 	"github.com/dop251/goja"
+	"github.com/itchyny/gojq"
 )
 
 func init() {
@@ -37,6 +38,8 @@ type scriptRuntime struct {
 	statePath         string
 	networkSlots      chan struct{}
 	logs              engineLogPublisher
+	jqMu              sync.Mutex
+	jqPrograms        map[scriptProgramKey]*gojq.Code
 }
 
 // persistentSnapshot and every map reachable from it are immutable after
@@ -137,6 +140,11 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		}
 		r.logs.Publish(event)
 	}()
+	// A jq action is declarative and never reaches the JavaScript runtime: no
+	// VM, no event loop, no proxy-client globals.
+	if rule.JQProgram != "" {
+		return r.executeJQ(actionCtx, module, rule, request, response)
+	}
 	program, err := scriptProgram(module, rule)
 	if err != nil {
 		return scriptResult{}, err
@@ -155,6 +163,9 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		// Published bundles assume a browser-ish global set. Native scripts keep
 		// the smaller surface they were reviewed against.
 		if err := installWebAPI(vm); err != nil {
+			return scriptResult{}, err
+		}
+		if err := installDOMAPI(vm); err != nil {
 			return scriptResult{}, err
 		}
 	}

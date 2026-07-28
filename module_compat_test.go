@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -40,16 +41,16 @@ func compatFixtureOptions() compatOptions {
 	return compatOptions{
 		request:   map[string]any{"url": "https://api.example.com/v1", "method": "GET", "headers": map[string]any{}},
 		response:  map[string]any{"status": 200, "headers": map[string]any{}, "body": "ok"},
-		argument:  `mode="clean"&level="2"`,
+		argument:  map[string]any{"mode": "clean", "level": float64(2)},
 		startTime: time.Now(),
 	}
 }
 
-func TestCompatPersonaResolvesToSurge(t *testing.T) {
+func TestCompatPersonaResolvesToLoon(t *testing.T) {
 	t.Parallel()
-	// This is the same probe order @nsnanocat/util uses. Defining any of the
-	// earlier globals would select the wrong branch and change the bundle's
-	// network, storage, and completion shapes.
+	// This is the same probe order the published bundles use. Loon is the branch
+	// this runtime presents; $task must stay undefined or a bundle selects
+	// Quantumult X and changes its network, storage, and completion shapes.
 	source := `
 const has = (name) => name in globalThis
 let runtime
@@ -72,8 +73,8 @@ $done({ runtime, startTime: typeof $script.startTime })
 	if !ok {
 		t.Fatalf("result = %v, want an object", result)
 	}
-	if exported["runtime"] != "Surge" {
-		t.Fatalf("runtime = %v, want Surge", exported["runtime"])
+	if exported["runtime"] != "Loon" {
+		t.Fatalf("runtime = %v, want Loon", exported["runtime"])
 	}
 	if exported["startTime"] != "number" {
 		t.Fatalf("$script.startTime = %v, want a number", exported["startTime"])
@@ -103,21 +104,26 @@ func TestCompatEntryCompletesThroughDoneAfterAwait(t *testing.T) {
 	}
 }
 
-func TestCompatArgumentIsTheSerializedSettingString(t *testing.T) {
+func TestCompatArgumentIsTheDecodedSettingObject(t *testing.T) {
 	t.Parallel()
-	// The bundle runs its own parser over $argument, so the host supplies the
-	// published sgmodule's string form rather than a decoded object.
-	source := `$done({ argument: $argument, type: typeof $argument })`
+	// Loon hands the bundle a decoded object, so the declared types cross
+	// intact. Serializing into a string is what forced a per-publisher encoding
+	// guess, and a bundle that mis-parses $argument runs on its defaults
+	// silently rather than failing.
+	source := `$done({ type: typeof $argument, mode: $argument.mode, level: $argument.level, isNumber: typeof $argument.level === "number" })`
 	result, err := runCompatScript(t, source, compatFixtureOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	exported, _ := stringAnyMap(result.Export())
-	if exported["type"] != "string" {
-		t.Fatalf("$argument type = %v, want string", exported["type"])
+	if exported["type"] != "object" {
+		t.Fatalf("$argument type = %v, want object", exported["type"])
 	}
-	if exported["argument"] != `mode="clean"&level="2"` {
-		t.Fatalf("$argument = %v, want the serialized setting string", exported["argument"])
+	if exported["mode"] != "clean" {
+		t.Fatalf("$argument.mode = %v, want clean", exported["mode"])
+	}
+	if exported["isNumber"] != true {
+		t.Fatalf("$argument.level crossed as %T, want a number", exported["level"])
 	}
 }
 
@@ -146,7 +152,7 @@ func TestCompatPersistentStoreUsesValueFirstArgumentOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Surge's write takes the value before the key; reversing them would store
+	// The write takes the value before the key; reversing them would store
 	// under the wrong name and silently lose every cached value.
 	source := `
 $persistentStore.write("cached-value", "cache-key")
@@ -264,21 +270,6 @@ func TestProxyCompatBundleThatNeverCompletesHitsTheDeadline(t *testing.T) {
 	}
 }
 
-func TestSerializeCompatArgumentIsStableAndBounded(t *testing.T) {
-	t.Parallel()
-	// The bundle parses this string itself, so separators inside a value would
-	// let one setting inject another.
-	argument := serializeCompatArgument(map[string]any{
-		"mode":    `cle"an&injected="x`,
-		"enabled": true,
-		"level":   float64(2),
-	})
-	want := `enabled="true"&level="2"&mode="clean injected=x"`
-	if argument != strings.ReplaceAll(want, " ", "") {
-		t.Fatalf("argument = %q, want %q", argument, strings.ReplaceAll(want, " ", ""))
-	}
-}
-
 func TestCompatResultUnwrapsAHostImportedBody(t *testing.T) {
 	t.Parallel()
 	// scriptMessageObject imports the body once as a goja value. A bundle that
@@ -335,5 +326,131 @@ func TestCompatPersistentStoreExistsWithoutTheStoragePermission(t *testing.T) {
 	exported, _ := stringAnyMap(result.Export())
 	if exported["body"] != `{"read":null,"wrote":false}` {
 		t.Fatalf("null store reported %v, want a miss and a failed write", exported["body"])
+	}
+}
+
+// compatUngzipFixture runs a compat script with gzipped bytes already in
+// $request.body, which is how the Bilibili bundle's gRPC middleware meets them.
+func compatUngzipFixture(t *testing.T, payload []byte, limit int64, source string) (goja.Value, error) {
+	t.Helper()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	vm := goja.New()
+	loop := newAsyncLoop()
+	defer loop.close()
+	constructor, ok := goja.AssertConstructor(vm.Get("Uint8Array"))
+	if !ok {
+		t.Fatal("Uint8Array constructor is unavailable")
+	}
+	body, err := constructor(nil, vm.ToValue(vm.NewArrayBuffer(compressed.Bytes())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := compatFixtureOptions()
+	options.request = map[string]any{"url": "https://api.example.com/v1", "body": body}
+	options.decompressLimit = limit
+	entry, err := installProxyCompatAPI(vm, loop, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vm.RunString(source); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := loop.wait(ctx, entry.settled); err != nil {
+		return nil, err
+	}
+	return entry.result, nil
+}
+
+func TestCompatUtilsUngzipReturnsTheOriginalBytes(t *testing.T) {
+	t.Parallel()
+	// The published Bilibili bundle reaches $utils.ungzip from its gRPC
+	// middleware on every persona, so an undefined $utils would throw inside its
+	// own error handling and read as an action that declined to transform.
+	payload := []byte("the original gRPC frame payload")
+	result, err := compatUngzipFixture(t, payload, 1<<20, `
+	  const out = $utils.ungzip($request.body)
+	  $done({ body: String(out instanceof Uint8Array) + ":" + String.fromCharCode.apply(null, out) })
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseCompatScriptResult(result, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(parsed.Body), "true:"+string(payload); got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestCompatUtilsUngzipStaysInsideTheActionBudget(t *testing.T) {
+	t.Parallel()
+	// A compressed body that expands past the limit the operator already agreed
+	// to for this action must fail rather than be decompressed anyway.
+	result, err := compatUngzipFixture(t, bytes.Repeat([]byte("a"), 512<<10), 4096, `
+	  try { $utils.ungzip($request.body); $done({ body: "unbounded" }) }
+	  catch (error) { $done({ body: "bounded" }) }
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseCompatScriptResult(result, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(parsed.Body) != "bounded" {
+		t.Fatalf("body = %q, want the decompression refused by the action budget", parsed.Body)
+	}
+}
+func TestCompatNotificationIsDefinedAndRoutesToConsole(t *testing.T) {
+	t.Parallel()
+	// Both published bundles call $notification.post from their Surge error and
+	// status paths. Leaving it undefined throws inside the bundle's own catch,
+	// which then still calls $done — the failure looks like a silent no-op.
+	result, err := runCompatScript(t, `
+	  const seen = []
+	  console = { info: function () { seen.push(Array.prototype.join.call(arguments, " ")) } }
+	  $notification.post("Bilibili", "airborne", "3 segments", { "auto-dismiss": 5 })
+	  $done({ body: seen.join("|") })
+	`, compatFixtureOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseCompatScriptResult(result, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(parsed.Body), "$notification.post Bilibili — airborne — 3 segments"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestCompatNotificationSurvivesWithoutAConsole(t *testing.T) {
+	t.Parallel()
+	// The console is installed by the runtime, not by this layer. If it is ever
+	// absent the notification must be dropped, not turned into a throw on the
+	// bundle's error path.
+	result, err := runCompatScript(t, `
+	  $notification.post("title")
+	  $done({ body: "survived" })
+	`, compatFixtureOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseCompatScriptResult(result, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(parsed.Body) != "survived" {
+		t.Fatalf("body = %q, want the notification dropped silently", parsed.Body)
 	}
 }
