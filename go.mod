@@ -14,6 +14,8 @@ require (
 require (
 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/google/pprof v0.0.0-20230207041349-798e818bf904 // indirect
+	github.com/itchyny/gojq v0.12.16 // indirect
+	github.com/itchyny/timefmt-go v0.1.6 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect

@@ -2,11 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -18,15 +15,17 @@ import (
 // instead of the native transform(context) entry point.
 const scriptEntryProxyCompat = "proxy-compat"
 
-// surgePersonaVersion is reported through $environment["surge-version"].
+// loonPersonaVersion is reported through $loon.
 //
-// @nsnanocat/util picks its runtime by probing globals in a fixed order:
-// $task, $loon, $rocket, Egern, then $environment["surge-version"]. Presenting
-// as Surge is what lets a published bundle take a code path whose network and
-// storage shapes map onto capabilities this sidecar already has. It is a
-// compatibility persona, not a claim to be Surge, so none of the earlier
-// globals may be defined or the bundle selects the wrong branch.
-const surgePersonaVersion = "5.0.0"
+// Published bundles probe for a client in a fixed order -- $task, $loon,
+// $rocket, Egern, then $environment["surge-version"] -- and take a different
+// branch for each. Loon is the branch this runtime presents, because Loon is
+// also the publishing convention this repository follows: its [Argument]
+// section is typed, matching the manifest's typed settings, and it hands the
+// bundle $argument as a decoded object rather than a string each publisher
+// encodes differently. It is a compatibility persona, not a claim to be Loon,
+// so $task must stay undefined or a bundle selects Quantumult X instead.
+const loonPersonaVersion = "3.3.8(932)"
 
 // compatOptions carries everything one compat-mode action needs. Every field is
 // produced by the existing native plumbing; nothing here is a second
@@ -34,7 +33,7 @@ const surgePersonaVersion = "5.0.0"
 type compatOptions struct {
 	request         map[string]any
 	response        map[string]any
-	argument        string
+	argument        map[string]any
 	storage         *goja.Object
 	requester       *moduleNetworkRequester
 	startTime       time.Time
@@ -55,8 +54,14 @@ func (c *compatEntry) settled() bool { return c.completed }
 func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOptions) (*compatEntry, error) {
 	entry := &compatEntry{}
 
+	if err := vm.Set("$loon", loonPersonaVersion); err != nil {
+		return nil, err
+	}
+	// Some bundles read $environment even on the Loon branch, for a build or
+	// language hint. It exists and reports Loon rather than being absent, which
+	// would throw on the property read.
 	environment := vm.NewObject()
-	if err := environment.Set("surge-version", surgePersonaVersion); err != nil {
+	if err := environment.Set("loon-version", loonPersonaVersion); err != nil {
 		return nil, err
 	}
 	if err := vm.Set("$environment", environment); err != nil {
@@ -87,6 +92,11 @@ func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOpti
 		return nil, err
 	}
 
+	// Loon hands the bundle a decoded object. Every encoding bug this layer hit
+	// -- weatherkit's quoted form, bilibili's and youtube's JSON, wloc's bare
+	// query -- came from serializing settings into a string each publisher then
+	// parsed differently, and a bundle that mis-parses $argument does not fail,
+	// it silently runs on its defaults.
 	if err := vm.Set("$argument", options.argument); err != nil {
 		return nil, err
 	}
@@ -409,7 +419,7 @@ func (r *scriptRuntime) executeProxyCompat(
 ) (scriptResult, error) {
 	options := compatOptions{
 		request:         requestObject,
-		argument:        serializeCompatArgument(settings, rule.ArgumentFormat),
+		argument:        settings,
 		startTime:       time.Now(),
 		requester:       requester,
 		decompressLimit: rule.MaxBodyBytes,
@@ -431,81 +441,6 @@ func (r *scriptRuntime) executeProxyCompat(
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}
 	return parseCompatScriptResult(entry.result, responsePhase)
-}
-
-// Published bundles disagree on how they read $argument, and the disagreement
-// is silent: bilibili's parser catches a JSON failure and logs it, leaving every
-// setting at its default. The manifest declares which one a bundle parses.
-const (
-	compatArgumentFormatQuery = "query"
-	compatArgumentFormatJSON  = "json"
-)
-
-// serializeCompatArgument renders typed settings into the encoding the bundle
-// parses. The query form is the Surge sgmodule convention and stays the default,
-// because that is what the already-published weatherkit bundle reads.
-func serializeCompatArgument(settings map[string]any, format string) string {
-	if format == compatArgumentFormatJSON {
-		return serializeCompatArgumentJSON(settings)
-	}
-	return serializeCompatArgumentQuery(settings)
-}
-
-// serializeCompatArgumentJSON emits the decoded settings object, which the
-// bundles hand straight to JSON.parse. Values keep their declared types rather
-// than being stringified: a boolean setting read back as the string "true" would
-// be truthy either way, but a number compared with === would not match.
-func serializeCompatArgumentJSON(settings map[string]any) string {
-	if len(settings) == 0 {
-		return "{}"
-	}
-	encoded, err := json.Marshal(settings)
-	if err != nil {
-		return "{}"
-	}
-	return string(encoded)
-}
-
-func serializeCompatArgumentQuery(settings map[string]any) string {
-	keys := make([]string, 0, len(settings))
-	for key := range settings {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	var builder strings.Builder
-	for _, key := range keys {
-		if builder.Len() > 0 {
-			builder.WriteByte('&')
-		}
-		builder.WriteString(key)
-		builder.WriteString(`="`)
-		builder.WriteString(compatArgumentValue(settings[key]))
-		builder.WriteString(`"`)
-	}
-	return builder.String()
-}
-
-func compatArgumentValue(value any) string {
-	switch typed := value.(type) {
-	case nil:
-		return ""
-	case string:
-		return strings.NewReplacer(`"`, "", "&", "", "\r", "", "\n", "").Replace(typed)
-	case bool:
-		return strconv.FormatBool(typed)
-	case float64:
-		return strconv.FormatFloat(typed, 'f', -1, 64)
-	case int:
-		return strconv.Itoa(typed)
-	case int64:
-		return strconv.FormatInt(typed, 10)
-	default:
-		encoded, err := json.Marshal(typed)
-		if err != nil {
-			return ""
-		}
-		return strings.NewReplacer(`"`, "", "&", "").Replace(string(encoded))
-	}
 }
 
 // unwrapCompatValue exports a value that is still a goja value. The host hands

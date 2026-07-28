@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -43,16 +41,16 @@ func compatFixtureOptions() compatOptions {
 	return compatOptions{
 		request:   map[string]any{"url": "https://api.example.com/v1", "method": "GET", "headers": map[string]any{}},
 		response:  map[string]any{"status": 200, "headers": map[string]any{}, "body": "ok"},
-		argument:  `mode="clean"&level="2"`,
+		argument:  map[string]any{"mode": "clean", "level": float64(2)},
 		startTime: time.Now(),
 	}
 }
 
-func TestCompatPersonaResolvesToSurge(t *testing.T) {
+func TestCompatPersonaResolvesToLoon(t *testing.T) {
 	t.Parallel()
-	// This is the same probe order @nsnanocat/util uses. Defining any of the
-	// earlier globals would select the wrong branch and change the bundle's
-	// network, storage, and completion shapes.
+	// This is the same probe order the published bundles use. Loon is the branch
+	// this runtime presents; $task must stay undefined or a bundle selects
+	// Quantumult X and changes its network, storage, and completion shapes.
 	source := `
 const has = (name) => name in globalThis
 let runtime
@@ -75,8 +73,8 @@ $done({ runtime, startTime: typeof $script.startTime })
 	if !ok {
 		t.Fatalf("result = %v, want an object", result)
 	}
-	if exported["runtime"] != "Surge" {
-		t.Fatalf("runtime = %v, want Surge", exported["runtime"])
+	if exported["runtime"] != "Loon" {
+		t.Fatalf("runtime = %v, want Loon", exported["runtime"])
 	}
 	if exported["startTime"] != "number" {
 		t.Fatalf("$script.startTime = %v, want a number", exported["startTime"])
@@ -106,21 +104,26 @@ func TestCompatEntryCompletesThroughDoneAfterAwait(t *testing.T) {
 	}
 }
 
-func TestCompatArgumentIsTheSerializedSettingString(t *testing.T) {
+func TestCompatArgumentIsTheDecodedSettingObject(t *testing.T) {
 	t.Parallel()
-	// The bundle runs its own parser over $argument, so the host supplies the
-	// published sgmodule's string form rather than a decoded object.
-	source := `$done({ argument: $argument, type: typeof $argument })`
+	// Loon hands the bundle a decoded object, so the declared types cross
+	// intact. Serializing into a string is what forced a per-publisher encoding
+	// guess, and a bundle that mis-parses $argument runs on its defaults
+	// silently rather than failing.
+	source := `$done({ type: typeof $argument, mode: $argument.mode, level: $argument.level, isNumber: typeof $argument.level === "number" })`
 	result, err := runCompatScript(t, source, compatFixtureOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
 	exported, _ := stringAnyMap(result.Export())
-	if exported["type"] != "string" {
-		t.Fatalf("$argument type = %v, want string", exported["type"])
+	if exported["type"] != "object" {
+		t.Fatalf("$argument type = %v, want object", exported["type"])
 	}
-	if exported["argument"] != `mode="clean"&level="2"` {
-		t.Fatalf("$argument = %v, want the serialized setting string", exported["argument"])
+	if exported["mode"] != "clean" {
+		t.Fatalf("$argument.mode = %v, want clean", exported["mode"])
+	}
+	if exported["isNumber"] != true {
+		t.Fatalf("$argument.level crossed as %T, want a number", exported["level"])
 	}
 }
 
@@ -149,7 +152,7 @@ func TestCompatPersistentStoreUsesValueFirstArgumentOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Surge's write takes the value before the key; reversing them would store
+	// The write takes the value before the key; reversing them would store
 	// under the wrong name and silently lose every cached value.
 	source := `
 $persistentStore.write("cached-value", "cache-key")
@@ -264,60 +267,6 @@ func TestProxyCompatBundleThatNeverCompletesHitsTheDeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("action took %s, want it bounded by the deadline", elapsed)
-	}
-}
-
-func TestSerializeCompatArgumentIsStableAndBounded(t *testing.T) {
-	t.Parallel()
-	// The bundle parses this string itself, so separators inside a value would
-	// let one setting inject another.
-	argument := serializeCompatArgument(map[string]any{
-		"mode":    `cle"an&injected="x`,
-		"enabled": true,
-		"level":   float64(2),
-	}, compatArgumentFormatQuery)
-	want := `enabled="true"&level="2"&mode="clean injected=x"`
-	if argument != strings.ReplaceAll(want, " ", "") {
-		t.Fatalf("argument = %q, want %q", argument, strings.ReplaceAll(want, " ", ""))
-	}
-}
-
-func TestSerializeCompatArgumentDefaultsToTheQueryForm(t *testing.T) {
-	t.Parallel()
-	// weatherkit is already published against the query form, so an action that
-	// declares no format must keep receiving it.
-	settings := map[string]any{"enabled": true}
-	if got := serializeCompatArgument(settings, ""); got != `enabled="true"` {
-		t.Fatalf("argument = %q, want the query form by default", got)
-	}
-}
-
-func TestSerializeCompatArgumentJSONKeepsDeclaredTypes(t *testing.T) {
-	t.Parallel()
-	// The bundles hand this to JSON.parse and then compare values. A boolean
-	// rendered as the string "true" survives a truthiness test but fails ===,
-	// so the types have to cross intact rather than being stringified.
-	argument := serializeCompatArgument(map[string]any{
-		"enabled": true,
-		"level":   float64(2),
-		"mode":    "clean",
-	}, compatArgumentFormatJSON)
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(argument), &decoded); err != nil {
-		t.Fatalf("argument %q is not JSON the bundle could parse: %v", argument, err)
-	}
-	if decoded["enabled"] != true || decoded["level"] != float64(2) || decoded["mode"] != "clean" {
-		t.Fatalf("decoded = %#v, want the declared types preserved", decoded)
-	}
-}
-
-func TestSerializeCompatArgumentJSONIsAnObjectWhenEmpty(t *testing.T) {
-	t.Parallel()
-	// An extension with no settings still has its $argument passed to
-	// JSON.parse. An empty string would throw there, inside a bundle that
-	// swallows the failure and silently runs on defaults.
-	if got := serializeCompatArgument(nil, compatArgumentFormatJSON); got != "{}" {
-		t.Fatalf("argument = %q, want an empty object", got)
 	}
 }
 

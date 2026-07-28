@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/dop251/goja"
+	"github.com/itchyny/gojq"
 )
 
 const configVersion = 5
@@ -102,9 +103,12 @@ type ScriptRule struct {
 	// others call JSON.parse on it. The wrong one is not an error a bundle
 	// reports — at least one swallows the parse failure and silently falls back
 	// to its defaults — so the encoding is declared rather than guessed.
-	ArgumentFormat string `json:"argument_format,omitempty"`
-	TimeoutMS      int    `json:"timeout_ms"`
-	MaxBodyBytes   int64  `json:"max_body_bytes"`
+	// JQProgram carries an upstream module's own response-body-json-jq
+	// expression. An action declares either a script or a jq program; a jq
+	// action never enters the JavaScript runtime.
+	JQProgram    string `json:"jq_program,omitempty"`
+	TimeoutMS    int    `json:"timeout_ms"`
+	MaxBodyBytes int64  `json:"max_body_bytes"`
 	// program and settings belong to the immutable compiled config snapshot.
 	program  *goja.Program
 	settings map[string]any
@@ -936,6 +940,24 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if len(rule.ScriptURL) > 4096 || (rule.ScriptURL != "" && !validSnapshotURL(rule.ScriptURL)) {
 				return fmt.Errorf("extension %q action %q URL is invalid", module.ID, rule.ID)
 			}
+			// A jq action is declarative: it carries an expression instead of a
+			// script and never enters the JavaScript runtime. Carrying both
+			// would leave which one runs undefined.
+			if rule.JQProgram != "" {
+				if rule.ScriptBody != "" || rule.ScriptURL != "" || rule.Entry != "" {
+					return fmt.Errorf("extension %q action %q declares both a jq program and a script", module.ID, rule.ID)
+				}
+				if rule.BodyMode != "text" {
+					return fmt.Errorf("extension %q action %q jq program requires a text body", module.ID, rule.ID)
+				}
+				if _, err := compileJQProgram(rule.JQProgram); err != nil {
+					return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
+				}
+				if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
+					return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
+				}
+				continue
+			}
 			if len(rule.ScriptBody) == 0 || len(rule.ScriptBody) > 1<<20 || rule.ScriptDigest != digestText(rule.ScriptBody) {
 				return fmt.Errorf("extension %q action %q script snapshot is invalid", module.ID, rule.ID)
 			}
@@ -952,16 +974,6 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			}
 			if rule.Entry != "" && rule.Entry != scriptEntryProxyCompat {
 				return fmt.Errorf("extension %q action %q entry mode is invalid", module.ID, rule.ID)
-			}
-			switch rule.ArgumentFormat {
-			case "", compatArgumentFormatQuery, compatArgumentFormatJSON:
-			default:
-				return fmt.Errorf("extension %q action %q argument format is invalid", module.ID, rule.ID)
-			}
-			// A native script receives decoded settings and never reads
-			// $argument, so an argument format there would describe nothing.
-			if rule.ArgumentFormat != "" && rule.Entry != scriptEntryProxyCompat {
-				return fmt.Errorf("extension %q action %q sets an argument format without entry %q", module.ID, rule.ID, scriptEntryProxyCompat)
 			}
 			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
 				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
@@ -1615,4 +1627,24 @@ func (s *configStore) clearReadErrorFile() {
 	s.readErrorModTime = time.Time{}
 	s.readErrorSize = 0
 	s.readErrorFile = nil
+}
+
+// jqCode returns the compiled program for a jq action, compiling once per
+// distinct expression. Compilation is not free, and an action runs per request.
+func (r *scriptRuntime) jqCode(module Module, rule ScriptRule) (*gojq.Code, error) {
+	key := scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}
+	r.jqMu.Lock()
+	defer r.jqMu.Unlock()
+	if r.jqPrograms == nil {
+		r.jqPrograms = make(map[scriptProgramKey]*gojq.Code)
+	}
+	if code, ok := r.jqPrograms[key]; ok {
+		return code, nil
+	}
+	code, err := compileJQProgram(rule.JQProgram)
+	if err != nil {
+		return nil, err
+	}
+	r.jqPrograms[key] = code
+	return code, nil
 }
