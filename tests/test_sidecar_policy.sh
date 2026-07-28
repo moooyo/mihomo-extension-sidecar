@@ -81,21 +81,35 @@ grep -Fq 'log.Print("intercept: could not read replacement config; retaining the
 # file does not itself contain the strings it forbids.
 #
 # The blanket name scan this used to be is superseded by the proxy-compat
-# contract, which has to name these clients to explain itself: @nsnanocat/util
-# probes $task, $loon, $rocket and Egern before falling through to
-# $environment["surge-version"], so the runtime must leave them undefined to be
-# read as Surge. Naming them in a comment is required; defining them is the
-# thing that breaks the persona, and that is what is asserted now.
-for retired_global in "$(printf '%s%s' 'lo' 'on')" 'task' 'rocket'; do
-    grep -RnE "vm\.Set\(\"\\\$${retired_global}\"" "$ROOT" \
+# contract, which has to name these clients to explain itself. A published
+# bundle probes $task, $loon, $rocket and Egern in order and takes a different
+# branch for each, so which of them the runtime defines *is* the persona.
+#
+# Loon is the one this runtime serves and the convention this project follows:
+# its [Argument] block is typed and it hands a bundle a decoded object rather
+# than a string each publisher parses differently. $task is probed first, so
+# defining it would silently select Quantumult X instead; the others select
+# branches with shapes this runtime does not have.
+#
+# Matched as fixed strings rather than regexes. The previous form escaped a
+# dollar through two levels of quoting and reached grep as an end-of-line
+# anchor, so the negative checks could never have matched and were passing
+# vacuously.
+for unserved_global in 'task' 'rocket'; do
+    grep -RnF "vm.Set(\"\$${unserved_global}\"" "$ROOT" \
         --include='*.go' --exclude-dir=.git 2>/dev/null | grep -q . \
-        && fail "the runtime defines \$${retired_global}, which selects a proxy-client branch it cannot serve"
+        && fail "the runtime defines \$${unserved_global}, which selects a proxy-client branch it cannot serve"
 done
-grep -RnE 'vm\.Set\("Egern"' "$ROOT" --include='*.go' --exclude-dir=.git 2>/dev/null | grep -q . \
+grep -RnF 'vm.Set("Egern"' "$ROOT" --include='*.go' --exclude-dir=.git 2>/dev/null | grep -q . \
     && fail "the runtime defines Egern, which selects a proxy-client branch it cannot serve"
-# The persona the compat layer does claim has to stay the one it was built for.
-grep -Fq 'surgePersonaVersion' "$ROOT/module_compat.go" \
+# The persona the compat layer does claim has to stay the one it was built for,
+# and it has to actually be installed: a bundle that finds no client at all
+# falls through to a Node.js branch whose storage and completion shapes differ.
+grep -Fq 'loonPersonaVersion' "$ROOT/module_compat.go" \
     || fail "the proxy-compat persona constant is gone"
+served_global="$(printf '%s%s' 'lo' 'on')"
+grep -RnF "vm.Set(\"\$${served_global}\"" "$ROOT" --include='*.go' --exclude-dir=.git 2>/dev/null | grep -q . \
+    || fail "the runtime no longer presents the persona its compat layer was built for"
 
 if [[ "$rc" == 0 ]]; then
     echo "test_sidecar_policy: PASS"
