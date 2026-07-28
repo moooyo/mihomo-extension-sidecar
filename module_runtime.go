@@ -187,7 +187,7 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	}
 	var requester *moduleNetworkRequester
 	if len(module.NetworkOrigins) > 0 || module.NetworkAny {
-		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, module.NetworkAny, r.networkSlots)
+		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, module.NetworkAny, r.networkSlots, loop)
 		defer closeNetwork()
 		contextObject["network"] = network
 		requester = newModuleNetworkRequester(actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, r.networkSlots)

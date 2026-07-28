@@ -36,10 +36,11 @@ func newModuleNetworkAPI(
 	origins []string,
 	allowAny bool,
 	slots chan struct{},
+	loop *asyncLoop,
 ) (*goja.Object, func()) {
 	requester := newModuleNetworkRequester(ctx, proxy, roots, origins, slots)
 	requester.allowAny = allowAny
-	return requester.newAPI(vm), requester.Close
+	return requester.newAPI(vm, loop), requester.Close
 }
 
 // moduleNetworkRequester belongs to one action. It never shares transports
@@ -85,13 +86,21 @@ func newModuleNetworkRequester(
 	return requester
 }
 
-func (r *moduleNetworkRequester) newAPI(vm *goja.Runtime) *goja.Object {
+func (r *moduleNetworkRequester) newAPI(vm *goja.Runtime, loop *asyncLoop) *goja.Object {
 	calls := 0
-	network := vm.NewObject()
-	_ = network.Set("request", func(call goja.FunctionCall) goja.Value {
+	// Both entry points draw on one per-action budget. Counting them separately
+	// would let a script double its allowance by mixing the two.
+	spend := func() error {
 		calls++
 		if calls > maxModuleNetworkCallsPerAction {
-			panic(vm.NewGoError(errors.New("network.request call limit exceeded")))
+			return errors.New("network.request call limit exceeded")
+		}
+		return nil
+	}
+	network := vm.NewObject()
+	_ = network.Set("request", func(call goja.FunctionCall) goja.Value {
+		if err := spend(); err != nil {
+			panic(vm.NewGoError(err))
 		}
 		options, ok := stringAnyMap(call.Argument(0).Export())
 		if !ok {
@@ -101,23 +110,66 @@ func (r *moduleNetworkRequester) newAPI(vm *goja.Runtime) *goja.Object {
 		if err != nil {
 			panic(vm.NewGoError(fmt.Errorf("network.request failed: %w", err)))
 		}
-		body, err := newModuleNetworkByteArray(vm, response.body)
+		result, err := moduleNetworkResultObject(vm, response)
 		if err != nil {
 			panic(vm.NewGoError(err))
 		}
-		result := map[string]any{
-			"url":      response.url,
-			"status":   response.status,
-			"headers":  response.headers,
-			"trailers": response.trailers,
-			"body":     body,
-		}
-		if utf8.Valid(response.body) {
-			result["text"] = string(response.body)
-		}
-		return vm.ToValue(result)
+		return result
 	})
+	// requestAsync returns a promise so a script can issue several requests at
+	// once. The synchronous form holds the VM for the whole round trip, which
+	// makes concurrency impossible to express — a port that needs two lookups
+	// has to serialize them and pay both latencies.
+	//
+	// The request runs on a worker goroutine and its completion is posted back
+	// to the goroutine that owns the VM, because goja is not goroutine-safe.
+	// A failure rejects rather than throws, so `await` inside try/catch reads
+	// the same way the synchronous form does.
+	if loop != nil {
+		_ = network.Set("requestAsync", func(call goja.FunctionCall) goja.Value {
+			if err := spend(); err != nil {
+				panic(vm.NewGoError(err))
+			}
+			options, ok := stringAnyMap(call.Argument(0).Export())
+			if !ok {
+				panic(vm.NewTypeError("network.requestAsync requires an options object"))
+			}
+			promise, resolve, reject := vm.NewPromise()
+			go func() {
+				response, err := r.requestWaiting(options)
+				loop.post(func() error {
+					if err != nil {
+						return reject(vm.NewGoError(fmt.Errorf("network.requestAsync failed: %w", err)))
+					}
+					result, resultErr := moduleNetworkResultObject(vm, response)
+					if resultErr != nil {
+						return reject(vm.NewGoError(resultErr))
+					}
+					return resolve(result)
+				})
+			}()
+			return vm.ToValue(promise)
+		})
+	}
 	return network
+}
+
+func moduleNetworkResultObject(vm *goja.Runtime, response moduleNetworkResponse) (goja.Value, error) {
+	body, err := newModuleNetworkByteArray(vm, response.body)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{
+		"url":      response.url,
+		"status":   response.status,
+		"headers":  response.headers,
+		"trailers": response.trailers,
+		"body":     body,
+	}
+	if utf8.Valid(response.body) {
+		result["text"] = string(response.body)
+	}
+	return vm.ToValue(result), nil
 }
 
 func (r *moduleNetworkRequester) Close() {
@@ -165,6 +217,21 @@ func performModuleNetworkRequest(
 }
 
 func (r *moduleNetworkRequester) request(options map[string]any) (moduleNetworkResponse, error) {
+	return r.performRequest(options, false)
+}
+
+// requestWaiting blocks for a concurrency slot instead of failing fast.
+//
+// Only the asynchronous API uses it. A synchronous caller holds the VM for the
+// whole request, so waiting there would freeze the script and failing
+// immediately is the only safe answer; an awaited request can simply settle
+// later. Both are bounded by the action deadline, which is what actually stops
+// a script from waiting forever.
+func (r *moduleNetworkRequester) requestWaiting(options map[string]any) (moduleNetworkResponse, error) {
+	return r.performRequest(options, true)
+}
+
+func (r *moduleNetworkRequester) performRequest(options map[string]any, waitForSlot bool) (moduleNetworkResponse, error) {
 	for key := range options {
 		switch key {
 		case "url", "method", "headers", "body":
@@ -217,11 +284,20 @@ func (r *moduleNetworkRequester) request(options map[string]any) (moduleNetworkR
 		return moduleNetworkResponse{}, err
 	}
 
-	select {
-	case r.slots <- struct{}{}:
-		defer func() { <-r.slots }()
-	default:
-		return moduleNetworkResponse{}, errors.New("network request capacity is busy")
+	if waitForSlot {
+		select {
+		case r.slots <- struct{}{}:
+			defer func() { <-r.slots }()
+		case <-r.ctx.Done():
+			return moduleNetworkResponse{}, r.ctx.Err()
+		}
+	} else {
+		select {
+		case r.slots <- struct{}{}:
+			defer func() { <-r.slots }()
+		default:
+			return moduleNetworkResponse{}, errors.New("network request capacity is busy")
+		}
 	}
 	requestCtx, cancel := context.WithTimeout(r.ctx, moduleNetworkTimeout)
 	defer cancel()
@@ -285,12 +361,19 @@ func (r *moduleNetworkRequester) transport(origin string, target socksTarget) (*
 	}
 
 	transport := &http.Transport{
-		Proxy:                  nil,
-		ForceAttemptHTTP2:      true,
-		DisableCompression:     true,
-		MaxIdleConns:           1,
-		MaxIdleConnsPerHost:    1,
-		MaxConnsPerHost:        1,
+		Proxy:               nil,
+		ForceAttemptHTTP2:   true,
+		DisableCompression:  true,
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		// One connection per host was all a synchronous caller could ever use.
+		// With requestAsync it becomes an artificial serializer: two awaited
+		// requests to the same host would queue on the connection and cost both
+		// latencies, which is the divergence the async form exists to close.
+		// Bounded by the per-action call budget, so an action can never open
+		// more connections to a host than it is allowed requests, and the
+		// process-wide slot cap still bounds everything in flight.
+		MaxConnsPerHost:        maxModuleNetworkCallsPerAction,
 		MaxResponseHeaderBytes: maxModuleNetworkHeaderBytes,
 		ResponseHeaderTimeout:  moduleNetworkTimeout,
 		TLSHandshakeTimeout:    moduleNetworkTimeout,
