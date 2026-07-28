@@ -32,12 +32,13 @@ const surgePersonaVersion = "5.0.0"
 // produced by the existing native plumbing; nothing here is a second
 // implementation of storage, settings, or networking.
 type compatOptions struct {
-	request   map[string]any
-	response  map[string]any
-	argument  string
-	storage   *goja.Object
-	requester *moduleNetworkRequester
-	startTime time.Time
+	request         map[string]any
+	response        map[string]any
+	argument        string
+	storage         *goja.Object
+	requester       *moduleNetworkRequester
+	startTime       time.Time
+	decompressLimit int64
 }
 
 // compatEntry tracks completion for a bundle that signals it by calling $done
@@ -125,7 +126,99 @@ func installProxyCompatAPI(vm *goja.Runtime, loop *asyncLoop, options compatOpti
 			return nil, err
 		}
 	}
+
+	// $utils.ungzip is a host-provided decompressor. The gRPC middleware in the
+	// published Bilibili bundle reaches it on every persona, not just Loon's, so
+	// leaving it undefined would throw inside the bundle's own error handling and
+	// surface as an action that simply declined to transform anything.
+	utils, err := compatUtils(vm, options.decompressLimit)
+	if err != nil {
+		return nil, err
+	}
+	if err := vm.Set("$utils", utils); err != nil {
+		return nil, err
+	}
+
+	// The gateway has no channel to deliver an operator notification on, so this
+	// records the call through the action's own console budget rather than
+	// pretending to deliver it. It has to exist: the bundles' Surge branch calls
+	// it from their error and status paths.
+	notification := vm.NewObject()
+	if err := notification.Set("post", func(call goja.FunctionCall) goja.Value {
+		compatLogNotification(vm, call)
+		return goja.Undefined()
+	}); err != nil {
+		return nil, err
+	}
+	if err := vm.Set("$notification", notification); err != nil {
+		return nil, err
+	}
 	return entry, nil
+}
+
+// compatUtils provides the host helpers a published bundle expects to find on
+// $utils. Only ungzip is implemented; anything else stays absent so a bundle
+// reaching for an unimplemented helper fails loudly here rather than silently
+// producing a wrong result.
+func compatUtils(vm *goja.Runtime, limit int64) (*goja.Object, error) {
+	utils := vm.NewObject()
+	if err := utils.Set("ungzip", func(call goja.FunctionCall) goja.Value {
+		body, err := exportedBody(call.Argument(0).Export())
+		if err != nil {
+			panic(vm.NewTypeError("ungzip expects a string or Uint8Array: %s", err))
+		}
+		// Bounded by the action's own body budget: a gzip bomb inside an
+		// otherwise-conforming response must not outlive the limit the operator
+		// already agreed to for this action.
+		decoded, err := decodeContentBody(body, "gzip", limit)
+		if err != nil {
+			panic(vm.NewGoError(err))
+		}
+		constructor, ok := goja.AssertConstructor(vm.Get("Uint8Array"))
+		if !ok {
+			panic(vm.NewTypeError("Uint8Array constructor is unavailable"))
+		}
+		value, err := constructor(nil, vm.ToValue(vm.NewArrayBuffer(decoded)))
+		if err != nil {
+			panic(vm.NewGoError(err))
+		}
+		return value
+	}); err != nil {
+		return nil, err
+	}
+	return utils, nil
+}
+
+// compatNotificationText flattens $notification.post(title, subtitle, body, ...)
+// into one log line. Only the three text arguments are recorded; the options
+// object carries actions this runtime cannot perform anyway.
+func compatNotificationText(call goja.FunctionCall) string {
+	parts := make([]string, 0, 3)
+	for index := 0; index < 3 && index < len(call.Arguments); index++ {
+		argument := call.Argument(index)
+		if goja.IsUndefined(argument) || goja.IsNull(argument) {
+			continue
+		}
+		if text := strings.TrimSpace(argument.String()); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " — ")
+}
+
+// compatLogNotification routes a notification through the action's own console,
+// so it inherits the per-action message cap and truncation already in place
+// instead of opening a second, unbounded path to the engine log.
+func compatLogNotification(vm *goja.Runtime, call goja.FunctionCall) {
+	console, ok := vm.Get("console").(*goja.Object)
+	if !ok {
+		return
+	}
+	info, ok := goja.AssertFunction(console.Get("info"))
+	if !ok {
+		return
+	}
+	_, _ = info(console, vm.ToValue("$notification.post"), vm.ToValue(compatNotificationText(call)))
 }
 
 // compatPersistentStore adapts the bounded native storage object to the
@@ -315,10 +408,11 @@ func (r *scriptRuntime) executeProxyCompat(
 	responsePhase bool,
 ) (scriptResult, error) {
 	options := compatOptions{
-		request:   requestObject,
-		argument:  serializeCompatArgument(settings),
-		startTime: time.Now(),
-		requester: requester,
+		request:         requestObject,
+		argument:        serializeCompatArgument(settings, rule.ArgumentFormat),
+		startTime:       time.Now(),
+		requester:       requester,
+		decompressLimit: rule.MaxBodyBytes,
 	}
 	if responseObject, ok := contextObject["response"].(map[string]any); ok {
 		options.response = responseObject
@@ -339,10 +433,40 @@ func (r *scriptRuntime) executeProxyCompat(
 	return parseCompatScriptResult(entry.result, responsePhase)
 }
 
-// serializeCompatArgument renders typed settings into the key="value" string
-// the published sgmodule passes, because the bundle runs its own parser over it
-// rather than accepting a decoded object.
-func serializeCompatArgument(settings map[string]any) string {
+// Published bundles disagree on how they read $argument, and the disagreement
+// is silent: bilibili's parser catches a JSON failure and logs it, leaving every
+// setting at its default. The manifest declares which one a bundle parses.
+const (
+	compatArgumentFormatQuery = "query"
+	compatArgumentFormatJSON  = "json"
+)
+
+// serializeCompatArgument renders typed settings into the encoding the bundle
+// parses. The query form is the Surge sgmodule convention and stays the default,
+// because that is what the already-published weatherkit bundle reads.
+func serializeCompatArgument(settings map[string]any, format string) string {
+	if format == compatArgumentFormatJSON {
+		return serializeCompatArgumentJSON(settings)
+	}
+	return serializeCompatArgumentQuery(settings)
+}
+
+// serializeCompatArgumentJSON emits the decoded settings object, which the
+// bundles hand straight to JSON.parse. Values keep their declared types rather
+// than being stringified: a boolean setting read back as the string "true" would
+// be truthy either way, but a number compared with === would not match.
+func serializeCompatArgumentJSON(settings map[string]any) string {
+	if len(settings) == 0 {
+		return "{}"
+	}
+	encoded, err := json.Marshal(settings)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+func serializeCompatArgumentQuery(settings map[string]any) string {
 	keys := make([]string, 0, len(settings))
 	for key := range settings {
 		keys = append(keys, key)

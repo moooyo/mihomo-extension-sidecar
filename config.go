@@ -96,9 +96,15 @@ type ScriptRule struct {
 	// proxy-client bundle, which signals completion by calling $done. The mode
 	// cannot be inferred from the source, because it changes how the action
 	// completes and what its result means.
-	Entry        string `json:"entry,omitempty"`
-	TimeoutMS    int    `json:"timeout_ms"`
-	MaxBodyBytes int64  `json:"max_body_bytes"`
+	Entry string `json:"entry,omitempty"`
+	// ArgumentFormat selects how typed settings are rendered into $argument.
+	// Published bundles disagree: some parse the Surge key="value"&... form,
+	// others call JSON.parse on it. The wrong one is not an error a bundle
+	// reports — at least one swallows the parse failure and silently falls back
+	// to its defaults — so the encoding is declared rather than guessed.
+	ArgumentFormat string `json:"argument_format,omitempty"`
+	TimeoutMS      int    `json:"timeout_ms"`
+	MaxBodyBytes   int64  `json:"max_body_bytes"`
 	// program and settings belong to the immutable compiled config snapshot.
 	program  *goja.Program
 	settings map[string]any
@@ -946,6 +952,16 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			}
 			if rule.Entry != "" && rule.Entry != scriptEntryProxyCompat {
 				return fmt.Errorf("extension %q action %q entry mode is invalid", module.ID, rule.ID)
+			}
+			switch rule.ArgumentFormat {
+			case "", compatArgumentFormatQuery, compatArgumentFormatJSON:
+			default:
+				return fmt.Errorf("extension %q action %q argument format is invalid", module.ID, rule.ID)
+			}
+			// A native script receives decoded settings and never reads
+			// $argument, so an argument format there would describe nothing.
+			if rule.ArgumentFormat != "" && rule.Entry != scriptEntryProxyCompat {
+				return fmt.Errorf("extension %q action %q sets an argument format without entry %q", module.ID, rule.ID, scriptEntryProxyCompat)
 			}
 			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
 				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
