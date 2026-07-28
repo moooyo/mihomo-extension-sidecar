@@ -98,17 +98,16 @@ type ScriptRule struct {
 	// cannot be inferred from the source, because it changes how the action
 	// completes and what its result means.
 	Entry string `json:"entry,omitempty"`
-	// ArgumentFormat selects how typed settings are rendered into $argument.
-	// Published bundles disagree: some parse the Surge key="value"&... form,
-	// others call JSON.parse on it. The wrong one is not an error a bundle
-	// reports — at least one swallows the parse failure and silently falls back
-	// to its defaults — so the encoding is declared rather than guessed.
 	// JQProgram carries an upstream module's own response-body-json-jq
-	// expression. An action declares either a script or a jq program; a jq
-	// action never enters the JavaScript runtime.
-	JQProgram    string `json:"jq_program,omitempty"`
-	TimeoutMS    int    `json:"timeout_ms"`
-	MaxBodyBytes int64  `json:"max_body_bytes"`
+	// expression.
+	JQProgram string `json:"jq_program,omitempty"`
+	// Reject aborts the exchange. It is what ten actions across two extensions
+	// carried a 57-byte script to do.
+	Reject bool `json:"reject,omitempty"`
+	// Mock answers with a fixed reply instead of running anything.
+	Mock         *MockResponse `json:"mock,omitempty"`
+	TimeoutMS    int           `json:"timeout_ms"`
+	MaxBodyBytes int64         `json:"max_body_bytes"`
 	// program and settings belong to the immutable compiled config snapshot.
 	program  *goja.Program
 	settings map[string]any
@@ -940,13 +939,30 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if len(rule.ScriptURL) > 4096 || (rule.ScriptURL != "" && !validSnapshotURL(rule.ScriptURL)) {
 				return fmt.Errorf("extension %q action %q URL is invalid", module.ID, rule.ID)
 			}
-			// A jq action is declarative: it carries an expression instead of a
-			// script and never enters the JavaScript runtime. Carrying both
-			// would leave which one runs undefined.
-			if rule.JQProgram != "" {
-				if rule.ScriptBody != "" || rule.ScriptURL != "" || rule.Entry != "" {
-					return fmt.Errorf("extension %q action %q declares both a jq program and a script", module.ID, rule.ID)
+			// Four kinds of action, and exactly one applies. Carrying two would
+			// leave which one runs undefined.
+			kinds := 0
+			for _, declared := range []bool{rule.JQProgram != "", rule.Reject, rule.Mock != nil, rule.ScriptBody != "" || rule.ScriptURL != ""} {
+				if declared {
+					kinds++
 				}
+			}
+			if kinds > 1 {
+				return fmt.Errorf("extension %q action %q declares more than one of jq, reject, mock, and a script", module.ID, rule.ID)
+			}
+			if rule.Entry != "" && (rule.Reject || rule.Mock != nil || rule.JQProgram != "") {
+				return fmt.Errorf("extension %q action %q declares an entry without a script", module.ID, rule.ID)
+			}
+			if rule.Reject {
+				continue
+			}
+			if rule.Mock != nil {
+				if err := rule.Mock.validate(); err != nil {
+					return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
+				}
+				continue
+			}
+			if rule.JQProgram != "" {
 				if rule.BodyMode != "text" {
 					return fmt.Errorf("extension %q action %q jq program requires a text body", module.ID, rule.ID)
 				}

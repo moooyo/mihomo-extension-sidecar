@@ -22,6 +22,12 @@ const (
 	maxJQOutputBytes  = 64 << 20
 )
 
+// jqSettingsVariable exposes the action's decoded settings to the program.
+// Without it a jq action cannot depend on operator choices at all, which is
+// what kept the TestFlight storefront rewrite in JavaScript: its replacement
+// value comes from a setting.
+const jqSettingsVariable = "$settings"
+
 func compileJQProgram(program string) (*gojq.Code, error) {
 	if len(program) > maxJQProgramBytes {
 		return nil, fmt.Errorf("jq program exceeds %d bytes", maxJQProgramBytes)
@@ -30,7 +36,7 @@ func compileJQProgram(program string) (*gojq.Code, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse jq program: %w", err)
 	}
-	code, err := gojq.Compile(parsed)
+	code, err := gojq.Compile(parsed, gojq.WithVariables([]string{jqSettingsVariable}))
 	if err != nil {
 		return nil, fmt.Errorf("compile jq program: %w", err)
 	}
@@ -41,12 +47,15 @@ func compileJQProgram(program string) (*gojq.Code, error) {
 // rather than a pass-through: the action matched a path its author declared to
 // be JSON, and silently forwarding something else would hide a a mismatch
 // between the manifest's pattern and reality.
-func runJQ(ctx context.Context, code *gojq.Code, body []byte) ([]byte, error) {
+func runJQ(ctx context.Context, code *gojq.Code, body []byte, settings map[string]any) ([]byte, error) {
 	var input any
 	if err := json.Unmarshal(body, &input); err != nil {
 		return nil, fmt.Errorf("action body is not JSON: %w", err)
 	}
-	iterator := code.RunWithContext(ctx, input)
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	iterator := code.RunWithContext(ctx, input, settings)
 	// Only the first output is used. Every published rule this supports is
 	// single-output; taking the first keeps a program that unexpectedly streams
 	// from concatenating documents into one malformed body.
@@ -90,7 +99,11 @@ func (r *scriptRuntime) executeJQ(
 		}
 		body = response.Body
 	}
-	transformed, err := runJQ(ctx, code, body)
+	settings, err := scriptSettingValues(module, rule)
+	if err != nil {
+		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+	}
+	transformed, err := runJQ(ctx, code, body, settings)
 	if err != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}

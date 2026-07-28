@@ -16,7 +16,7 @@ func runJQFixture(t *testing.T, program, body string) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := runJQ(ctx, code, []byte(body))
+	out, err := runJQ(ctx, code, []byte(body), nil)
 	return string(out), err
 }
 
@@ -115,7 +115,7 @@ func TestJQStopsAtTheActionDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if _, err := runJQ(ctx, code, []byte(`{}`)); err == nil {
+	if _, err := runJQ(ctx, code, []byte(`{}`), nil); err == nil {
 		t.Fatal("expected the deadline to stop the program")
 	}
 	if elapsed := time.Since(started); elapsed > 3*time.Second {

@@ -356,7 +356,7 @@ func TestBilibiliShippedJQPrograms(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			got, err := runJQ(ctx, code, []byte(testCase.input))
+			got, err := runJQ(ctx, code, []byte(testCase.input), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
