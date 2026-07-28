@@ -157,6 +157,9 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		if err := installWebAPI(vm); err != nil {
 			return scriptResult{}, err
 		}
+		if err := installDOMAPI(vm); err != nil {
+			return scriptResult{}, err
+		}
 	}
 	installConsoleAPI(vm, r.logs, EngineLog{
 		Source: "script", Extension: module.ID, Action: rule.ID, Phase: rule.Phase,
