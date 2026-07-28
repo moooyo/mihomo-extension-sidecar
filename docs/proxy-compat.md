@@ -195,5 +195,37 @@ Not done:
 - Contract changes beyond the two that landed (script entry, network
   capability): remote-script trust on first use, and surfacing the entry mode
   and the broader network grant in the Console and Telegram review copy.
-- No deployment has run this yet. Everything above is local.
+
+## Verified on a gateway
+
+Deployed to the `test-env` gateway (Debian 13, `5gpn-dns` and `5gpn-intercept`
+built from these branches) and exercised through the real control plane:
+
+- The manifest imported over the console API with `entry: proxy-compat` and
+  `permissions.network.any` (HTTP 201). The control plane fetched the release
+  bundle from GitHub itself and recorded SHA-256
+  `4d368808…` — the same digest the extension README pins, computed
+  independently.
+- Enable ran the whole publish transaction (certificates, mihomo rules, sidecar
+  bundle push, DNS overlay) and reported `ready: true`.
+- The new sidecar accepted the gateway's existing 498 KB production document
+  under `--check-config` before deployment, so the added fields are backward
+  compatible.
+- A live request to `weatherkit.apple.com` through the gateway ran the bundle.
+  The plugin engine log ring carries its own output under
+  `extension: io.5gpn.weatherkit`, `action: weather-availability`, with the
+  pinned script digest, `$argument` parsed into the nested settings tree, and
+  the URL decomposed by the `URL` implementation added here.
+
+Apple answers an unauthenticated request with `401` and `text/plain`, so the
+published action — which matches status 200 — does not fire against it. The run
+above used a temporary variant that also matched 401 purely to observe
+execution; the bundle correctly declined to transform a `text/plain` body. A
+200 needs a real device JWT, so end-to-end *output* on a gateway is still
+unproven. Both transformations are proven against the real asset in the unit
+tests.
+
+`go test -race ./...` passes for this module and for `cmd/5gpn-dns` on Linux.
+Two of the 34 shell policy tests fail there, and both fail identically on an
+untouched checkout.
 
