@@ -1039,3 +1039,36 @@ func TestCompiledConfigPreservesActiveAndMappedHostSemantics(t *testing.T) {
 		t.Fatalf("compiled mapped target = %q", got)
 	}
 }
+
+// The sidecar does not act on a [Host] mapping — it dials every origin by name
+// and lets the gateway's resolver decide the address. But it validates the
+// document it is handed, so a target form it does not recognise is a form the
+// operator cannot deploy: the whole configuration is refused one layer below
+// anything that could explain why. The vocabulary is shared even though the
+// behaviour is not.
+func TestHostTargetAcceptsEveryLoonForm(t *testing.T) {
+	for _, target := range []string{
+		"203.0.113.9",       // address
+		"origin.example.com", // alias
+		"server:1.1.1.1",     // resolver
+		"server:1.1.1.1,9.9.9.9",
+	} {
+		if !validHostTarget(target) {
+			t.Errorf("%q was refused; the gateway accepts it, so the document cannot be deployed", target)
+		}
+	}
+}
+
+// The scope refusal is duplicated rather than delegated: a mapping is the one
+// way an extension could aim origin traffic at a private address, and both
+// sides validate what they accept.
+func TestHostTargetRefusesNonGlobalAddresses(t *testing.T) {
+	for _, target := range []string{
+		"127.0.0.1", "10.0.1.20", "192.168.1.1", "172.16.0.1",
+		"169.254.169.254", "100.64.0.1", "server:", "server: , ",
+	} {
+		if validHostTarget(target) {
+			t.Errorf("%q was accepted as a mapping target", target)
+		}
+	}
+}

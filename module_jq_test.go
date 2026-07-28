@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -78,13 +80,43 @@ func TestJQRunsUpstreamExpressionsVerbatim(t *testing.T) {
 	}
 }
 
-func TestJQRejectsANonJSONBody(t *testing.T) {
+func TestJQLeavesANonJSONBodyAlone(t *testing.T) {
 	t.Parallel()
-	// The action matched a path its author declared to be JSON. Forwarding
-	// something else unchanged would hide a mismatch between the manifest's
-	// pattern and what the endpoint actually returns.
-	if _, err := runJQFixture(t, ".", "<html></html>"); err == nil {
-		t.Fatal("expected a non-JSON body to be refused")
+	// An origin answers a JSON endpoint with a non-JSON body whenever it likes.
+	// api.zhihu.com/search/recommend_query/v1 -- a path a shipped zhihu action
+	// filters -- returns the plain text "404 page not found" to an
+	// unauthenticated client, and the response-phase caller is fail-closed, so
+	// treating that as a failure turned the origin's 404 into a 502 on every
+	// such request. Nothing can hide in a body that is not JSON.
+	if _, err := runJQFixture(t, ".", "404 page not found"); !errors.Is(err, errJQBodyNotJSON) {
+		t.Fatalf("non-JSON body = %v, want errJQBodyNotJSON so the caller can no-op", err)
+	}
+	if _, err := runJQFixture(t, ".", "<html></html>"); !errors.Is(err, errJQBodyNotJSON) {
+		t.Fatalf("HTML body = %v, want errJQBodyNotJSON", err)
+	}
+}
+
+// The no-op has to reach the caller as "nothing changed", not as an empty body:
+// an empty body would truncate the response just as surely as the 502 replaced
+// it. Driven through execute() so the dispatch path is covered too.
+func TestJQActionOnANonJSONBodyChangesNothing(t *testing.T) {
+	t.Parallel()
+	rule := ScriptRule{
+		ID: "clean", Phase: "response", BodyMode: "text",
+		JQProgram: ".data |= map(select(.ad != true))",
+		TimeoutMS: 1000, MaxBodyBytes: 1 << 20,
+	}
+	body := []byte("404 page not found")
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 404, Headers: make(http.Header), Body: body}
+
+	result, err := newScriptRuntime().execute(
+		context.Background(), Config{}, nil, nativeRuntimeModule(), rule, request, &response)
+	if err != nil {
+		t.Fatalf("a jq action on a non-JSON body = %v; the origin's response must survive", err)
+	}
+	if result.ChangedBody || result.Body != nil || result.Abort {
+		t.Fatalf("jq produced %+v on a non-JSON body, want an untouched message", result)
 	}
 }
 

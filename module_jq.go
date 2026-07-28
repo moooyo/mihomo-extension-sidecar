@@ -43,14 +43,29 @@ func compileJQProgram(program string) (*gojq.Code, error) {
 	return code, nil
 }
 
-// runJQ transforms one JSON document. A body that is not JSON is an error
-// rather than a pass-through: the action matched a path its author declared to
-// be JSON, and silently forwarding something else would hide a a mismatch
-// between the manifest's pattern and reality.
+// errJQBodyNotJSON reports a body a JSON filter has nothing to say about.
+//
+// This used to be an ordinary failure, on the reasoning that the action matched
+// a path its author declared to be JSON and forwarding something else would hide
+// a mismatch between the manifest's pattern and reality. Live traffic disproved
+// the premise. An origin answers a JSON endpoint with a non-JSON body whenever
+// it feels like it -- `404 page not found` in plain text, an HTML error page, a
+// CDN block notice -- and none of that is a manifest bug. It is normal HTTP.
+//
+// Treating it as a failure was actively destructive, because the caller's
+// response-phase exit is fail-closed: one unparseable body turned a perfectly
+// good 404 from the origin into a 502 the client had no way to interpret. Ads
+// cannot hide in a body that is not JSON, so there is nothing for the filter to
+// do and nothing leaks by leaving it alone. Failing closed protects capture, not
+// this: a transform that cannot run must not destroy what it cannot edit.
+var errJQBodyNotJSON = errors.New("action body is not JSON")
+
+// runJQ transforms one JSON document. A body that does not parse as JSON yields
+// errJQBodyNotJSON, which the caller turns into a no-op rather than a failure.
 func runJQ(ctx context.Context, code *gojq.Code, body []byte, settings map[string]any) ([]byte, error) {
 	var input any
 	if err := json.Unmarshal(body, &input); err != nil {
-		return nil, fmt.Errorf("action body is not JSON: %w", err)
+		return nil, errJQBodyNotJSON
 	}
 	if settings == nil {
 		settings = map[string]any{}
@@ -104,6 +119,10 @@ func (r *scriptRuntime) executeJQ(
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}
 	transformed, err := runJQ(ctx, code, body, settings)
+	if errors.Is(err, errJQBodyNotJSON) {
+		// Nothing to filter. Leave the message exactly as it arrived.
+		return scriptResult{}, nil
+	}
 	if err != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}

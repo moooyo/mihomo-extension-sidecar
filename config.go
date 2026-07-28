@@ -1360,12 +1360,63 @@ func validateHostMappings(captureHosts []string, mappings []HostMapping) error {
 	return nil
 }
 
+// validHostTarget accepts the three forms of a Loon [Host] target.
+//
+// The sidecar does not act on a mapping — it dials every origin by name through
+// the authenticated egress and lets the gateway's resolver decide the address,
+// which is exactly where a mapping takes effect. But it does validate the
+// document it is handed, so a form it does not recognise is a form the operator
+// cannot deploy: refusing "server:1.1.1.1" here rejected the whole
+// configuration, one layer below anything that could explain why.
+//
+// So the vocabulary is shared even though the behaviour is not. The address
+// form's scope refusal is duplicated rather than delegated for the same reason
+// the gateway has it: a mapping is the one way an extension could aim origin
+// traffic at a private address, and both sides validate what they accept.
 func validHostTarget(value string) bool {
+	// Before canonicalHost, which splits host:port and would read
+	// "server:1.1.1.1" as the host "server" on the port "1.1.1.1".
+	if rest, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(value)), hostTargetServerPrefix); ok {
+		return validHostTargetServers(rest)
+	}
 	value = canonicalHost(value)
 	if ip := net.ParseIP(value); ip != nil {
-		return ip.To4() != nil && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+		return ip.To4() != nil && hostTargetAddressAllowed(ip)
 	}
 	return !strings.HasPrefix(value, "*.") && value != "localhost" && !strings.HasSuffix(value, ".local") && validHostPattern(value)
+}
+
+// hostTargetServerPrefix marks the resolver form. Loon's spelling, not ours.
+const hostTargetServerPrefix = "server:"
+
+// maxHostTargetServers matches the gateway's bound. Disagreeing would let a
+// document pass one side and fail the other, which is the failure this whole
+// function exists to prevent.
+const maxHostTargetServers = 4
+
+func validHostTargetServers(rest string) bool {
+	count := 0
+	for _, part := range strings.Split(rest, ",") {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		count++
+	}
+	return count > 0 && count <= maxHostTargetServers
+}
+
+// hostTargetAddressAllowed refuses every address the gateway must never be
+// pointed at. Carrier-grade NAT is refused alongside the private ranges:
+// IsGlobalUnicast reports true for 100.64/10, but it is neither globally
+// routable nor the operator's own network.
+func hostTargetAddressAllowed(ip net.IP) bool {
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	if four := ip.To4(); four != nil && four[0] == 100 && four[1]&0xc0 == 64 {
+		return false
+	}
+	return true
 }
 
 func validModuleID(id string) bool {
