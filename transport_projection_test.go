@@ -12,7 +12,7 @@ func TestUpstreamTransportProjectionPreservesOnlyTransportAuthorization(t *testi
 	cfg.Modules[0].HostMappings = []HostMapping{
 		{Pattern: "api.example.com", Target: "203.0.113.8"},
 	}
-	cfg.Modules[0].NetworkOrigins = []string{"https://worker.example.com:8443"}
+	cfg.Modules[0].Network = true
 	compiled, err := compileScriptConfig(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -30,9 +30,11 @@ func TestUpstreamTransportProjectionPreservesOnlyTransportAuthorization(t *testi
 		ok   bool
 	}{
 		{host: "api.example.com", port: "443", want: socksTarget{Host: "203.0.113.8", Port: 443}, ok: true},
+		// The network grant is unbounded, so every port and host the module did
+		// not capture is servable rather than only the ones it listed.
 		{host: "worker.example.com", port: "8443", want: socksTarget{Host: "worker.example.com", Port: 8443}, ok: true},
-		{host: "worker.example.com", port: "443"},
-		{host: "other.example.com", port: "443"},
+		{host: "worker.example.com", port: "443", want: socksTarget{Host: "worker.example.com", Port: 443}, ok: true},
+		{host: "other.example.com", port: "443", want: socksTarget{Host: "other.example.com", Port: 443}, ok: true},
 	} {
 		got, ok := projection.targets.upstreamTarget(test.host, test.port)
 		if ok != test.ok || got != test.want {
@@ -77,10 +79,7 @@ func TestUpstreamTargetProjectionMatchesValidatedConfigResolution(t *testing.T) 
 		{Pattern: "*.example.com", Target: "198.51.100.7"},
 		{Pattern: "api.example.com", Target: "203.0.113.8"},
 	}
-	cfg.Modules[0].NetworkOrigins = []string{
-		"http://events.example.net:8080",
-		"https://worker.example.net:8443",
-	}
+	cfg.Modules[0].Network = true
 	projection := newUpstreamTransportProjection(cfg)
 	for _, target := range []struct {
 		host string

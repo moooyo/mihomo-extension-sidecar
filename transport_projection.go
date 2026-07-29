@@ -19,7 +19,10 @@ type upstreamTargetProjection struct {
 	enabled        bool
 	activeHosts    *compiledHostMatcher
 	modules        []upstreamModuleProjection
-	networkTargets map[socksTarget]struct{}
+	// networkGrant is true when any enabled module holds the network
+	// permission. That grant carries no origin list, so there is nothing to
+	// enumerate: it either makes every target servable or none.
+	networkGrant bool
 }
 
 type upstreamModuleProjection struct {
@@ -38,7 +41,7 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 	targets := upstreamTargetProjection{
 		enabled:        cfg.MITM.Enabled,
 		activeHosts:    projectedActiveHostMatcher(cfg),
-		networkTargets: make(map[socksTarget]struct{}),
+		networkGrant:   false,
 	}
 	for _, module := range cfg.Modules {
 		if !module.Enabled {
@@ -55,11 +58,8 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 			})
 		}
 		targets.modules = append(targets.modules, projectedModule)
-		for _, origin := range module.NetworkOrigins {
-			_, canonical, target, err := parseModuleNetworkRequestURL(origin)
-			if err == nil && canonical == origin {
-				targets.networkTargets[target] = struct{}{}
-			}
+		if module.Network {
+			targets.networkGrant = true
 		}
 	}
 	return upstreamTransportProjection{
@@ -124,12 +124,10 @@ func (p upstreamTargetProjection) upstreamTarget(rawHost, portText string) (sock
 		}
 		return socksTarget{Host: target, Port: port}, true
 	}
-	target := socksTarget{Host: host, Port: port}
-	_, allowed := p.networkTargets[target]
-	if !allowed {
+	if !p.networkGrant {
 		return socksTarget{}, false
 	}
-	return target, true
+	return socksTarget{Host: host, Port: port}, true
 }
 
 func (a inboundUDPAuthorization) allows(target socksTarget) bool {

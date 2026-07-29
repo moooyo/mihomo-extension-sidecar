@@ -58,7 +58,7 @@ func TestNativeNetworkRequestUsesApprovedSOCKSOriginWithoutImplicitCredentials(t
   return {response: {status: reply.status, headers: reply.headers, trailers: reply.trailers, body: reply.text + ":" + reply.body[0]}}
 }`, strconv.Quote(origin))
 	module := nativeRuntimeModule()
-	module.NetworkOrigins = []string{origin}
+	module.Network = true
 	rule := nativeRuntimeRule(source, "response", "text")
 	rule.TimeoutMS = 2000
 	request := scriptMessage{
@@ -120,20 +120,21 @@ func TestNativeNetworkRequestRejectsUnapprovedOriginAndLimitsCalls(t *testing.T)
 	proxy, _ := startTestSOCKSTCPRelay(t, parsed.Host)
 	origin := "http://network.example:" + port
 
-	t.Run("unapproved", func(t *testing.T) {
+	// The grant no longer carries an origin list, so there is no such thing as
+	// an unapproved host for a module that holds it. What is still absolute is
+	// that a module without the grant has no request API at all: the property
+	// worth pinning moved from "which origin" to "whether the object exists".
+	t.Run("ungranted", func(t *testing.T) {
 		source := `function transform(context) {
-  try { context.network.request({url: "http://other.example:80/"}) } catch (error) {
-    return {response: {body: String(error)}}
-  }
-  throw new Error("request unexpectedly succeeded")
+  return {response: {body: String(context.network)}}
 }`
 		module := nativeRuntimeModule()
-		module.NetworkOrigins = []string{origin}
+		module.Network = false
 		request := scriptMessage{URL: "https://api.example.com/", Headers: make(http.Header)}
 		response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header)}
 		result, err := newScriptRuntime().execute(context.Background(), Config{UpstreamProxy: proxy}, nil, module, nativeRuntimeRule(source, "response", "text"), request, &response)
-		if err != nil || !strings.Contains(string(result.Body), "not permitted") {
-			t.Fatalf("unapproved result=%q err=%v", result.Body, err)
+		if err != nil || string(result.Body) != "undefined" {
+			t.Fatalf("ungranted result=%q err=%v", result.Body, err)
 		}
 	})
 
@@ -146,7 +147,7 @@ func TestNativeNetworkRequestRejectsUnapprovedOriginAndLimitsCalls(t *testing.T)
   return {response: {body: caught}}
 }`, strconv.Quote(origin))
 		module := nativeRuntimeModule()
-		module.NetworkOrigins = []string{origin}
+		module.Network = true
 		rule := nativeRuntimeRule(source, "response", "text")
 		rule.TimeoutMS = 3000
 		request := scriptMessage{URL: "https://api.example.com/", Headers: make(http.Header)}
@@ -182,7 +183,7 @@ func TestNativeNetworkRequestDoesNotFollowRedirects(t *testing.T) {
   return {response: {status: reply.status, body: reply.text}}
 }`, strconv.Quote(origin))
 	module := nativeRuntimeModule()
-	module.NetworkOrigins = []string{origin}
+	module.Network = true
 	rule := nativeRuntimeRule(source, "response", "text")
 	rule.TimeoutMS = 2000
 	request := scriptMessage{URL: "https://api.example.com/", Headers: make(http.Header)}
@@ -210,11 +211,10 @@ func TestNativeNetworkRequestVerifiesTLSThroughSOCKS(t *testing.T) {
 	proxy, targets := startTestSOCKSTCPRelay(t, parsed.Host)
 	origin := "https://api.example.com:" + port
 	options := map[string]any{"url": origin + "/secure"}
-	allowed := map[string]struct{}{origin: {}}
-	if _, err := performModuleNetworkRequest(context.Background(), proxy, nil, allowed, make(chan struct{}, 1), options); err == nil {
+	if _, err := performModuleNetworkRequest(context.Background(), proxy, nil, make(chan struct{}, 1), options); err == nil {
 		t.Fatal("untrusted upstream certificate was accepted")
 	}
-	result, err := performModuleNetworkRequest(context.Background(), proxy, roots, allowed, make(chan struct{}, 1), options)
+	result, err := performModuleNetworkRequest(context.Background(), proxy, roots, make(chan struct{}, 1), options)
 	if err != nil || result.status != http.StatusOK || string(result.body) != "secure" {
 		t.Fatalf("TLS result=%+v err=%v", result, err)
 	}
@@ -243,7 +243,7 @@ func TestNativeNetworkRequestUsesActionAndCallerCancellation(t *testing.T) {
   return null
 }`, strconv.Quote(origin))
 	module := nativeRuntimeModule()
-	module.NetworkOrigins = []string{origin}
+	module.Network = true
 	rule := nativeRuntimeRule(source, "response", "none")
 	rule.TimeoutMS = 100
 	request := scriptMessage{URL: "https://api.example.com/", Headers: make(http.Header)}
@@ -266,23 +266,22 @@ func TestNativeNetworkRequestUsesActionAndCallerCancellation(t *testing.T) {
 
 func TestNativeNetworkRequestInternalSizeAndConcurrencyLimits(t *testing.T) {
 	t.Parallel()
-	allowed := map[string]struct{}{"http://network.example": {}}
 	slots := make(chan struct{}, 1)
 	slots <- struct{}{}
-	_, err := performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, allowed, slots, map[string]any{
+	_, err := performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, slots, map[string]any{
 		"url": "http://network.example:80/",
 	})
 	if err == nil || !strings.Contains(err.Error(), "capacity") {
 		t.Fatalf("capacity error = %v", err)
 	}
-	_, err = performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, allowed, make(chan struct{}, 1), map[string]any{
+	_, err = performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, make(chan struct{}, 1), map[string]any{
 		"url":  "http://network.example:80/",
 		"body": strings.Repeat("x", int(maxModuleNetworkRequestBody)+1),
 	})
 	if err == nil || !strings.Contains(err.Error(), "request body exceeds") {
 		t.Fatalf("body limit error = %v", err)
 	}
-	_, err = performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, allowed, make(chan struct{}, 1), map[string]any{
+	_, err = performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, make(chan struct{}, 1), map[string]any{
 		"url": "http://network.example:80/",
 		"headers": map[string]any{
 			"X-Oversized": strings.Repeat("x", int(maxModuleNetworkHeaderBytes)+1),
@@ -296,7 +295,7 @@ func TestNativeNetworkRequestInternalSizeAndConcurrencyLimits(t *testing.T) {
 		{"Connection": "close"},
 		{"X-Duplicate": "one", "x-duplicate": "two"},
 	} {
-		_, err = performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, allowed, make(chan struct{}, 1), map[string]any{
+		_, err = performModuleNetworkRequest(context.Background(), ProxyConfig{}, nil, make(chan struct{}, 1), map[string]any{
 			"url":     "http://network.example:80/",
 			"headers": headers,
 		})
@@ -318,7 +317,7 @@ func TestNativeNetworkRequestRejectsOversizedResponse(t *testing.T) {
 	origin := "http://network.example:" + port
 	_, err := performModuleNetworkRequest(
 		context.Background(), proxy, nil,
-		map[string]struct{}{origin: {}}, make(chan struct{}, 1),
+		make(chan struct{}, 1),
 		map[string]any{"url": origin + "/large"},
 	)
 	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
@@ -348,7 +347,7 @@ func TestNativeNetworkRequesterReusesSameOriginAndClosesAtActionEnd(t *testing.T
 	})
 	actionCtx, cancelAction := context.WithCancel(context.Background())
 	defer cancelAction()
-	requester := newModuleNetworkRequester(actionCtx, proxy, nil, []string{origin}, make(chan struct{}, 1))
+	requester := newModuleNetworkRequester(actionCtx, proxy, nil, make(chan struct{}, 1))
 
 	for index := 0; index < 2; index++ {
 		result, requestErr := requester.request(map[string]any{"url": origin + "/same-origin"})
@@ -387,7 +386,7 @@ func TestNativeNetworkRequesterReusesSameOriginAndClosesAtActionEnd(t *testing.T
 
 	nextActionCtx, cancelNextAction := context.WithCancel(context.Background())
 	defer cancelNextAction()
-	nextRequester := newModuleNetworkRequester(nextActionCtx, proxy, nil, []string{origin}, make(chan struct{}, 1))
+	nextRequester := newModuleNetworkRequester(nextActionCtx, proxy, nil, make(chan struct{}, 1))
 	result, requestErr := nextRequester.request(map[string]any{"url": origin + "/next-action"})
 	if requestErr != nil || string(result.body) != "reused" {
 		t.Fatalf("next action result=%+v err=%v", result, requestErr)
@@ -434,7 +433,7 @@ func TestNativeNetworkAPIClosesConnectionsWhenActionReturns(t *testing.T) {
   return {response: {body: first.text + ":" + second.text}}
 }`, strconv.Quote(origin), strconv.Quote(origin))
 	module := nativeRuntimeModule()
-	module.NetworkOrigins = []string{origin}
+	module.Network = true
 	rule := nativeRuntimeRule(source, "response", "text")
 	rule.TimeoutMS = 2000
 	request := scriptMessage{URL: "https://api.example.com/", Headers: make(http.Header)}
@@ -505,7 +504,7 @@ func TestNativeNetworkRequesterKeepsExactOriginsSeparate(t *testing.T) {
 	actionCtx, cancelAction := context.WithCancel(context.Background())
 	defer cancelAction()
 	requester := newModuleNetworkRequester(
-		actionCtx, proxy, nil, []string{firstOrigin, secondOrigin}, make(chan struct{}, 1),
+		actionCtx, proxy, nil, make(chan struct{}, 1),
 	)
 
 	for _, test := range []struct {

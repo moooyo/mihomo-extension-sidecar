@@ -37,7 +37,13 @@ const (
 	// fields, so a coordinator that emits it to a schema-1 build loses its whole
 	// configuration rather than one action; the version is what makes that a
 	// refusal at connect time instead.
-	controlAPISchema = 2
+	//
+	// 3 replaced the network_origins/network_any pair with a single network
+	// boolean, and turned enabled_when from a boolean setting key into a
+	// key/equals comparison. Both are incompatible in both directions: a
+	// schema-2 coordinator's origin list is now an unknown field, and its bare
+	// enabled_when string no longer decodes into an object.
+	controlAPISchema = 3
 
 	controlMaxRequestBytes = 32 << 20
 	controlReadTimeout     = 30 * time.Second

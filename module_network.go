@@ -33,31 +33,24 @@ func newModuleNetworkAPI(
 	ctx context.Context,
 	proxy ProxyConfig,
 	roots *x509.CertPool,
-	origins []string,
-	allowAny bool,
 	slots chan struct{},
 	loop *asyncLoop,
 ) (*goja.Object, func()) {
-	requester := newModuleNetworkRequester(ctx, proxy, roots, origins, slots)
-	requester.allowAny = allowAny
+	requester := newModuleNetworkRequester(ctx, proxy, roots, slots)
 	return requester.newAPI(vm, loop), requester.Close
 }
 
 // moduleNetworkRequester belongs to one action. It never shares transports
 // across action or configuration snapshots.
 type moduleNetworkRequester struct {
-	ctx     context.Context
-	proxy   ProxyConfig
-	roots   *x509.CertPool
-	allowed map[string]struct{}
-	// allowAny grants the declared network capability without an exact origin
-	// list, for extensions whose reachable hosts are operator-configured and
-	// therefore cannot be enumerated in a manifest. Every other guard still
-	// applies: the URL is canonicalized, IP literals and unsafe or private
-	// hosts are refused, and the request still leaves through authenticated
-	// mihomo SOCKS5.
-	allowAny bool
-	slots    chan struct{}
+	ctx   context.Context
+	proxy ProxyConfig
+	roots *x509.CertPool
+	// A requester exists only for a module holding the network grant, and that
+	// grant no longer carries an origin list. Every other guard still applies:
+	// the URL is canonicalized, IP literals and unsafe or private hosts are
+	// refused, and the request still leaves through authenticated mihomo SOCKS5.
+	slots chan struct{}
 
 	mu         sync.Mutex
 	transports map[string]*http.Transport
@@ -68,22 +61,15 @@ func newModuleNetworkRequester(
 	ctx context.Context,
 	proxy ProxyConfig,
 	roots *x509.CertPool,
-	origins []string,
 	slots chan struct{},
 ) *moduleNetworkRequester {
-	allowed := make(map[string]struct{}, len(origins))
-	for _, origin := range origins {
-		allowed[origin] = struct{}{}
-	}
-	requester := &moduleNetworkRequester{
+	return &moduleNetworkRequester{
 		ctx:        ctx,
 		proxy:      proxy,
 		roots:      roots,
-		allowed:    allowed,
 		slots:      slots,
 		transports: make(map[string]*http.Transport),
 	}
-	return requester
 }
 
 func (r *moduleNetworkRequester) newAPI(vm *goja.Runtime, loop *asyncLoop) *goja.Object {
@@ -203,15 +189,10 @@ func performModuleNetworkRequest(
 	ctx context.Context,
 	proxy ProxyConfig,
 	roots *x509.CertPool,
-	allowed map[string]struct{},
 	slots chan struct{},
 	options map[string]any,
 ) (moduleNetworkResponse, error) {
-	origins := make([]string, 0, len(allowed))
-	for origin := range allowed {
-		origins = append(origins, origin)
-	}
-	requester := newModuleNetworkRequester(ctx, proxy, roots, origins, slots)
+	requester := newModuleNetworkRequester(ctx, proxy, roots, slots)
 	defer requester.Close()
 	return requester.request(options)
 }
@@ -246,9 +227,6 @@ func (r *moduleNetworkRequester) performRequest(options map[string]any, waitForS
 	parsed, origin, target, err := parseModuleNetworkRequestURL(rawURL)
 	if err != nil {
 		return moduleNetworkResponse{}, err
-	}
-	if _, permitted := r.allowed[origin]; !permitted && !r.allowAny {
-		return moduleNetworkResponse{}, fmt.Errorf("origin %q is not permitted", origin)
 	}
 	method := http.MethodGet
 	if rawMethod, exists := options["method"]; exists {

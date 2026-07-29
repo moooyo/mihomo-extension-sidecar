@@ -151,7 +151,7 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	case rule.Headers != nil:
 		return executeHeaderEdits(rule, request, response)
 	case rule.Rewrite != nil:
-		return executeRewrite(rule, request)
+		return executeRewrite(rule, module, request)
 	case rule.ReplaceBody != nil:
 		return executeBodyReplace(rule, module, request, response)
 	case rule.JQProgram != "":
@@ -209,12 +209,11 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		contextObject["storage"] = r.storageObject(vm, module.ID)
 	}
 	var requester *moduleNetworkRequester
-	if len(module.NetworkOrigins) > 0 || module.NetworkAny {
-		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, module.NetworkAny, r.networkSlots, loop)
+	if module.Network {
+		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, r.networkSlots, loop)
 		defer closeNetwork()
 		contextObject["network"] = network
-		requester = newModuleNetworkRequester(actionCtx, cfg.UpstreamProxy, roots, module.NetworkOrigins, r.networkSlots)
-		requester.allowAny = module.NetworkAny
+		requester = newModuleNetworkRequester(actionCtx, cfg.UpstreamProxy, roots, r.networkSlots)
 		defer requester.Close()
 	}
 
@@ -270,16 +269,23 @@ func scriptSettingValues(module Module, rule ScriptRule) (map[string]any, error)
 
 // actionGateOpen reports whether an action's enabled_when permits it to run.
 //
-// Only an explicit false closes the gate. An action with no gate, or one whose
-// setting resolves to anything else, stays compiled: a document that reached
-// this point has already been validated, and between wrongly dropping an action
-// and wrongly keeping one, dropping is the failure an operator cannot see.
+// The setting's value is rendered to text and compared to the declared one, so
+// a select gate matches the option string an operator picked and a boolean gate
+// matches "true" or "false".
+//
+// An action with no gate, or one whose setting is absent from the values map,
+// stays compiled: a document that reached this point has already been
+// validated, and between wrongly dropping an action and wrongly keeping one,
+// dropping is the failure an operator cannot see.
 func actionGateOpen(rule ScriptRule, settings map[string]any) bool {
-	if rule.EnabledWhen == "" {
+	if rule.EnabledWhen == nil {
 		return true
 	}
-	enabled, ok := settings[rule.EnabledWhen].(bool)
-	return !ok || enabled
+	value, ok := settings[rule.EnabledWhen.Key]
+	if !ok {
+		return true
+	}
+	return compatArgumentText(value) == rule.EnabledWhen.Equals
 }
 
 func cloneScriptSettings(settings map[string]any) map[string]any {

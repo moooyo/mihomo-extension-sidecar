@@ -153,7 +153,7 @@ func executeHeaderEdits(rule ScriptRule, request scriptMessage, response *script
 // redirect. The in-place form still passes through the same authorisation the
 // scripted rewrite uses, so a cross-origin target still needs a declared
 // network origin.
-func executeRewrite(rule ScriptRule, request scriptMessage) (scriptResult, error) {
+func executeRewrite(rule ScriptRule, module Module, request scriptMessage) (scriptResult, error) {
 	rewrite := rule.Rewrite
 	if rewrite.compiled == nil {
 		if err := rewrite.validate(); err != nil {
@@ -167,7 +167,19 @@ func executeRewrite(rule ScriptRule, request scriptMessage) (scriptResult, error
 		// template with no captures would build a wrong URL.
 		return scriptResult{}, nil
 	}
-	target := string(rewrite.compiled.ExpandString(nil, rewrite.To, request.URL, match))
+	// {{settings.key}} resolves before the capture groups do, so a setting can
+	// choose the host while the pattern still carries the rest of the URL
+	// through. An unresolvable key declines the action, which leaves the request
+	// going where it was already going.
+	settings, err := scriptSettingValues(module, rule)
+	if err != nil {
+		return scriptResult{}, err
+	}
+	to, ok := expandSettingsTemplate(rewrite.To, nil, settings)
+	if !ok {
+		return scriptResult{}, nil
+	}
+	target := string(rewrite.compiled.ExpandString(nil, to, request.URL, match))
 	if len(target) == 0 || len(target) > maxRewriteURLBytes {
 		return scriptResult{}, fmt.Errorf("rewritten URL must contain 1 to %d bytes", maxRewriteURLBytes)
 	}
@@ -205,7 +217,7 @@ func executeBodyReplace(rule ScriptRule, module Module, request scriptMessage, r
 	if err != nil {
 		return scriptResult{}, err
 	}
-	template, ok := expandReplacementTemplate(replace, settings)
+	template, ok := expandSettingsTemplate(replace.To, replace.ValueMap, settings)
 	if !ok {
 		// A setting value with no mapping declines rather than substituting an
 		// empty string into the body.
@@ -217,12 +229,17 @@ func executeBodyReplace(rule ScriptRule, module Module, request scriptMessage, r
 	return scriptResult{Body: replace.compiled.ReplaceAll(body, []byte(template)), ChangedBody: true}, nil
 }
 
-// expandReplacementTemplate substitutes {{settings.key}} in the replacement.
-// When the action declares a valueMap for that key the setting's value is
-// looked up in it, which is how a module that hard-codes one value becomes an
-// extension whose operator chooses among several.
-func expandReplacementTemplate(replace *BodyReplace, settings map[string]any) (string, bool) {
-	out := replace.To
+// expandSettingsTemplate substitutes {{settings.key}} in a template. When the
+// action declares a valueMap for that key the setting's value is looked up in
+// it, which is how a module that hard-codes one value becomes an extension
+// whose operator chooses among several.
+//
+// A missing key or an unmapped value returns false, and every caller declines
+// rather than substituting an empty string. For a body replacement that would
+// corrupt the document; for a rewrite target it would build a URL pointing at
+// nothing, or worse, at something else.
+func expandSettingsTemplate(template string, valueMap map[string]map[string]string, settings map[string]any) (string, bool) {
+	out := template
 	for {
 		start := strings.Index(out, "{{settings.")
 		if start < 0 {
@@ -238,7 +255,7 @@ func expandReplacementTemplate(replace *BodyReplace, settings map[string]any) (s
 			return "", false
 		}
 		value := compatArgumentText(raw)
-		if mapping, mapped := replace.ValueMap[key]; mapped {
+		if mapping, mapped := valueMap[key]; mapped {
 			substitution, found := mapping[value]
 			if !found {
 				return "", false

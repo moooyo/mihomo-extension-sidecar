@@ -31,7 +31,7 @@ func authorizeModuleRequestURLRewriteConfig(cfg Config, module Module, currentUR
 	}
 
 	if targetOrigin == currentOrigin {
-		if !moduleCapturesHost(cfg, module, target.Hostname()) && !moduleDeclaresNetworkOrigin(module, targetOrigin) {
+		if !moduleCapturesHost(cfg, module, target.Hostname()) && !module.Network {
 			return nil, errors.New("same-origin rewrite target is outside the extension boundary")
 		}
 		// Same-origin rewrites retain the existing URL representation behavior.
@@ -46,19 +46,14 @@ func authorizeModuleRequestURLRewriteConfig(cfg Config, module Module, currentUR
 	if rawTarget.Scheme+"://"+rawTarget.Host != targetOrigin {
 		return nil, errors.New("cross-origin request URL origin must be canonical")
 	}
-	if !moduleDeclaresNetworkOrigin(module, targetOrigin) {
-		return nil, fmt.Errorf("cross-origin request URL origin %q is not declared", targetOrigin)
+	// A cross-origin rewrite hands the captured request -- its method, decoded
+	// body, and end-to-end headers, credentials included -- to another host. The
+	// network grant is what authorizes that. It no longer carries an origin
+	// list, so this is a check for the grant rather than for membership of one.
+	if !module.Network {
+		return nil, fmt.Errorf("cross-origin request URL origin %q needs the network permission", targetOrigin)
 	}
 	return target, nil
-}
-
-func moduleDeclaresNetworkOrigin(module Module, origin string) bool {
-	for _, allowed := range module.NetworkOrigins {
-		if allowed == origin {
-			return true
-		}
-	}
-	return false
 }
 
 func authorizeModuleRequestActionURL(cfg Config, module Module, rawURL string) error {
@@ -66,10 +61,10 @@ func authorizeModuleRequestActionURL(cfg Config, module Module, rawURL string) e
 	if err != nil {
 		return fmt.Errorf("current request URL is invalid: %w", err)
 	}
-	if moduleCapturesHost(cfg, module, parsed.Hostname()) || moduleDeclaresNetworkOrigin(module, origin) {
+	if moduleCapturesHost(cfg, module, parsed.Hostname()) || module.Network {
 		return nil
 	}
-	return fmt.Errorf("current request origin %q is outside this extension's capture hosts and declared network origins", origin)
+	return fmt.Errorf("current request origin %q is outside this extension's capture hosts and it holds no network permission", origin)
 }
 
 func activeModuleUpstreamTarget(cfg Config, rawHost, portText string) (socksTarget, bool) {
@@ -84,15 +79,11 @@ func activeModuleUpstreamTarget(cfg Config, rawHost, portText string) (socksTarg
 	if (port == 80 || port == 443) && activeInterceptHost(cfg, host) {
 		return socksTarget{Host: mappedInterceptTarget(cfg, host), Port: port}, true
 	}
+	// Any module holding the network grant may reach any host, so an active
+	// grant makes every target servable. There is no list left to enumerate.
 	for _, module := range cfg.Modules {
-		if !module.Enabled {
-			continue
-		}
-		for _, origin := range module.NetworkOrigins {
-			_, canonical, target, parseErr := parseModuleNetworkRequestURL(origin)
-			if parseErr == nil && canonical == origin && target.Host == host && target.Port == port {
-				return target, true
-			}
+		if module.Enabled && module.Network {
+			return socksTarget{Host: host, Port: port}, true
 		}
 	}
 	return socksTarget{}, false

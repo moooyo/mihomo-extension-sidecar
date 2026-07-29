@@ -32,7 +32,7 @@ func nativeAsyncFixture(t *testing.T, handler http.HandlerFunc) (Module, string,
 	proxy, _ := startTestSOCKSTCPRelay(t, parsed.Host)
 	origin := "https://api.example.com:" + port
 	module := nativeRuntimeModule()
-	module.NetworkOrigins = []string{origin}
+	module.Network = true
 	return module, origin, Config{UpstreamProxy: proxy}, roots
 }
 
@@ -98,18 +98,18 @@ func TestNativeAsyncNetworkRejectsInsteadOfThrowing(t *testing.T) {
 	})
 	source := `async function transform(context) {
   try {
-    await context.network.requestAsync({url: "https://not-permitted.example/v1"})
+    await context.network.requestAsync({url: "https://127.0.0.1/v1"})
     return { response: { body: "unexpected-success" } }
   } catch (error) {
-    return { response: { body: "rejected:" + (String(error).includes("not permitted") ? "origin" : "other") } }
+    return { response: { body: "rejected:" + (String(error).includes("host") ? "host" : "other") } }
   }
 }`
 	result, err := runNativeAsyncScript(t, source, module, cfg, roots, 10000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(result.Body); got != "rejected:origin" {
-		t.Fatalf("body = %q, want the origin refusal delivered as a rejection", got)
+	if got := string(result.Body); got != "rejected:host" {
+		t.Fatalf("body = %q, want the refused host delivered as a rejection", got)
 	}
 }
 

@@ -17,11 +17,7 @@ func TestAuthorizeModuleRequestURLRewrite(t *testing.T) {
 	t.Parallel()
 	module := nativeRuntimeModule()
 	module.CaptureHosts = []string{"api.example.com", "other.example.com"}
-	module.NetworkOrigins = []string{
-		"http://upgrade.example.com",
-		"https://worker.example.com",
-		"https://worker.example.com:8443",
-	}
+	module.Network = true
 
 	tests := []struct {
 		name       string
@@ -50,21 +46,20 @@ func TestAuthorizeModuleRequestURLRewrite(t *testing.T) {
 			name: "protocol upgrade", currentURL: "http://api.example.com/v1/player",
 			targetURL: "https://worker.example.com/process", wantURL: "https://worker.example.com/process",
 		},
+		// The grant is unbounded, so a host, scheme, or port this manifest never
+		// named is now authorized by holding the permission at all. What is left
+		// to refuse is the shape of the URL itself, and the downgrade.
 		{
-			name: "undeclared origin", currentURL: "https://api.example.com/v1/player",
-			targetURL: "https://undeclared.example.com/process", wantError: "is not declared",
+			name: "any cross origin", currentURL: "https://api.example.com/v1/player",
+			targetURL: "https://undeclared.example.com/process", wantURL: "https://undeclared.example.com/process",
 		},
 		{
-			name: "declared host with wrong scheme", currentURL: "http://api.example.com/v1/player",
-			targetURL: "http://worker.example.com/process", wantError: "is not declared",
+			name: "any port", currentURL: "https://api.example.com/v1/player",
+			targetURL: "https://worker.example.com:9443/process", wantURL: "https://worker.example.com:9443/process",
 		},
 		{
-			name: "declared host with wrong port", currentURL: "https://api.example.com/v1/player",
-			targetURL: "https://worker.example.com:9443/process", wantError: "is not declared",
-		},
-		{
-			name: "other capture host still requires origin permission", currentURL: "https://api.example.com/v1/player",
-			targetURL: "https://other.example.com/process", wantError: "is not declared",
+			name: "plaintext target from a plaintext request", currentURL: "http://api.example.com/v1/player",
+			targetURL: "http://worker.example.com/process", wantURL: "http://worker.example.com/process",
 		},
 		{
 			name: "protocol downgrade", currentURL: "https://api.example.com/v1/player",
@@ -171,7 +166,7 @@ func TestCrossOriginRequestRewritePreservesRequestAndUsesAuthenticatedSOCKS(t *t
 }`
 	module := nativeRuntimeModule()
 	module.Enabled = true
-	module.NetworkOrigins = []string{"http://worker.example.com"}
+	module.Network = true
 	module.Scripts = []ScriptRule{nativeRuntimeRule(source, "request", "binary")}
 	module.Scripts[0].Match.Schemes = []string{"http"}
 	cfg := Config{
@@ -261,7 +256,7 @@ func TestCrossOriginRequestRewriteDoesNotFollowRedirects(t *testing.T) {
 
 	module := nativeRuntimeModule()
 	module.Enabled = true
-	module.NetworkOrigins = []string{"http://worker.example.com"}
+	module.Network = true
 	module.Scripts = []ScriptRule{nativeRuntimeRule(
 		`function transform() { return {request: {url: "http://worker.example.com/first"}} }`,
 		"request",
@@ -300,7 +295,7 @@ func TestCrossOriginRequestRewriteDoesNotFollowRedirects(t *testing.T) {
 	}
 }
 
-func TestPrepareModuleRequestFailsClosedOnUndeclaredCrossOriginRewrite(t *testing.T) {
+func TestPrepareModuleRequestFailsClosedOnUngrantedCrossOriginRewrite(t *testing.T) {
 	t.Parallel()
 	module := nativeRuntimeModule()
 	module.Enabled = true
@@ -314,7 +309,7 @@ func TestPrepareModuleRequestFailsClosedOnUndeclaredCrossOriginRewrite(t *testin
 	outbound, handled, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequest(
 		httptest.NewRecorder(), request, cfg, "api.example.com",
 	)
-	if err == nil || !strings.Contains(err.Error(), "origin \"https://worker.example.com\" is not declared") {
+	if err == nil || !strings.Contains(err.Error(), "origin \"https://worker.example.com\" needs the network permission") {
 		t.Fatalf("outbound=%v handled=%v err=%v", outbound, handled, err)
 	}
 }
@@ -323,7 +318,7 @@ func TestPrepareModuleRequestUsesCanonicalCrossOriginAuthority(t *testing.T) {
 	t.Parallel()
 	module := nativeRuntimeModule()
 	module.Enabled = true
-	module.NetworkOrigins = []string{"https://worker.example.com:8443"}
+	module.Network = true
 	module.Scripts = []ScriptRule{nativeRuntimeRule(
 		`function transform() { return {request: {url: "https://worker.example.com:8443/process"}} }`,
 		"request",
@@ -361,7 +356,7 @@ func TestRequestActionsMayContinueInsideTheirDeclaredRewrittenOrigin(t *testing.
 	second.ID = "rewrite-path"
 	module := nativeRuntimeModule()
 	module.Enabled = true
-	module.NetworkOrigins = []string{"https://worker.example.com"}
+	module.Network = true
 	module.Scripts = []ScriptRule{first, second}
 	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
 	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
@@ -376,12 +371,12 @@ func TestRequestActionsMayContinueInsideTheirDeclaredRewrittenOrigin(t *testing.
 	}
 }
 
-func TestOverlappingRequestActionRequiresItsOwnRewrittenOriginPermission(t *testing.T) {
+func TestOverlappingRequestActionRequiresItsOwnNetworkPermission(t *testing.T) {
 	t.Parallel()
 	first := nativeRuntimeModule()
 	first.ID = "io.example.first"
 	first.Enabled = true
-	first.NetworkOrigins = []string{"https://worker.example.com"}
+	first.Network = true
 	first.Scripts = []ScriptRule{nativeRuntimeRule(
 		`function transform() { return {request: {url: "https://worker.example.com/process"}} }`,
 		"request",
@@ -411,7 +406,7 @@ func TestOverlappingRequestActionRequiresItsOwnRewrittenOriginPermission(t *test
 		t.Fatalf("outbound=%v handled=%v err=%v", outbound, handled, err)
 	}
 
-	second.NetworkOrigins = []string{"https://worker.example.com"}
+	second.Network = true
 	cfg.Modules = []Module{first, second}
 	request = httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
 	outbound, handled, err = (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequest(
@@ -425,13 +420,13 @@ func TestOverlappingRequestActionRequiresItsOwnRewrittenOriginPermission(t *test
 	}
 }
 
-func TestActiveModuleUpstreamTargetRequiresEnabledReviewedOrigin(t *testing.T) {
+func TestActiveModuleUpstreamTargetRequiresAnEnabledNetworkGrant(t *testing.T) {
 	t.Parallel()
 	module := nativeRuntimeModule()
-	module.NetworkOrigins = []string{"https://worker.example.com:8443"}
+	module.Network = true
 	cfg := Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{module}}
 	if _, allowed := activeModuleUpstreamTarget(cfg, "worker.example.com", "8443"); allowed {
-		t.Fatal("disabled module origin was active")
+		t.Fatal("disabled module grant was active")
 	}
 	module.Enabled = true
 	cfg.Modules = []Module{module}
@@ -439,15 +434,17 @@ func TestActiveModuleUpstreamTargetRequiresEnabledReviewedOrigin(t *testing.T) {
 	if !allowed || target != (socksTarget{Host: "worker.example.com", Port: 8443}) {
 		t.Fatalf("active target=%+v allowed=%v", target, allowed)
 	}
+	// Unbounded means unbounded: any host and port the grant holder asks for.
+	if _, allowed := activeModuleUpstreamTarget(cfg, "other.example.com", "443"); !allowed {
+		t.Fatal("granted module could not reach an unlisted host")
+	}
 	cfg.MITM.Enabled = false
 	if _, allowed := activeModuleUpstreamTarget(cfg, "worker.example.com", "8443"); allowed {
-		t.Fatal("origin stayed active with MITM disabled")
+		t.Fatal("grant stayed active with MITM disabled")
 	}
-	if _, allowed := activeModuleUpstreamTarget(Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{module}}, "other.example.com", "8443"); allowed {
-		t.Fatal("undeclared origin target was active")
-	}
-	module.NetworkOrigins = []string{"HTTPS://WORKER.EXAMPLE.COM:443/"}
-	if _, allowed := activeModuleUpstreamTarget(Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{module}}, "worker.example.com", "443"); allowed {
-		t.Fatal("noncanonical stored origin target was active")
+	ungranted := nativeRuntimeModule()
+	ungranted.Enabled = true
+	if _, allowed := activeModuleUpstreamTarget(Config{MITM: MITMSettings{Enabled: true}, Modules: []Module{ungranted}}, "worker.example.com", "8443"); allowed {
+		t.Fatal("module without the grant reached an upstream target")
 	}
 }
