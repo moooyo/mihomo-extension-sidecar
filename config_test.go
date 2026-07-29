@@ -64,7 +64,7 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Version != 5 || len(loaded.Modules) != 1 || loaded.Modules[0].ID != "io.example.fixture" || loaded.runtime == nil || len(loaded.runtime.modules) != 1 {
+	if loaded.Version != configVersion || len(loaded.Modules) != 1 || loaded.Modules[0].ID != "io.example.fixture" || loaded.runtime == nil || len(loaded.runtime.modules) != 1 {
 		t.Fatalf("loaded config = %+v", loaded)
 	}
 	if loaded.Modules[0].Scripts[0].program != nil || loaded.Modules[0].Scripts[0].settings != nil {
@@ -74,7 +74,7 @@ func TestConfigLoadsStrictNativeExtensionDocument(t *testing.T) {
 		t.Fatal("enabled compiled rule did not retain its validated program and settings")
 	}
 
-	duplicate := strings.Replace(string(body), `"version":5`, `"version":5,"Version":5`, 1)
+	duplicate := strings.Replace(string(body), `"version":6`, `"version":6,"Version":6`, 1)
 	if err := os.WriteFile(path, []byte(duplicate), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -761,7 +761,7 @@ func TestConfigRejectsStaleVersionAndInvalidExecutionOrder(t *testing.T) {
 	t.Parallel()
 	cfg := validNativeConfig()
 	cfg.Version = 3
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 5") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 6") {
 		t.Fatalf("version error = %v", err)
 	}
 	cfg = validNativeConfig()
@@ -791,37 +791,16 @@ func TestConfigRejectsStaleVersionAndInvalidExecutionOrder(t *testing.T) {
 func TestConfigValidatesNetworkAndEgressPermissions(t *testing.T) {
 	t.Parallel()
 	cfg := validNativeConfig()
-	cfg.Modules[0].NetworkOrigins = []string{
-		"http://events.example.com:8080",
-		"https://api.example.com",
-	}
+	// The grant is one boolean now. There is no list to canonicalize, sort, or
+	// reject entries from, so what remains to validate here is the egress
+	// binding beside it.
+	cfg.Modules[0].Network = true
 	cfg.Modules[0].EgressGroupRequired = true
 	cfg.Modules[0].EgressGroup = "Extension Egress"
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
 
-	invalidOrigins := []string{
-		"https://api.example.com:443",
-		"https://api.example.com:443/",
-		"https://api.example.com:8443/path",
-		"https://user@api.example.com:443",
-		"https://127.0.0.1:443",
-		"https://*.example.com:443",
-	}
-	for _, origin := range invalidOrigins {
-		cfg := validNativeConfig()
-		cfg.Modules[0].NetworkOrigins = []string{origin}
-		if err := cfg.Validate(); err == nil {
-			t.Errorf("accepted invalid network origin %q", origin)
-		}
-	}
-
-	cfg = validNativeConfig()
-	cfg.Modules[0].NetworkOrigins = []string{"https://z.example.com", "https://a.example.com"}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "sorted") {
-		t.Fatalf("unsorted origins error = %v", err)
-	}
 	cfg = validNativeConfig()
 	cfg.Modules[0].EgressGroupRequired = true
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "egress_group") {
@@ -1079,7 +1058,7 @@ func TestHostTargetRefusesNonGlobalAddresses(t *testing.T) {
 // hold the contract that makes it mean something: the gate must name a setting
 // the operator actually has, and a closed gate must remove the action rather
 // than let it run and decline.
-func TestActionGateMustNameARequiredBooleanSetting(t *testing.T) {
+func TestActionGateMustCompareARequiredSettingToAReachableValue(t *testing.T) {
 	t.Parallel()
 	booleanSetting := func(required bool, value string) []ModuleSetting {
 		return []ModuleSetting{{
@@ -1089,26 +1068,45 @@ func TestActionGateMustNameARequiredBooleanSetting(t *testing.T) {
 	}
 
 	cfg := validNativeConfig()
-	cfg.Modules[0].Scripts[0].EnabledWhen = "airborne"
+	cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "airborne", Equals: "true"}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "does not declare") {
 		t.Fatalf("undeclared gate setting error = %v", err)
 	}
 
-	cfg.Modules[0].Scripts[0].EnabledWhen = "not a key"
+	cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "not a key", Equals: "true"}
 	cfg.Modules[0].Settings = booleanSetting(true, `true`)
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not a valid setting key") {
 		t.Fatalf("malformed gate key error = %v", err)
 	}
 
-	cfg.Modules[0].Scripts[0].EnabledWhen = "airborne"
-	cfg.Modules[0].Settings = []ModuleSetting{{
-		Key: "airborne", Type: "text", Required: true,
-		Default: json.RawMessage(`"on"`), Value: json.RawMessage(`"on"`),
-	}}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "only boolean is supported") {
-		t.Fatalf("non-boolean gate error = %v", err)
+	cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "airborne", Equals: ""}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "no value to compare") {
+		t.Fatalf("valueless gate error = %v", err)
 	}
 
+	cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "airborne", Equals: "yes"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "compares a boolean setting") {
+		t.Fatalf("non-boolean comparison error = %v", err)
+	}
+
+	// A select gate is checked against its own options: comparing to a value
+	// the operator can never pick would compile to an action that never runs,
+	// which is the failure nobody sees.
+	cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "mode", Equals: "Cloud"}
+	cfg.Modules[0].Settings = []ModuleSetting{{
+		Key: "mode", Type: "select", Required: true, Options: []string{"Script", "Worker"},
+		Default: json.RawMessage(`"Script"`), Value: json.RawMessage(`"Script"`),
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not one of that setting's options") {
+		t.Fatalf("unreachable select value error = %v", err)
+	}
+
+	cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "mode", Equals: "Worker"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid select gate rejected: %v", err)
+	}
+
+	cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "airborne", Equals: "true"}
 	cfg.Modules[0].Settings = booleanSetting(false, `true`)
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must name a required one") {
 		t.Fatalf("optional gate setting error = %v", err)
@@ -1129,7 +1127,7 @@ func TestClosedActionGateRemovesTheCompiledRule(t *testing.T) {
 			Key: "airborne", Type: "boolean", Required: true,
 			Default: json.RawMessage(`true`), Value: json.RawMessage(value),
 		}}
-		cfg.Modules[0].Scripts[0].EnabledWhen = "airborne"
+		cfg.Modules[0].Scripts[0].EnabledWhen = &ActionGate{Key: "airborne", Equals: "true"}
 		body, err := json.Marshal(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -1149,5 +1147,48 @@ func TestClosedActionGateRemovesTheCompiledRule(t *testing.T) {
 	}
 	if got := compiledRules(t, `false`); got != 0 {
 		t.Fatalf("closed gate compiled %d rules; the action must not be matchable at all", got)
+	}
+}
+
+// One select choosing between two mutually exclusive action sets is the shape a
+// pair of booleans cannot express: with two switches an operator can turn both
+// on, and the manifest has to describe what that means. Here the value itself
+// makes it impossible.
+func TestSelectGateCompilesExactlyTheMatchingActionSet(t *testing.T) {
+	t.Parallel()
+	compiledIDs := func(t *testing.T, mode string) []string {
+		t.Helper()
+		cfg := validNativeConfig()
+		cfg.Modules[0].Settings = []ModuleSetting{{
+			Key: "Mode", Type: "select", Required: true, Options: []string{"Script", "Cloud"},
+			Default: json.RawMessage(`"Script"`), Value: json.RawMessage(`"` + mode + `"`),
+		}}
+		scripted := cfg.Modules[0].Scripts[0]
+		scripted.ID = "scripted"
+		scripted.EnabledWhen = &ActionGate{Key: "Mode", Equals: "Script"}
+		cloud := cfg.Modules[0].Scripts[0]
+		cloud.ID = "cloud"
+		cloud.EnabledWhen = &ActionGate{Key: "Mode", Equals: "Cloud"}
+		cfg.Modules[0].Scripts = []ScriptRule{scripted, cloud}
+		body, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := decodeConfig(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]string, 0, 2)
+		for _, compiled := range loaded.runtime.modules[0].rules {
+			ids = append(ids, compiled.rule.ID)
+		}
+		return ids
+	}
+
+	if got := compiledIDs(t, "Script"); len(got) != 1 || got[0] != "scripted" {
+		t.Fatalf("Script mode compiled %v", got)
+	}
+	if got := compiledIDs(t, "Cloud"); len(got) != 1 || got[0] != "cloud" {
+		t.Fatalf("Cloud mode compiled %v", got)
 	}
 }

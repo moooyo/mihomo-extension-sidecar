@@ -179,3 +179,47 @@ func TestHeaderEditsRefuseInjection(t *testing.T) {
 		t.Fatalf("err = %v, want the header refused", err)
 	}
 }
+
+// A rewrite target may name a setting, which is how upstream's own endpoint
+// argument survives the port: Loon interpolates {endpoint} into the rewrite
+// line, and this is the same idea with the manifest's own syntax.
+func TestRewriteTargetResolvesASettingBeforeItsCaptures(t *testing.T) {
+	t.Parallel()
+	rule := baseRule("request")
+	rule.Rewrite = &URLRewrite{
+		Pattern: `^https://api\.example\.com/v1/(.*)$`,
+		To:      "https://{{settings.Endpoint}}/v1/$1",
+	}
+	module := Module{
+		ID: "io.example.declarative", CaptureHosts: []string{"api.example.com"}, Network: true,
+		Settings: []ModuleSetting{{
+			Key: "Endpoint", Type: "select", Required: true, Options: []string{"a.example.net", "b.example.net"},
+			Default: []byte(`"a.example.net"`), Value: []byte(`"b.example.net"`),
+		}},
+	}
+	result, err := newScriptRuntime().execute(context.Background(), Config{}, nil, module, rule, declarativeRequest(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.ChangedURL || result.URL != "https://b.example.net/v1/thing?a=1" {
+		t.Fatalf("result = %+v, want the operator's endpoint with the rest of the URL carried through", result)
+	}
+}
+
+// An unresolvable key leaves the request going where it was already going.
+// Substituting nothing would build a URL pointing at something else.
+func TestRewriteTargetDeclinesAnUnresolvableSetting(t *testing.T) {
+	t.Parallel()
+	rule := baseRule("request")
+	rule.Rewrite = &URLRewrite{
+		Pattern: `^https://api\.example\.com/v1/(.*)$`,
+		To:      "https://{{settings.Missing}}/v1/$1",
+	}
+	result, err := runDeclarative(t, rule, declarativeRequest(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ChangedURL || result.Synthetic {
+		t.Fatalf("result = %+v, want the request untouched", result)
+	}
+}

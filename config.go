@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,9 +27,8 @@ import (
 	"github.com/itchyny/gojq"
 )
 
-const configVersion = 5
+const configVersion = 6
 const maxConfigBytes = 16 << 20
-const maxModuleNetworkOrigins = 256
 const maxModuleCaptureHosts = 512
 const maxActionMatchHosts = 512
 const maxCertificateHosts = 512
@@ -84,12 +84,23 @@ type ActionMatch struct {
 	StatusCodes []int    `json:"status_codes,omitempty"`
 }
 
+// ActionGate decides whether an action is compiled at all, by comparing one
+// setting of the same extension against a declared value.
+//
+// Equals is compared as rendered text, which is what makes a select gate work
+// the way an operator reads it: the setting's option strings are the values a
+// manifest writes here. A boolean setting still gates on "true" and "false".
+type ActionGate struct {
+	Key    string `json:"key"`
+	Equals string `json:"equals"`
+}
+
 type ScriptRule struct {
 	ID    string      `json:"id"`
 	Phase string      `json:"phase"`
 	Match ActionMatch `json:"match"`
-	// EnabledWhen names a required boolean setting of the same extension. When
-	// that setting is false the action is not compiled into a matcher at all,
+	// EnabledWhen compares one of the extension's own settings against a value.
+	// When it does not hold, the action is not compiled into a matcher at all,
 	// so it never runs and costs nothing per request.
 	//
 	// Upstream plugin formats gate a script entry from outside the script --
@@ -98,11 +109,17 @@ type ScriptRule struct {
 	// extension carrying such a switch has a setting that silently does
 	// nothing: the entry runs whatever the operator chose, including the
 	// requests it makes to third parties.
-	EnabledWhen  string `json:"enabled_when,omitempty"`
-	ScriptURL    string `json:"script_url,omitempty"`
-	ScriptDigest string `json:"script_digest"`
-	ScriptBody   string `json:"script_body"`
-	BodyMode     string `json:"body_mode"`
+	//
+	// The comparison form, rather than a bare boolean key, is what lets one
+	// setting select among several mutually exclusive action sets. Two booleans
+	// can express "A on" and "B on" but not "exactly one of A and B", which is
+	// the shape an upstream that publishes two modules for the same paths
+	// actually has.
+	EnabledWhen  *ActionGate `json:"enabled_when,omitempty"`
+	ScriptURL    string      `json:"script_url,omitempty"`
+	ScriptDigest string      `json:"script_digest"`
+	ScriptBody   string      `json:"script_body"`
+	BodyMode     string      `json:"body_mode"`
 	// Entry selects the script contract. The empty value is the native
 	// transform(context) entry point; "proxy-compat" runs a published
 	// proxy-client bundle, which signals completion by calling $done. The mode
@@ -311,12 +328,17 @@ type Module struct {
 	Settings          []ModuleSetting `json:"settings,omitempty"`
 	Scripts           []ScriptRule    `json:"actions,omitempty"`
 	PersistentStorage bool            `json:"persistent_storage"`
-	NetworkOrigins    []string        `json:"network_origins"`
-	// NetworkAny grants the network capability without an exact origin list.
-	// It exists for extensions whose reachable hosts are operator-configured
-	// and therefore cannot be enumerated, and it is a strictly broader grant
-	// than NetworkOrigins: every management surface must review it as such.
-	NetworkAny          bool   `json:"network_any,omitempty"`
+	// Network grants the network capability: the script request API, and a
+	// request-phase URL rewrite to any origin.
+	//
+	// It replaces the earlier network_origins list and network_any pair. The
+	// two forms were the same capability at two breadths, and an extension that
+	// needed operator-chosen hosts for one action and an exact host for another
+	// could satisfy neither. What the list bought was a review that could name
+	// where captured data may go; that is now stated as "any host" for every
+	// extension holding this grant, and every management surface must present it
+	// as such.
+	Network             bool   `json:"network,omitempty"`
 	EgressGroupRequired bool   `json:"egress_group_required"`
 	EgressGroup         string `json:"egress_group,omitempty"`
 }
@@ -1074,20 +1096,6 @@ func validateExecutionOrder(modules []Module, order []string) error {
 }
 
 func validateModuleNetworkPermissions(module Module) error {
-	if len(module.NetworkOrigins) > maxModuleNetworkOrigins {
-		return fmt.Errorf("network_origins exceeds %d entries", maxModuleNetworkOrigins)
-	}
-	previous := ""
-	for _, origin := range module.NetworkOrigins {
-		canonical, err := canonicalModuleNetworkOrigin(origin)
-		if err != nil || canonical != origin {
-			return fmt.Errorf("network origin %q is not canonical", origin)
-		}
-		if previous != "" && origin <= previous {
-			return errors.New("network_origins must be sorted and unique")
-		}
-		previous = origin
-	}
 	if module.Enabled && module.EgressGroupRequired && strings.TrimSpace(module.EgressGroup) == "" {
 		return errors.New("egress_group is required")
 	}
@@ -1184,39 +1192,47 @@ func validateActionMatch(captureHosts []string, phase string, match ActionMatch)
 // validateActionGate checks an action's enabled_when against the settings its
 // own extension declares.
 //
-// The named setting must be boolean and required. Required is the load-bearing
-// half: an enabled module's required settings always carry a concrete value, so
-// a gate always has a decidable state. Allowing an optional setting would
-// introduce a third case -- declared, gating an action, and unset -- whose only
-// answers are "run something the operator may have switched off" and "silently
-// drop an action". Refusing it here means neither has to be chosen later.
+// Required is the load-bearing half: an enabled module's required settings
+// always carry a concrete value, so a gate always has a decidable state.
+// Allowing an optional setting would introduce a third case -- declared, gating
+// an action, and unset -- whose only answers are "run something the operator may
+// have switched off" and "silently drop an action". Refusing it here means
+// neither has to be chosen later.
+//
+// A select gate is checked against its own options, so a manifest that compares
+// against a value the operator can never choose fails at import rather than
+// leaving an action that never compiles.
 func validateActionGate(module Module, rule ScriptRule) error {
-	if rule.EnabledWhen == "" {
+	if rule.EnabledWhen == nil {
 		return nil
 	}
-	if !validSettingKey(rule.EnabledWhen) {
-		return fmt.Errorf("enabled_when %q is not a valid setting key", rule.EnabledWhen)
+	gate := rule.EnabledWhen
+	if !validSettingKey(gate.Key) {
+		return fmt.Errorf("enabled_when %q is not a valid setting key", gate.Key)
+	}
+	if gate.Equals == "" {
+		return fmt.Errorf("enabled_when %q declares no value to compare against", gate.Key)
 	}
 	for _, setting := range module.Settings {
-		if setting.Key != rule.EnabledWhen {
+		if setting.Key != gate.Key {
 			continue
 		}
-		if setting.Type != "boolean" {
-			return fmt.Errorf("enabled_when %q names a %s setting; only boolean is supported", rule.EnabledWhen, setting.Type)
-		}
 		if !setting.Required {
-			return fmt.Errorf("enabled_when %q names an optional setting; a gate must name a required one", rule.EnabledWhen)
+			return fmt.Errorf("enabled_when %q names an optional setting; a gate must name a required one", gate.Key)
 		}
-		if !module.Enabled {
-			return nil
-		}
-		var value bool
-		if err := json.Unmarshal(setting.Value, &value); err != nil {
-			return fmt.Errorf("enabled_when %q has no usable boolean value: %w", rule.EnabledWhen, err)
+		switch setting.Type {
+		case "boolean":
+			if gate.Equals != "true" && gate.Equals != "false" {
+				return fmt.Errorf("enabled_when %q compares a boolean setting against %q", gate.Key, gate.Equals)
+			}
+		case "select":
+			if !slices.Contains(setting.Options, gate.Equals) {
+				return fmt.Errorf("enabled_when %q compares against %q, which is not one of that setting's options", gate.Key, gate.Equals)
+			}
 		}
 		return nil
 	}
-	return fmt.Errorf("enabled_when %q names a setting this extension does not declare", rule.EnabledWhen)
+	return fmt.Errorf("enabled_when %q names a setting this extension does not declare", gate.Key)
 }
 
 func validateModuleSettings(settings []ModuleSetting, requireReady bool) error {

@@ -426,7 +426,7 @@ type pluginStatus struct {
 	CaptureHosts []string `json:"captureHosts"`
 	Actions      int      `json:"actions"`
 	Settings     int      `json:"settings"`
-	NetworkHosts []string `json:"networkOrigins"`
+	Network      bool     `json:"network"`
 	EgressGroup  string   `json:"egressGroup,omitempty"`
 	Order        int      `json:"order"`
 }
@@ -465,7 +465,7 @@ func (m *bundleManager) Plugins() (string, []pluginStatus) {
 			CaptureHosts: append([]string(nil), mod.CaptureHosts...),
 			Actions:      len(mod.Scripts),
 			Settings:     len(mod.Settings),
-			NetworkHosts: append([]string(nil), mod.NetworkOrigins...),
+			Network:      mod.Network,
 			EgressGroup:  mod.EgressGroup,
 			Order:        order[mod.ID],
 		})

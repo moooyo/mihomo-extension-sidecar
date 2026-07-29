@@ -773,18 +773,18 @@ func TestPrepareModuleRequestAllNoneRewriteStillBuffersCompleteDecodedBody(t *te
 	tests := []struct {
 		name          string
 		target        string
-		origins       []string
+		network       bool
 		contentCoding string
 	}{
 		{name: "same origin", target: "https://api.example.com/rewritten"},
-		{name: "cross origin gzip", target: "https://worker.example.com/process", origins: []string{"https://worker.example.com"}, contentCoding: "gzip"},
+		{name: "cross origin gzip", target: "https://worker.example.com/process", network: true, contentCoding: "gzip"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			source := fmt.Sprintf(`function transform() { return {request: {url: %q}} }`, test.target)
 			module := nativeRuntimeModule()
 			module.Enabled = true
-			module.NetworkOrigins = test.origins
+			module.Network = test.network
 			module.Scripts = []ScriptRule{nativeRuntimeRule(source, "request", "none")}
 			cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
 			raw := []byte("payload")

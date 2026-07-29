@@ -429,7 +429,7 @@ func TestControlAPIRejectsAnInvalidDocument(t *testing.T) {
 	client := serveControlAPI(t, m)
 
 	req, _ := http.NewRequest(http.MethodPut, "http://sidecar/bundles/b1",
-		strings.NewReader(`{"version": 5, "modules": "not an array"}`))
+		strings.NewReader(`{"version": 6, "modules": "not an array"}`))
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)

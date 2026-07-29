@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "listen": "127.0.0.1:18080",
   "username": "module-in-0000000000000000000000",
   "password": "module-in-password-0000000000000000",
@@ -88,7 +88,6 @@
         }
       ],
       "persistent_storage": false,
-      "network_origins": null,
       "egress_group_required": false
     }
   ]

@@ -63,8 +63,7 @@ func compatHTTPFixture(t *testing.T, handler http.HandlerFunc) (*moduleNetworkRe
 	parsed, _ := url.Parse(upstream.URL)
 	_, port, _ := net.SplitHostPort(parsed.Host)
 	proxy, _ := startTestSOCKSTCPRelay(t, parsed.Host)
-	requester := newModuleNetworkRequester(context.Background(), proxy, roots, nil, make(chan struct{}, 4))
-	requester.allowAny = true
+	requester := newModuleNetworkRequester(context.Background(), proxy, roots, make(chan struct{}, 4))
 	t.Cleanup(requester.Close)
 	return requester, "https://api.example.com:" + port
 }
