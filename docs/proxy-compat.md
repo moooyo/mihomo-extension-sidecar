@@ -17,15 +17,15 @@ Measured against `v3.2.0-beta2/response.bundle.js` (251,617 bytes):
 
 | Global | References | Purpose |
 | --- | ---: | --- |
-| `$argument` | 12 | Settings, as a serialized string it parses itself |
+| `$argument` | 12 | Settings; the bundle carries its own string parser, but under the Loon persona it receives a decoded object and never runs it |
 | `$done` | 5 | Completion; receives the final response projection |
 | `$persistentStore` | 4 | `read(key)` / `write(value, key)` |
-| `$prefs` | 4 | Quantumult X storage; unused under the Surge persona |
+| `$prefs` | 4 | Quantumult X storage; unused under the Loon persona |
 | `$response` | 3 | Response projection, mutated in place |
 | `$request` | 2 | Request projection |
 | `$task` | 2 | Quantumult X fetch; **must not be defined** (see below) |
 | `$environment` | 2 | Runtime identity |
-| `$httpClient` | 1 | Surge-style network |
+| `$httpClient` | 1 | Callback-style network; Loon and Surge share this shape |
 
 Async surface: 31 `async`, 57 `await`, 8 `Promise`, 2 `setTimeout`.
 
@@ -33,7 +33,7 @@ All 6 `require(` sites sit behind a `"Node.js"` runtime branch, so **no module
 loader is needed**. Both `setTimeout` sites race a pending request against a
 timeout, which `module_async.go` already provides.
 
-## Persona: Surge
+## Persona: Loon
 
 `@nsnanocat/util` picks its runtime by probing globals, in this order:
 
@@ -49,11 +49,33 @@ switch (true) {
 }
 ```
 
-Presenting as **Surge** means defining `$environment["surge-version"]` and
-**not** defining `$task`, `$loon`, `$rocket`, or `Egern`. Surge is the right
-persona because its network shape is a plain callback
-(`$httpClient[method](options, cb)`) that maps directly onto the sidecar's
-existing requester, and its storage shape is two functions.
+Presenting as **Loon** means defining `$loon` and **not** defining `$task`,
+`$rocket`, or `Egern`. `$task` is probed first, so defining it would silently
+select Quantumult X; the others select branches whose shapes this runtime does
+not have. `$environment` reports `loon-version`, not `surge-version`.
+
+Loon is the right persona because its `[Argument]` block is typed, matching the
+manifest's typed settings, and Loon hands the bundle a **decoded object**. This
+layer originally presented as Surge, which made `$argument` a string — and that
+string has no single encoding: WeatherKit's bundle parses the quoted
+`key="value"` form, YouTube's and Bilibili's call `JSON.parse`, Yu9191/wloc
+parses a bare `key=value` query. None of them report a mismatch — Bilibili
+catches the parse failure and runs on its defaults — so the wrong encoding
+produces an extension whose settings silently do nothing. Making the encoding
+declarable managed that problem; Loon removes it.
+
+The Surge persona also rested on an inference that turned out to be unfounded:
+WeatherKit ships no script at all at the pinned commit — all five module files
+have zero `script-path` entries — so its "Surge argument convention" had been
+derived from nothing.
+
+`tests/test_sidecar_policy.sh` guards this in both directions: `$task`,
+`$rocket`, and `Egern` must stay undefined, and `$loon` must be defined, because
+a bundle that finds no client at all falls through to a Node.js branch with
+different storage and completion shapes.
+
+Its network shape (`$httpClient[method](options, cb)`) maps directly onto the
+sidecar's existing requester, and its storage shape is two functions.
 
 ## Entry and exit model
 
@@ -66,14 +88,8 @@ point is not a function that returns a value:
   .finally(() => done($response))
 ```
 
-and the Surge branch of `done` is:
-
-```js
-case "Surge":
-  s.policy && _.set(s, "headers.X-Surge-Policy", s.policy)
-  log("🚩 执行结束!", `🕛 ${(new Date).getTime() / 1e3 - $script.startTime} 秒`)
-  $done(s)
-```
+and the client branch of `done` sets any transport hint the bundle carries,
+logs its elapsed time from `$script.startTime`, and calls `$done(s)`.
 
 So the runtime must:
 
@@ -81,9 +97,10 @@ So the runtime must:
 2. drive the event loop until `$done` is called or the action deadline expires;
 3. treat the value passed to `$done` as the action result.
 
-`$script.startTime` must exist — the Surge branch reads it before calling
-`$done`, and a `TypeError` there would be swallowed by `.finally()` and hang the
-action until its deadline.
+`$script.startTime` must exist — the completion branch reads it before calling
+`$done`, on Loon as well as the personas this runtime does not serve, and a
+`TypeError` there would be swallowed by `.finally()` and hang the action until
+its deadline. `wloc.js` computes its elapsed time from it in its Loon case.
 
 `asyncLoop.wait` already accepts an arbitrary `settled` predicate, so compat mode
 passes `func() bool { return doneCalled }` where native mode passes the promise
@@ -92,25 +109,34 @@ state. No second loop is needed.
 ## Global shapes
 
 ```
-$environment      { "surge-version": <string> }
+$loon             <persona version string>
+$environment      { "loon-version": <string> }
 $script           { startTime: <seconds, float> }
 $request          { url, method, headers, body? }
-$response         { status, statusCode, headers, body | bodyBytes }
-$done(result)     result: { status?, headers?, body? | bodyBytes? }
+$response         { status, headers, body }; undefined in the request phase,
+                  but defined, because the bundle assigns back to it
+$done(result)     result: { status?, headers?, body? | bodyBytes?, trailers? }
 $persistentStore  { read(key) -> string|null, write(value, key) -> bool }
 $httpClient       { get|post|put|delete|head|patch(options, cb) }
                   cb(error, response, body); response.status, response.headers
-$argument         string, "key=value&key=value", parsed by the bundle itself
+$utils            { ungzip }; nothing else, so a bundle reaching for an
+                  unimplemented helper fails loudly rather than silently
+$notification     { post }; recorded through the action's console budget, since
+                  the gateway has no channel to deliver on
+$argument         the typed manifest settings, as a decoded object
 ```
 
 Binary bodies: the sgmodule sets `binary-body-mode=1`, and the util normalizes
 `bodyBytes` into `body` before a request and mirrors a binary response body into
 both fields. The sidecar's existing `bodyMode: binary` projection supplies the
-`Uint8Array`.
+`Uint8Array`. `bodyBytes` is accepted alongside `body` on the way out for the
+same reason; the `statusCode` alias is not, because it came from Quantumult X's
+adapter and names a client this runtime deliberately does not present as.
 
-`$argument` must be serialized from typed manifest settings into the
-`key="value"&key="value"` form the published sgmodule uses, because the bundle
-runs its own parser over the string.
+`$argument` is the settings object itself. There is no serializer: Loon's
+`[Argument]` is typed and Loon hands a bundle a decoded object, so a setting
+declared `number` in the manifest arrives as a number and the bundle's own
+string parser never runs.
 
 ## Mapping onto existing sidecar capabilities
 
@@ -119,7 +145,7 @@ runs its own parser over the string.
 | `$httpClient` | `moduleNetworkRequester.request`, run on a worker goroutine, completion posted through `asyncLoop.post` |
 | `$persistentStore` | `scriptRuntime.storageObject`, already bounded and extension-scoped |
 | `$request` / `$response` | `scriptMessageObject`, unchanged |
-| `$argument` | `scriptSettingValues`, serialized |
+| `$argument` | `scriptSettingValues`, passed through as an object |
 | console | `installConsoleAPI`, unchanged |
 
 Only `$httpClient` needs new plumbing, and only to move a blocking call off the
@@ -153,8 +179,8 @@ Implemented and tested:
 
 - `module_async.go` — event loop, promise settling, timers, per-action timer
   budget, deadline behavior.
-- `module_compat.go` — the globals above, the `$done` completion model,
-  `$argument` serialization, and result translation.
+- `module_compat.go` — the globals above, the `$done` completion model, the
+  `$argument` settings object, and result translation.
 - `module_webapi.go` — `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
   installed only for proxy-compat actions.
 - `ScriptRule.Entry` — `""` keeps the native contract, `"proxy-compat"` runs a
