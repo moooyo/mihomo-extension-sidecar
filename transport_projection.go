@@ -16,9 +16,9 @@ type upstreamTransportProjection struct {
 }
 
 type upstreamTargetProjection struct {
-	enabled        bool
-	activeHosts    *compiledHostMatcher
-	modules        []upstreamModuleProjection
+	enabled     bool
+	activeHosts *compiledHostMatcher
+	modules     []upstreamModuleProjection
 	// networkGrant is true when any enabled module holds the network
 	// permission. That grant carries no origin list, so there is nothing to
 	// enumerate: it either makes every target servable or none.
@@ -39,9 +39,9 @@ type inboundUDPAuthorization struct {
 
 func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 	targets := upstreamTargetProjection{
-		enabled:        cfg.MITM.Enabled,
-		activeHosts:    projectedActiveHostMatcher(cfg),
-		networkGrant:   false,
+		enabled:      cfg.MITM.Enabled,
+		activeHosts:  projectedActiveHostMatcher(cfg),
+		networkGrant: false,
 	}
 	for _, module := range cfg.Modules {
 		if !module.Enabled {
