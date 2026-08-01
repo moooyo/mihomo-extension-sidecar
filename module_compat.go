@@ -441,7 +441,26 @@ func (r *scriptRuntime) executeProxyCompat(
 	if err := loop.wait(ctx, entry.settled); err != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}
+	if compatProjectionIsEmpty(entry.result) && engineLogPublishingEnabled(r.logs) {
+		r.logs.Publish(EngineLog{
+			Level: "warn", Source: "engine", Extension: module.ID, Action: rule.ID,
+			Phase: rule.Phase, URL: sanitizeEngineLogURL(request(contextObject)),
+			ScriptDigest: rule.ScriptDigest,
+			Message:      "bundle completed with no member this runtime understands; the action changed nothing",
+		})
+	}
 	return parseCompatScriptResult(entry.result, responsePhase)
+}
+
+// request reads the URL out of the projection handed to the bundle, for the
+// engine log only.
+func request(contextObject map[string]any) string {
+	message, ok := contextObject["request"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	url, _ := message["url"].(string)
+	return url
 }
 
 // unwrapCompatValue exports a value that is still a goja value. The host hands
@@ -470,6 +489,24 @@ func flatCompatHeaders(headers map[string][]string) map[string]string {
 // {response: {...}} envelope the native contract uses, so the value is treated
 // as the patch. `bodyBytes` is accepted alongside `body` because the bundles
 // mirror a binary payload into both fields.
+// parseCompatScriptResult translates the value a bundle handed $done.
+//
+// A Loon completion wraps the projection in a `response` envelope. The shipped
+// wloc bundle ends with, after minification:
+//
+//	"Quantumult X" === client ? done(out) : done({response: out})
+//
+// and this runtime presents as Loon precisely so it takes the second branch --
+// so the envelope is the shape it should have expected all along, not an
+// exception. Ignoring it made both apple-wloc actions permanent silent no-ops:
+// the projection came out empty, no error was raised, and the device's real
+// location was forwarded whatever point an operator had configured. That is the
+// failure docs/proxy-compat.md predicted, where a gap "will look like the bundle
+// chose not to act, not like a crash".
+//
+// The native contract has always handled this shape (parseNativeScriptResult),
+// including turning a request-phase `response` into a synthetic reply, so the
+// envelope is unwrapped here with the same meaning rather than a parallel one.
 func parseCompatScriptResult(value goja.Value, responsePhase bool) (scriptResult, error) {
 	result := scriptResult{}
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
@@ -479,6 +516,31 @@ func parseCompatScriptResult(value goja.Value, responsePhase bool) (scriptResult
 	if !ok {
 		return result, errors.New("$done requires an object, null, or undefined")
 	}
+	if envelope, wrapped := patch["response"]; wrapped {
+		projection, ok := stringAnyMap(unwrapCompatValue(envelope))
+		if !ok {
+			return scriptResult{}, errors.New("$done response envelope must be an object")
+		}
+		if err := applyNativePatch(&result, compatProjection(projection), true); err != nil {
+			return scriptResult{}, err
+		}
+		// A request-phase action that completes with a response is answering the
+		// exchange itself, which is what save-wloc-settings does to return its
+		// stored point as JSON.
+		result.Synthetic = !responsePhase
+		return result, nil
+	}
+	return result, applyNativePatch(&result, compatProjection(patch), responsePhase)
+}
+
+// compatProjection keeps the members the runtime owns and drops the rest.
+//
+// A bundle carries transport hints -- policy, node, url -- through the same
+// object, and the Loon branch of every published util sets them, so an unknown
+// member cannot be an error the way it is on the native contract. What can be
+// reported is a completion that carried nothing at all: see
+// compatProjectionIsEmpty.
+func compatProjection(patch map[string]any) map[string]any {
 	projection := make(map[string]any, len(patch))
 	for key, raw := range patch {
 		switch key {
@@ -490,17 +552,27 @@ func parseCompatScriptResult(value goja.Value, responsePhase bool) (scriptResult
 			if _, exists := projection["body"]; !exists {
 				projection["body"] = unwrapCompatValue(raw)
 			}
-		default:
-			// Bundles carry transport hints such as policy or url through the
-			// same object. They are runtime-owned here, so they are ignored
-			// rather than failing the action.
 		}
 	}
 	if body, exists := projection["body"]; exists && body == nil {
 		delete(projection, "body")
 	}
-	if err := applyNativePatch(&result, projection, responsePhase); err != nil {
-		return scriptResult{}, err
+	return projection
+}
+
+// compatProjectionIsEmpty reports a completion this runtime understood nothing
+// of. It is the signature of the bug this envelope handling fixed, so it is
+// reported rather than left for the next reader to rediscover from traffic.
+func compatProjectionIsEmpty(value goja.Value) bool {
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return false
 	}
-	return result, nil
+	patch, ok := stringAnyMap(value.Export())
+	if !ok || len(patch) == 0 {
+		return false
+	}
+	if _, wrapped := patch["response"]; wrapped {
+		return false
+	}
+	return len(compatProjection(patch)) == 0
 }
