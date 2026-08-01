@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -35,7 +36,25 @@ type interceptProxy struct {
 	transportMu sync.Mutex
 	upstream    *upstreamTransportGeneration
 	http3Slots  chan struct{}
+
+	// The client-facing TLS leg's shared session ticket keys. Every connection
+	// clones a config from these rather than building its own, which is what
+	// makes resumption possible at all; see mitmTLSConfig.
+	tlsMu      sync.Mutex
+	tlsKeys    [][32]byte
+	tlsKeysSet time.Time
+	tlsNow     func() time.Time
 }
+
+const (
+	// How long one client-facing session ticket key issues tickets for, and how
+	// many are kept so a ticket issued just before a rotation still resumes.
+	// This is what crypto/tls does for a server that manages its own keys; the
+	// keys are set explicitly here only because a per-connection clone cannot
+	// inherit ones the template never generated.
+	mitmTicketKeyLifetime = 24 * time.Hour
+	mitmTicketKeyHistory  = 2
+)
 
 const (
 	maxIdleUpstreamHTTPConnections        = 64
@@ -62,6 +81,10 @@ const (
 	// milliseconds; waiting longer would only pin this request's connection, and
 	// its upstream one, behind a shortage it cannot outlast.
 	moduleBodySlotWait = 250 * time.Millisecond
+
+	// Enough that a burst across a handful of origins keeps resuming, small
+	// enough that a retired generation's cache is trivial to drop.
+	upstreamSessionCacheEntries = 64
 
 	upstreamHTTP3RecycleTimeout          = 250 * time.Millisecond
 	interceptCertificateTrustLogInterval = time.Minute
@@ -259,6 +282,10 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 	if err != nil {
 		return err
 	}
+	tlsConfig, err := p.mitmTLSConfig(cfg.MITM.HTTP2)
+	if err != nil {
+		return err
+	}
 	listener := newSingleConnListener(conn)
 	server := &http.Server{
 		Handler:           p,
@@ -266,17 +293,75 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          log.New(p.tlsErrors.writer(target), "", 0),
-		TLSConfig: &tls.Config{
-			MinVersion:     tls.VersionTLS12,
-			GetCertificate: p.certificates.GetCertificate,
-			NextProtos:     mitmTLSNextProtos(cfg.MITM.HTTP2),
-		},
+		TLSConfig:         tlsConfig,
 	}
 	err = server.ServeTLS(listener, "", "")
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 		return nil
 	}
 	return err
+}
+
+// mitmTLSConfig builds this connection's client-facing TLS config from keys the
+// whole process shares.
+//
+// Every connection used to construct its own tls.Config, and a server's session
+// ticket keys belong to its config: a ticket issued on one connection could
+// never be decrypted on the next, so the MITM leg never resumed and every
+// connection paid a full handshake and a signature. Measured against this
+// certificate: a fresh config per connection resumes on no connection, a clone
+// of a template whose keys were never set resumes on none either, and a clone of
+// one carrying explicit keys resumes from the second connection on, under both
+// TLS 1.2 and TLS 1.3.
+//
+// The clone is not incidental. http.Server.ServeTLS hands its TLSConfig to
+// http2ConfigureServer, which writes to it, and this proxy builds one
+// http.Server per connection -- so a config shared by pointer would be written
+// by every connection at once. Each connection gets its own object and only the
+// keys are shared.
+//
+// NextProtos comes from the caller's snapshot rather than the template because
+// MITM.HTTP2 can change under a running process.
+func (p *interceptProxy) mitmTLSConfig(http2 bool) (*tls.Config, error) {
+	keys, err := p.sessionTicketKeys()
+	if err != nil {
+		return nil, err
+	}
+	config := &tls.Config{
+		MinVersion:     tls.VersionTLS12,
+		GetCertificate: p.certificates.GetCertificate,
+		NextProtos:     mitmTLSNextProtos(http2),
+	}
+	config.SetSessionTicketKeys(keys)
+	return config, nil
+}
+
+// sessionTicketKeys returns the keys to issue and accept tickets under, newest
+// first, rotating them on the same daily schedule crypto/tls uses for a server
+// that manages its own. The previous key is kept so a ticket issued just before
+// a rotation still resumes rather than silently falling back to a full
+// handshake.
+func (p *interceptProxy) sessionTicketKeys() ([][32]byte, error) {
+	now := time.Now
+	if p.tlsNow != nil {
+		now = p.tlsNow
+	}
+	p.tlsMu.Lock()
+	defer p.tlsMu.Unlock()
+	if len(p.tlsKeys) > 0 && now().Sub(p.tlsKeysSet) < mitmTicketKeyLifetime {
+		return append([][32]byte(nil), p.tlsKeys...), nil
+	}
+	var fresh [32]byte
+	if _, err := rand.Read(fresh[:]); err != nil {
+		return nil, fmt.Errorf("session ticket key: %w", err)
+	}
+	rotated := append([][32]byte{fresh}, p.tlsKeys...)
+	if len(rotated) > mitmTicketKeyHistory {
+		rotated = rotated[:mitmTicketKeyHistory]
+	}
+	p.tlsKeys = rotated
+	p.tlsKeysSet = now()
+	return append([][32]byte(nil), rotated...), nil
 }
 
 func mitmTLSNextProtos(http2 bool) []string {
@@ -866,6 +951,11 @@ func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransp
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    p.upstreamRoots,
+			// Without a cache every re-dial to an origin is a full handshake
+			// through the mihomo leg. The cache belongs to the transport, so it
+			// dies with the generation that owns it and never outlives the
+			// allowlist that authorized those origins.
+			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
 		},
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 			host, portText, err := net.SplitHostPort(address)
@@ -890,8 +980,9 @@ func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGenerati
 	return &http3.Transport{
 		MaxResponseHeaderBytes: int(maxModuleNetworkHeaderBytes),
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS13,
-			RootCAs:    p.upstreamRoots,
+			MinVersion:         tls.VersionTLS13,
+			RootCAs:            p.upstreamRoots,
+			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
 		},
 		QUICConfig: &quic.Config{
 			Versions: []quic.Version{version},
