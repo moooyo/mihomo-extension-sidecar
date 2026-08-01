@@ -430,12 +430,12 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.releaseBodySlot()
 		}
 	}()
-	outbound, handled, requestBodyBufferRetained, prepareErr := p.prepareModuleRequestWithRules(w, r, cfg, requestProbe, requestRules)
-	if bodySlotHeld && !requestBodyBufferRetained {
+	prepared, prepareErr := p.prepareModuleRequestWithRules(w, r, cfg, requestProbe, requestRules)
+	if bodySlotHeld && !prepared.bodyBufferRetained {
 		p.releaseBodySlot()
 		bodySlotHeld = false
 	}
-	if handled {
+	if prepared.handled {
 		return
 	}
 	if prepareErr != nil {
@@ -445,6 +445,7 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	outbound := prepared.outbound
 	response, cleanup, err := p.roundTrip(outbound, cfg)
 	if cleanup != nil {
 		defer cleanup()
@@ -458,7 +459,10 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	responseProbe := scriptMessage{
 		URL: outbound.URL.String(), Method: outbound.Method, StatusCode: response.StatusCode,
 	}
-	responseRules := matchingScriptRules(cfg, "response", responseProbe)
+	// Filtered from the probe taken while the outbound headers were built, which
+	// is a superset of this match: the status code was the only thing it could
+	// not evaluate. Walking every rule again would also re-parse the URL.
+	responseRules := responseRulesForStatus(prepared.responseCandidates, response.StatusCode)
 	if !bodySlotHeld && len(responseRules) > 0 {
 		// The upstream leg has already run, so a capacity rejection here cannot be
 		// an "unavailable, try again": the request was made. This is the same
