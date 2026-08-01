@@ -125,7 +125,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	conditionalStream := requestCanConditionallyStreamWithModuleActions(incoming, requestRules)
 	bodyBufferRetained := false
 	if !conditionalStream {
-		body, bodyErr := readDecodedModuleRequestBody(w, incoming)
+		body, bodyErr := readDecodedModuleRequestBody(w, incoming, moduleBodyReadLimit(requestRules))
 		if bodyErr != nil {
 			return nil, false, false, bodyErr
 		}
@@ -192,7 +192,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 				return nil, false, bodyBufferRetained, err
 			}
 		case urlChanged:
-			body, bodyErr := readDecodedModuleRequestBody(w, incoming)
+			body, bodyErr := readDecodedModuleRequestBody(w, incoming, moduleBodyReadLimit(requestRules))
 			if bodyErr != nil {
 				return nil, false, false, bodyErr
 			}
@@ -275,7 +275,41 @@ func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMes
 	return outbound, nil
 }
 
-func readDecodedModuleRequestBody(w http.ResponseWriter, incoming *http.Request) ([]byte, error) {
+// moduleBodyReadLimit is the largest body any matched action could accept.
+//
+// An action whose BodyMode is "none" never reads the body, so it does not
+// constrain the read. That distinction is the whole design: reading with
+// MaxBodyBytes directly was tried and reverted, because it let such an action's
+// limit become a ceiling on the whole message and failed the read before the
+// per-rule loop could exempt it -- turning an upstream exchange that had already
+// succeeded into a 502. Taking the maximum over only the actions that do read a
+// body leaves those per-rule checks as the authority for which action refuses,
+// and merely stops the process holding bytes no matched action could ever accept.
+//
+// No interested action means nothing reads the body and the global cap stands:
+// the message still has to be forwarded.
+//
+// This bounds the wire read only. The decode limit deliberately stays at the
+// global cap, because transformModuleResponse treats any decode failure as
+// "cannot filter this, forward it untouched" -- so a tighter decode bound would
+// convert a fail-closed refusal into a silently unfiltered response.
+func moduleBodyReadLimit(rules []matchedScriptRule) int64 {
+	limit := int64(0)
+	for _, matched := range rules {
+		if matched.Rule.BodyMode == "none" {
+			continue
+		}
+		if matched.Rule.MaxBodyBytes > limit {
+			limit = matched.Rule.MaxBodyBytes
+		}
+	}
+	if limit <= 0 || limit > maxModuleHTTPBody {
+		return maxModuleHTTPBody
+	}
+	return limit
+}
+
+func readDecodedModuleRequestBody(w http.ResponseWriter, incoming *http.Request, readLimit int64) ([]byte, error) {
 	if incoming.Body == nil {
 		return nil, nil
 	}
@@ -285,7 +319,7 @@ func readDecodedModuleRequestBody(w http.ResponseWriter, incoming *http.Request)
 	}
 	incoming.Body = http.MaxBytesReader(w, incoming.Body, maxModuleHTTPBody)
 	defer incoming.Body.Close()
-	body, err := readBounded(incoming.Body, maxModuleHTTPBody)
+	body, err := readBounded(incoming.Body, readLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +388,7 @@ func (p *interceptProxy) transformModuleResponse(
 		p.reportSkippedResponseActions(request, scripts, err)
 		return nil, nil
 	}
-	body, err := readBounded(response.Body, maxModuleHTTPBody)
+	body, err := readBounded(response.Body, moduleBodyReadLimit(scripts))
 	if err != nil {
 		return nil, err
 	}

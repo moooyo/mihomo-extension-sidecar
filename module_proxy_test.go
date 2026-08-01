@@ -1617,6 +1617,60 @@ func (w *controlledResponseWriter) FlushError() error {
 	return w.flushErr
 }
 
+// The read bound is the largest limit among the actions that actually read a
+// body. An action in "none" mode reads none, so it must not contribute a
+// ceiling -- that is the mistake TestResponseActionLimitDoesNotBoundTheUpstreamBody
+// exists to catch, expressed here at the level of the choice itself.
+func TestModuleBodyReadLimitIgnoresActionsThatDoNotReadTheBody(t *testing.T) {
+	t.Parallel()
+	module := nativeRuntimeModule()
+	rule := func(mode string, max int64) matchedScriptRule {
+		r := nativeRuntimeRule(`function transform() { return {} }`, "response", mode)
+		r.MaxBodyBytes = max
+		return matchedScriptRule{Module: module, Rule: r}
+	}
+	cases := []struct {
+		name  string
+		rules []matchedScriptRule
+		want  int64
+	}{
+		{name: "no rules at all forwards, so the global cap stands", rules: nil, want: maxModuleHTTPBody},
+		{
+			name:  "a none-mode action never bounds the read",
+			rules: []matchedScriptRule{rule("none", 1024)},
+			want:  maxModuleHTTPBody,
+		},
+		{
+			name:  "a reading action bounds it to its own limit",
+			rules: []matchedScriptRule{rule("text", 1<<20)},
+			want:  1 << 20,
+		},
+		{
+			name:  "the largest reader wins, so every action still gets its bytes",
+			rules: []matchedScriptRule{rule("text", 1<<20), rule("binary", 8<<20)},
+			want:  8 << 20,
+		},
+		{
+			name:  "a none-mode action alongside a reader does not shrink it",
+			rules: []matchedScriptRule{rule("none", 1024), rule("text", 4<<20)},
+			want:  4 << 20,
+		},
+		{
+			name:  "a limit above the global cap cannot raise it",
+			rules: []matchedScriptRule{rule("text", maxModuleHTTPBody*2)},
+			want:  maxModuleHTTPBody,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := moduleBodyReadLimit(testCase.rules); got != testCase.want {
+				t.Fatalf("read limit = %d, want %d", got, testCase.want)
+			}
+		})
+	}
+}
+
 // MaxBodyBytes bounds the projection an action is handed, not what the upstream
 // is allowed to send. Reading the upstream response with it made the smallest
 // legal value a ceiling on the whole response: readBounded failed before the
