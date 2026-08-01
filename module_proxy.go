@@ -142,12 +142,8 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	if incoming.ContentLength > maxModuleHTTPBody {
 		return preparedModuleRequest{}, fmt.Errorf("request exceeds %d bytes", maxModuleHTTPBody)
 	}
-	requestHeaders, err := exportedHeaders(incoming.Header)
-	if err != nil {
-		return preparedModuleRequest{}, fmt.Errorf("request headers: %w", err)
-	}
 	message := probe
-	message.Headers = requestHeaders
+	message.Headers = wireHeaders(incoming.Header)
 	incomingHadBodySection := requestHasBodySection(incoming)
 	if requestCanStreamWithoutModuleBuffer(incoming, requestRules) {
 		outbound, responseCandidates, streamErr := streamingModuleRequest(w, incoming, cfg, message)
@@ -437,11 +433,7 @@ func (p *interceptProxy) transformModuleResponse(
 	// check below could exempt a "none" mode action, and the upstream request had
 	// already succeeded, so the client got a 502. The request path already reads
 	// with the global cap and checks per rule afterwards.
-	responseHeaders, err := exportedHeaders(response.Header)
-	if err != nil {
-		return nil, fmt.Errorf("upstream response headers: %w", err)
-	}
-	responseMessage.Headers = responseHeaders
+	responseMessage.Headers = wireHeaders(response.Header)
 	encoding, err := normalizedContentEncoding(responseMessage.Headers)
 	if err != nil {
 		p.reportSkippedResponseActions(request, scripts, err)

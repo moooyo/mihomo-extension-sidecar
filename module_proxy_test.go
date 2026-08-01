@@ -1662,6 +1662,82 @@ func (w *controlledResponseWriter) FlushError() error {
 // body. An action in "none" mode reads none, so it must not contribute a
 // ceiling -- that is the mistake TestResponseActionLimitDoesNotBoundTheUpstreamBody
 // exists to catch, expressed here at the level of the choice itself.
+// An origin is not bound by the budget written for what a script may invent.
+//
+// exportedHeaders limits field and value counts as well as bytes, and those
+// counts are calibrated for a script. Running it over inbound traffic meant a
+// response carrying more than maxScriptHeaderFields fields was refused -- and on
+// the response path the upstream exchange has already succeeded, so that refusal
+// reaches the client as a 502 for a response the origin answered perfectly well.
+// The wire bound is maxWireHeaderBytes, which net/http enforced before any of
+// this ran.
+func TestAWideOriginHeaderBlockIsNotJudgedByTheScriptBudget(t *testing.T) {
+	t.Parallel()
+	// Changes the status rather than the headers: a script that returns headers
+	// replaces the whole set, which would hide whether the projection carried the
+	// origin's own fields through.
+	source := `function transform() { return {response: {status: 201}} }`
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	rule := nativeRuntimeRule(source, "response", "none")
+	module.Scripts = []ScriptRule{rule}
+	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	scripts := []matchedScriptRule{{Module: module, Rule: rule}}
+
+	// Well past the script field budget, and still a small block on the wire --
+	// comfortably inside what net/http already accepted.
+	wide := make(http.Header, maxScriptHeaderFields+64)
+	for index := 0; index < maxScriptHeaderFields+64; index++ {
+		wide[fmt.Sprintf("X-Origin-%04d", index)] = []string{"1"}
+	}
+	if len(wide) <= maxScriptHeaderFields {
+		t.Fatalf("fixture built %d fields, want more than the %d field script budget", len(wide), maxScriptHeaderFields)
+	}
+	// The split itself: the same block that the script-output validator refuses
+	// is carried by the wire projection. Before they were one function, this
+	// rejection was what an origin got.
+	if _, err := exportedHeaders(wide); err == nil {
+		t.Fatal("the script header validator accepted a block wider than its own field budget")
+	}
+	if len(wireHeaders(wide)) != len(wide) {
+		t.Fatal("the wire projection dropped fields")
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
+	response := &http.Response{
+		StatusCode: http.StatusOK, Header: wide, Body: io.NopCloser(strings.NewReader("body")),
+	}
+	transformed, err := (&interceptProxy{scripts: newScriptRuntime()}).transformModuleResponse(request, response, cfg, scripts)
+	if err != nil {
+		t.Fatalf("a wide origin header block was refused: %v", err)
+	}
+	if transformed == nil || transformed.StatusCode != 201 {
+		t.Fatalf("the action did not run over a wide header block: %+v", transformed)
+	}
+	if got := transformed.Header.Get("X-Origin-0100"); got != "1" {
+		t.Fatalf("an origin header was dropped in projection: X-Origin-0100=%q", got)
+	}
+}
+
+// The request path takes the same projection, so a client sending a wide header
+// block must reach the upstream leg rather than a 502 built from a script limit.
+func TestAWideClientHeaderBlockReachesUpstream(t *testing.T) {
+	t.Parallel()
+	incoming := httptest.NewRequest(http.MethodGet, "http://api.example.com/v1", nil)
+	for index := 0; index < maxScriptHeaderFields+64; index++ {
+		incoming.Header.Set(fmt.Sprintf("X-Client-%04d", index), "1")
+	}
+
+	outbound, handled, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequest(
+		httptest.NewRecorder(), incoming, Config{}, "api.example.com")
+	if err != nil || handled {
+		t.Fatalf("a wide client header block was refused: handled=%v err=%v", handled, err)
+	}
+	if got := outbound.Header.Get("X-Client-0100"); got != "1" {
+		t.Fatalf("a client header was dropped in projection: X-Client-0100=%q", got)
+	}
+}
+
 // prepareForTest keeps the four-value shape these tests were written against
 // now that preparation returns a named result.
 func prepareForTest(

@@ -1241,10 +1241,7 @@ var streamingResponseBuffers = sync.Pool{
 
 func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int, method string, response *http.Response) error {
 	controller := http.NewResponseController(w)
-	responseHeaders, err := exportedHeaders(response.Header)
-	if err != nil {
-		return fmt.Errorf("upstream response headers: %w", err)
-	}
+	responseHeaders := wireHeaders(response.Header)
 	announcedTrailers, err := exportedTrailers(response.Trailer)
 	if err != nil {
 		return fmt.Errorf("upstream response trailers: %w", err)
