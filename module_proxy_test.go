@@ -406,23 +406,64 @@ func TestPrepareModuleRequestAllowsFirstBodylessHTTP3VersionReplay(t *testing.T)
 	}
 }
 
-func TestPrepareModuleRequestBuffersUnknownLengthUnmatchedBody(t *testing.T) {
+// A request with zero matched rules is forwarded byte-for-byte, so an
+// undeclared length is no reason to hold it in memory. Both shapes that carry
+// one -- chunked HTTP/1.1 and HTTP/2 -- used to be fully read and to hold one of
+// the two process-wide body slots for as long as the client took to send.
+func TestPrepareModuleRequestStreamsUnknownLengthUnmatchedBody(t *testing.T) {
+	cases := []struct {
+		name             string
+		protoMajor       int
+		transferEncoding []string
+	}{
+		{name: "chunked HTTP/1.1", protoMajor: 1, transferEncoding: []string{"chunked"}},
+		{name: "HTTP/2 without a declared length", protoMajor: 2},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := &trackingReadCloser{reader: bytes.NewReader([]byte("payload"))}
+			incoming := httptest.NewRequest(http.MethodPost, "http://api.example.com/upload", nil)
+			incoming.Body = body
+			incoming.ContentLength = -1
+			incoming.ProtoMajor = testCase.protoMajor
+			incoming.TransferEncoding = testCase.transferEncoding
+
+			proxy := &interceptProxy{scripts: newScriptRuntime()}
+			_, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), incoming, Config{}, "api.example.com")
+			if err != nil || handled {
+				t.Fatalf("handled=%v err=%v", handled, err)
+			}
+			if body.reads != 0 {
+				t.Fatalf("the body was read into memory: reads=%d", body.reads)
+			}
+			if requestNeedsModuleBodyReservation(incoming, nil) {
+				t.Fatal("a streamed body still reserved a body slot")
+			}
+		})
+	}
+}
+
+// HTTP/3 keeps buffering, and the guard that keeps it buffering must stay.
+// roundTripHTTP3 replays the request against QUIC version 2 after a version
+// negotiation error, and resetHTTP3RequestBodyForReplay hard-errors without
+// GetBody -- which only the buffered path supplies.
+func TestPrepareModuleRequestBuffersUnknownLengthHTTP3Body(t *testing.T) {
 	body := &trackingReadCloser{reader: bytes.NewReader([]byte("payload"))}
 	incoming := httptest.NewRequest(http.MethodPost, "http://api.example.com/upload", nil)
 	incoming.Body = body
 	incoming.ContentLength = -1
-	incoming.TransferEncoding = []string{"chunked"}
+	incoming.ProtoMajor = 3
 
 	proxy := &interceptProxy{scripts: newScriptRuntime()}
 	outbound, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), incoming, Config{}, "api.example.com")
 	if err != nil || handled {
 		t.Fatalf("handled=%v err=%v", handled, err)
 	}
-	if body.reads == 0 || outbound.Body == body || outbound.GetBody == nil {
-		t.Fatalf("unknown body bypassed buffering: reads=%d body=%T getBody=%v", body.reads, outbound.Body, outbound.GetBody != nil)
+	if body.reads == 0 || outbound.GetBody == nil {
+		t.Fatalf("an HTTP/3 body must stay replayable: reads=%d getBody=%v", body.reads, outbound.GetBody != nil)
 	}
 	if !requestNeedsModuleBodyReservation(incoming, nil) {
-		t.Fatal("unknown-length body did not reserve a body slot")
+		t.Fatal("a buffered HTTP/3 body did not reserve a body slot")
 	}
 }
 

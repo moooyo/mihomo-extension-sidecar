@@ -71,17 +71,28 @@ func requestNeedsModuleBodyReservation(incoming *http.Request, rules []matchedSc
 	return !requestCanStreamWithoutModuleBuffer(incoming, rules)
 }
 
+// requestCanStreamWithoutModuleBuffer reports whether a request nothing will
+// read can be forwarded without being read into memory first.
+//
+// An undeclared length is not a reason to buffer. A chunked HTTP/1.1 upload and
+// an HTTP/2 one both arrive with ContentLength -1, and refusing to stream them
+// meant a request with zero matched rules -- one this sidecar forwards
+// byte-for-byte -- was fully resident and held one of the two body slots for as
+// long as the client took to send it.
+//
+// HTTP/3 is the exception and the guard must stay. roundTripHTTP3 replays the
+// request against QUIC version 2 after a version negotiation error, and the
+// replay needs GetBody, which only the buffered path supplies.
 func requestCanStreamWithoutModuleBuffer(incoming *http.Request, rules []matchedScriptRule) bool {
 	if len(rules) > 0 || !requestHasBodySection(incoming) {
 		return len(rules) == 0
 	}
-	return incoming.ProtoMajor != 3 && incoming.ContentLength >= 0 &&
-		incoming.ContentLength <= maxModuleHTTPBody && len(incoming.TransferEncoding) == 0
+	return incoming.ProtoMajor != 3 && incoming.ContentLength <= maxModuleHTTPBody
 }
 
 func requestCanConditionallyStreamWithModuleActions(incoming *http.Request, rules []matchedScriptRule) bool {
 	if len(rules) == 0 || !requestHasPayload(incoming) || incoming.ProtoMajor == 3 ||
-		incoming.ContentLength < 0 || incoming.ContentLength > maxModuleHTTPBody || len(incoming.TransferEncoding) > 0 {
+		incoming.ContentLength > maxModuleHTTPBody {
 		return false
 	}
 	encoding, err := normalizedContentEncoding(incoming.Header)
