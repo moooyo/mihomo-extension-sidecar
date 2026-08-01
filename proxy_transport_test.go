@@ -9,7 +9,32 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
+
+// A QUIC keepalive shorter than the idle timeout makes the idle timeout dead
+// code: the connection is never idle, so it never closes, so the slot the dial
+// took is never released and the 64-connection budget only ever shrinks. Both
+// settings arrived in the same commit and cancelled each other out.
+//
+// The reclaim path is the whole reason this matters -- Dial takes a slot and
+// only connection.Context().Done() gives it back.
+func TestQUICIdleTimeoutIsNotDefeatedByAKeepalive(t *testing.T) {
+	t.Parallel()
+	proxy := &interceptProxy{}
+	generation := &upstreamTransportGeneration{}
+	transport := proxy.newHTTP3Transport(generation, quic.Version1)
+
+	if transport.QUICConfig.KeepAlivePeriod != 0 {
+		t.Fatalf("upstream keepalive = %v; a keepalive here means the idle timeout never fires and the connection slot never returns",
+			transport.QUICConfig.KeepAlivePeriod)
+	}
+	if transport.QUICConfig.MaxIdleTimeout != upstreamHTTPIdleTimeout {
+		t.Fatalf("upstream MaxIdleTimeout = %v, want %v so HTTP/3 reclaims on the same clock as the HTTP/1 and HTTP/2 pool",
+			transport.QUICConfig.MaxIdleTimeout, upstreamHTTPIdleTimeout)
+	}
+}
 
 func TestHTTP3ConnectionCapacityIsProxyWide(t *testing.T) {
 	proxy := &interceptProxy{}

@@ -329,10 +329,15 @@ func (p *interceptProxy) serveUDPAssociation(ctx context.Context, control net.Co
 			GetCertificate: p.certificates.GetCertificate,
 		},
 		QUICConfig: &quic.Config{
-			Versions:        []quic.Version{quic.Version1, quic.Version2},
-			MaxIdleTimeout:  90 * time.Second,
-			KeepAlivePeriod: 20 * time.Second,
-			Allow0RTT:       false,
+			Versions: []quic.Version{quic.Version1, quic.Version2},
+			// Same reason as the upstream transport: a 20s keepalive alongside a
+			// 90s idle timeout means the connection never idles out, so an idle
+			// client kept its association, its UDP socket and this server alive
+			// until the SOCKS control connection went away. Here the association
+			// bounds the leak, so this is consistency rather than a slot bug --
+			// but IdleTimeout above says 90 seconds and should mean it.
+			MaxIdleTimeout: 90 * time.Second,
+			Allow0RTT:      false,
 		},
 	}
 	defer server.Close()
@@ -885,9 +890,20 @@ func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGenerati
 			RootCAs:    p.upstreamRoots,
 		},
 		QUICConfig: &quic.Config{
-			Versions:        []quic.Version{version},
-			MaxIdleTimeout:  upstreamHTTPIdleTimeout,
-			KeepAlivePeriod: 20 * time.Second,
+			Versions: []quic.Version{version},
+			// No KeepAlivePeriod. A keepalive shorter than MaxIdleTimeout makes
+			// the idle timeout dead code -- the connection is never idle, so it
+			// never closes, so the slot acquireHTTP3ConnectionSlot took is never
+			// released and the 64-connection budget only ever shrinks. The two
+			// settings arrived together in the initial HTTP/3 commit and cancel
+			// each other out.
+			//
+			// Letting the idle timeout govern makes HTTP/3 behave like the
+			// HTTP/1 and HTTP/2 pool, which reclaims on the same 90 seconds
+			// through IdleConnTimeout. The cost is a fresh handshake for an
+			// origin untouched for 90 seconds, which is what the other two
+			// protocols already pay.
+			MaxIdleTimeout: upstreamHTTPIdleTimeout,
 		},
 		Dial: func(ctx context.Context, address string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
 			host, portText, err := net.SplitHostPort(address)
