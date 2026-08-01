@@ -737,6 +737,16 @@ func (p *interceptProxy) acquireUpstreamTransportGeneration(cfg Config) (*upstre
 		generation = newUpstreamTransportGeneration(cfg)
 		generation.retired = true
 	case generation == nil || cfg.generation > generation.generation:
+		// A newer document is not by itself a reason to drop warm connections.
+		// The generation number advances on any content change, and almost none
+		// of them reach the upstream leg -- a setting, an enable toggle, a
+		// script body, a match pattern all leave the proxy, the protocol and the
+		// target authorization untouched. Only when the fingerprint moves has
+		// this pool stopped being authorized for what it holds.
+		if generation != nil && newUpstreamTransportProjection(cfg).fingerprint == generation.projection.fingerprint {
+			generation.generation = cfg.generation
+			break
+		}
 		previous := generation
 		generation = newUpstreamTransportGeneration(cfg)
 		p.upstream = generation

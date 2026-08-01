@@ -228,6 +228,86 @@ func TestHTTP3ConnectionCapacityIsProxyWide(t *testing.T) {
 	}
 }
 
+// A commit that changes nothing the upstream leg depends on must keep its warm
+// connections.
+//
+// The generation number advances on any content change, and almost none of them
+// reach this leg: a setting, an enable toggle, a script body, a match pattern
+// all leave the proxy, the protocol and the target authorization exactly as they
+// were. Retiring on the number meant every commit dropped every pooled
+// connection and every TLS session with it, and paid a fresh SOCKS handshake
+// plus a fresh origin handshake on the next request.
+func TestUpstreamGenerationSurvivesACommitTheTransportDoesNotCareAbout(t *testing.T) {
+	certPath, keyPath, roots := writeTestInterceptCertificate(t)
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "served")
+	}))
+	upstream.EnableHTTP2 = true
+	upstream.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{loadTestKeyPair(t, certPath, keyPath)},
+	}
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	target := socksTarget{Host: "api.example.com", Port: 443}
+	proxyConfig, targets, _ := startTestSOCKSTCPRouter(t, map[string]string{
+		testSOCKSTargetKey(target): upstream.Listener.Addr().String(),
+	})
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	cfg := Config{
+		generation:     1,
+		MITM:           MITMSettings{Enabled: true, HTTP2: true},
+		UpstreamProxy:  proxyConfig,
+		Modules:        []Module{module},
+		ExecutionOrder: []string{module.ID},
+	}
+	proxy := &interceptProxy{upstreamRoots: roots}
+	defer proxy.closeUpstreamTransports()
+
+	if body := doTestProxyRoundTripPath(t, proxy, cfg, "/first"); body != "served" {
+		t.Fatalf("first body = %q", body)
+	}
+	waitForSOCKSTarget(t, targets, target)
+	first := proxy.upstream
+
+	// A commit that touches only what the script runtime cares about. None of it
+	// reaches the upstream leg.
+	settled := cfg
+	settled.generation = 2
+	changed := module
+	changed.Description = "an edited description"
+	changed.PersistentStorage = !module.PersistentStorage
+	settled.Modules = []Module{changed}
+
+	if body := doTestProxyRoundTripPath(t, proxy, settled, "/second"); body != "served" {
+		t.Fatalf("second body = %q", body)
+	}
+	assertNoSOCKSTarget(t, targets)
+	if proxy.upstream != first {
+		t.Fatal("the pool was replaced by a commit the transport does not depend on")
+	}
+	if proxy.upstream.generation != settled.generation {
+		t.Fatalf("the surviving pool kept generation %d, want the newer %d so the comparison keeps moving forward",
+			proxy.upstream.generation, settled.generation)
+	}
+
+	// And a commit that does reach it still retires the pool.
+	retiring := settled
+	retiring.generation = 3
+	widened := changed
+	widened.CaptureHosts = append(append([]string(nil), module.CaptureHosts...), "extra.example.com")
+	retiring.Modules = []Module{widened}
+	if body := doTestProxyRoundTripPath(t, proxy, retiring, "/third"); body != "served" {
+		t.Fatalf("third body = %q", body)
+	}
+	waitForSOCKSTarget(t, targets, target)
+	if proxy.upstream == first {
+		t.Fatal("a changed target authorization did not retire the pool")
+	}
+}
+
 func TestUpstreamHTTP2GenerationRetiresIdleConnectionsWithoutInterruptingInFlightBody(t *testing.T) {
 	certPath, keyPath, roots := writeTestInterceptCertificate(t)
 	oldHeaders := make(chan struct{})
@@ -305,6 +385,13 @@ func TestUpstreamHTTP2GenerationRetiresIdleConnectionsWithoutInterruptingInFligh
 
 	newCfg := cfg
 	newCfg.generation = 2
+	// Retirement follows the transport fingerprint now, not the generation
+	// number, so this has to move something the upstream leg actually depends
+	// on. An added capture host does that without changing whether
+	// api.example.com is authorized.
+	retiring := module
+	retiring.CaptureHosts = append(append([]string(nil), module.CaptureHosts...), "extra.example.com")
+	newCfg.Modules = []Module{retiring}
 	newBody := doTestProxyRoundTripPath(t, proxy, newCfg, "/new")
 	if newBody != "new-generation" {
 		t.Fatalf("new generation body = %q", newBody)
@@ -395,6 +482,13 @@ func TestUpstreamHTTP2TransportReusesConnectionsAndDoesNotRollBackGeneration(t *
 
 	newCfg := cfg
 	newCfg.generation = 2
+	// Retirement follows the transport fingerprint, so a bare generation bump
+	// would now reuse the pool -- which is what
+	// TestUpstreamGenerationSurvivesACommitTheTransportDoesNotCareAbout covers.
+	// This case is about a commit that does reach the upstream leg.
+	widened := module
+	widened.CaptureHosts = append(append([]string(nil), module.CaptureHosts...), "extra.example.com")
+	newCfg.Modules = []Module{widened}
 	doTestProxyRoundTrip(t, proxy, newCfg)
 	if got := len(targets); got != 2 {
 		t.Fatalf("new generation opened %d total SOCKS connections, want 2", got)
