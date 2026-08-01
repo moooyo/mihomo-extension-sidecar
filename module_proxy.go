@@ -240,17 +240,32 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	}, nil
 }
 
+// outboundModuleRequest builds the upstream request both module paths send.
+//
+// WithContext rather than Clone: Clone deep-copies the URL and the Header, and
+// both are dead on the next two lines -- the URL is replaced by the parsed
+// post-rewrite one and the Header by forwardRequestHeaders, which is itself a
+// clone of the projection. Trailer is the one field that must stay deep, because
+// streamingModuleRequest hands the outbound map to requestTrailerBody as the
+// destination it writes the late trailers into; aliasing it would write them
+// back into the inbound request's own map.
+func outboundModuleRequest(incoming *http.Request, parsedURL *url.URL, header http.Header) *http.Request {
+	outbound := incoming.WithContext(incoming.Context())
+	outbound.URL = parsedURL
+	outbound.Host = parsedURL.Host
+	outbound.RequestURI = ""
+	outbound.Header = header
+	outbound.Trailer = incoming.Trailer.Clone()
+	return outbound
+}
+
 func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg Config, message scriptMessage) (*http.Request, []matchedScriptRule, error) {
 	parsedURL, err := url.Parse(message.URL)
 	if err != nil {
 		return nil, nil, err
 	}
 	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
-	outbound := incoming.Clone(incoming.Context())
-	outbound.URL = parsedURL
-	outbound.Host = parsedURL.Host
-	outbound.RequestURI = ""
-	outbound.Header = forwardRequestHeaders(message, responseCandidates)
+	outbound := outboundModuleRequest(incoming, parsedURL, forwardRequestHeaders(message, responseCandidates))
 	if requestHasBodySection(incoming) {
 		outbound.Body = &requestTrailerBody{
 			ReadCloser:  http.MaxBytesReader(w, incoming.Body, maxModuleHTTPBody),
@@ -312,11 +327,7 @@ func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMes
 		return nil, nil, err
 	}
 	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
-	outbound := incoming.Clone(incoming.Context())
-	outbound.URL = parsedURL
-	outbound.Host = parsedURL.Host
-	outbound.RequestURI = ""
-	outbound.Header = forwardRequestHeaders(message, responseCandidates)
+	outbound := outboundModuleRequest(incoming, parsedURL, forwardRequestHeaders(message, responseCandidates))
 	outbound.Body = io.NopCloser(bytes.NewReader(message.Body))
 	outbound.ContentLength = int64(len(message.Body))
 	outbound.GetBody = func() (io.ReadCloser, error) {
@@ -344,10 +355,17 @@ func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMes
 // No interested action means nothing reads the body and the global cap stands:
 // the message still has to be forwarded.
 //
-// This bounds the wire read only. The decode limit deliberately stays at the
-// global cap, because transformModuleResponse treats any decode failure as
-// "cannot filter this, forward it untouched" -- so a tighter decode bound would
-// convert a fail-closed refusal into a silently unfiltered response.
+// This bounds the wire read only. On the RESPONSE path the decode limit
+// deliberately stays at the global cap, because transformModuleResponse treats
+// any decode failure as "cannot filter this, forward it untouched" -- so a
+// tighter decode bound there would convert a fail-closed refusal into a silently
+// unfiltered response. The request path is the opposite: a decode failure
+// propagates out of prepareModuleRequestWithRules and becomes a 502, exactly
+// like the per-rule "request body exceeds action limit" check, so it can and
+// does use this limit for the decode too. Without that, an action declaring
+// maxBodyBytes 1024 still let a client hold a fully expanded body resident --
+// brotli reaches the 64 MiB cap from ~106 bytes on the wire -- while occupying
+// one of the two body slots.
 func moduleBodyReadLimit(rules []matchedScriptRule) int64 {
 	limit := int64(0)
 	for _, matched := range rules {
@@ -378,7 +396,7 @@ func readDecodedModuleRequestBody(w http.ResponseWriter, incoming *http.Request,
 	if err != nil {
 		return nil, err
 	}
-	return decodeContentBody(body, encoding, maxModuleHTTPBody)
+	return decodeContentBody(body, encoding, readLimit)
 }
 
 func drainModuleRequestBody(w http.ResponseWriter, incoming *http.Request) error {
@@ -462,7 +480,7 @@ func (p *interceptProxy) transformModuleResponse(
 		return nil, nil
 	}
 	responseMessage.Body = decoded
-	responseTrailers, err := exportedTrailers(response.Trailer)
+	responseTrailers, err := wireTrailers(response.Trailer)
 	if err != nil {
 		return nil, fmt.Errorf("upstream response trailers: %w", err)
 	}

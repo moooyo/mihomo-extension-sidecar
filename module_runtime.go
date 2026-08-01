@@ -81,6 +81,17 @@ const (
 	maxPersistentKeys         = 256
 	maxPersistentKeyBytes     = 256
 	maxPersistentValueBytes   = 64 << 10
+	// maxPersistentCommitsPerAction bounds durable store commits the way
+	// maxConsoleLogsPerAction and maxModuleNetworkCallsPerAction bound the other
+	// two script-reachable side channels. Storage had size bounds but no call
+	// bound, and every accepted write marshals the whole store, writes it, fsyncs
+	// it and renames it while holding the process-wide persistentWriteMu -- so one
+	// extension looping storage.set with alternating values inside its rule
+	// timeout was thousands of fsyncs, blocking every other extension's writes for
+	// the duration. Only commits that actually reach the disk are counted: a set
+	// that rewrites an identical value, a delete of a missing key and a clear of
+	// an empty bucket all short-circuit before any I/O and cost nothing.
+	maxPersistentCommitsPerAction = 32
 )
 
 func newScriptRuntime(statePath ...string) *scriptRuntime {
@@ -257,9 +268,30 @@ func scriptProgram(module Module, rule ScriptRule) (*goja.Program, error) {
 	return program, nil
 }
 
+// scriptSettingValues returns settings a caller may hand to a VM, which means
+// the caller may see them mutated: context.settings and $argument are reachable
+// from script code. rule.settings is the snapshot-owned map compileScriptConfig
+// decoded once per module, so those callers get a copy.
 func scriptSettingValues(module Module, rule ScriptRule) (map[string]any, error) {
 	if rule.settings != nil {
 		return cloneScriptSettings(rule.settings), nil
+	}
+	return moduleSettingValues(module)
+}
+
+// scriptSettingValuesReadOnly is for callers that only look values up.
+//
+// executeRewrite and executeBodyReplace pass the map straight to
+// expandSettingsTemplate, which does nothing but read settings[key]. They are
+// also the two cheapest action kinds -- the ones that exist precisely so a
+// substitution does not have to construct a VM -- so a per-request deep copy of
+// up to 128 decoded settings could cost more than the action itself.
+//
+// The returned map must not be mutated or handed to a VM. Use
+// scriptSettingValues for that.
+func scriptSettingValuesReadOnly(module Module, rule ScriptRule) (map[string]any, error) {
+	if rule.settings != nil {
+		return rule.settings, nil
 	}
 	return moduleSettingValues(module)
 }
@@ -417,6 +449,15 @@ func applyNativePatch(result *scriptResult, raw any, response bool) error {
 }
 
 func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.Object {
+	// Per-action, because storageObject is built once per execute (the context
+	// construction at the top of this file). goja runs one VM on one goroutine,
+	// so a plain counter is enough -- the same shape module_network.go uses for
+	// its call budget.
+	commits := 0
+	spend := func() bool {
+		commits++
+		return commits <= maxPersistentCommitsPerAction
+	}
 	get := func(call goja.FunctionCall) goja.Value {
 		key := call.Argument(0).String()
 		snapshot := r.persistent.Load()
@@ -451,6 +492,9 @@ func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.O
 		if existed && previous == value {
 			return vm.ToValue(true)
 		}
+		if !spend() {
+			return vm.ToValue(false)
+		}
 		nextModules := clonePersistentModules(current.modules)
 		nextBucket := clonePersistentBucket(bucket)
 		nextBucket[key] = value
@@ -475,6 +519,9 @@ func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.O
 		if !existed {
 			return vm.ToValue(false)
 		}
+		if !spend() {
+			return vm.ToValue(false)
+		}
 		nextModules := clonePersistentModules(current.modules)
 		nextBucket := clonePersistentBucket(bucket)
 		delete(nextBucket, key)
@@ -496,6 +543,9 @@ func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.O
 		_, exists := current.modules[moduleID]
 		if !exists {
 			return vm.ToValue(true)
+		}
+		if !spend() {
+			return vm.ToValue(false)
 		}
 		nextModules := clonePersistentModules(current.modules)
 		delete(nextModules, moduleID)
@@ -620,7 +670,16 @@ func (r *scriptRuntime) savePersistent(snapshot *persistentSnapshot) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tempPath, r.statePath)
+	if err := os.Rename(tempPath, r.statePath); err != nil {
+		return err
+	}
+	// store.json is a sibling of meta.json and pointer.json, and bundleStore
+	// writes those with "atomic rename + fsync of file and directory". This one
+	// synced the file and skipped the directory, so the rename itself was not
+	// durable: a power cut could leave the directory entry naming the old inode,
+	// or a temp file that was then removed -- a storage.set that returned true to
+	// a script silently undone, or the whole store absent on the first write.
+	return syncBundleDir(filepath.Dir(r.statePath))
 }
 
 func installConsoleAPI(vm *goja.Runtime, publisher engineLogPublisher, metadata EngineLog) {
@@ -807,6 +866,42 @@ const maxWireHeaderBytes = maxModuleNetworkHeaderBytes
 // by the limit written for it, rather than by an inbound check standing in.
 func wireHeaders(source http.Header) http.Header {
 	return cloneProxyHeaders(source)
+}
+
+// wireTrailers projects an origin's trailer block into a script message and,
+// for the passthrough leg, into what gets republished.
+//
+// It is exportedTrailers minus one thing: the fatal check on names
+// validResponseTrailerName rejects. That check is right for a script's output --
+// a script inventing a Cache-Control trailer is a mistake worth refusing -- but
+// three call sites were running it over the *origin's* block, where it means
+// something else entirely. Those names are the RFC 7230 4.1.2 set a proxy MUST
+// NOT forward in a trailer section; an origin that emits one is quirky, not
+// hostile, and the correct proxy behaviour is to drop the field. Refusing turned
+// it into a failed exchange: on the pure passthrough leg
+// panic(http.ErrAbortHandler), tearing the client connection down before a byte
+// was written, for a response this process was only relaying.
+//
+// responseTrailerNames and publishResponseTrailers already drop exactly these
+// names one layer down, so dropping here loses nothing and additionally keeps
+// the script's projection equal to what the runtime could put back on the wire.
+//
+// The count, value and duplicate-name bounds stay. Unlike a header block -- where
+// those counts are calibrated for what a script invents and wrongly refused
+// large but legitimate origin responses -- a trailer section is a handful of
+// fields by construction, it arrives after the body so no transport header bound
+// covers it, and TestStreamingResponseRejectsUnsafeTrailers pins them.
+func wireTrailers(source http.Header) (http.Header, error) {
+	trailers, err := exportedHeaders(source)
+	if err != nil {
+		return nil, err
+	}
+	for name := range trailers {
+		if !validResponseTrailerName(name) {
+			delete(trailers, name)
+		}
+	}
+	return trailers, nil
 }
 
 func exportedHeaders(value any) (http.Header, error) {

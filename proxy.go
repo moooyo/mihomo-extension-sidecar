@@ -900,15 +900,20 @@ func (p *interceptProxy) acquireHTTP3ConnectionSlot(ctx context.Context, generat
 	// The HTTP/3 transport keeps authority connections alive. Under capacity
 	// pressure, recycle them only when this is the generation's sole request;
 	// otherwise an apparently idle client may still own a streaming body.
+	//
+	// Decide under the lock, act outside it -- the shape acquireUpstreamTransport-
+	// Generation and closeUpstreamTransports already use. closeIdleHTTP3Connections
+	// takes generation.mu itself and snapshots the transports before releasing it,
+	// so it never needed transportMu; holding that process-wide lock across up to
+	// maxUpstreamHTTP3Connections blocking CloseWithError calls stalled every
+	// other request's refcount bump behind a pile of QUIC teardowns.
 	p.transportMu.Lock()
 	soleRequest := generation.refs == 1
-	if soleRequest {
-		generation.closeIdleHTTP3Connections()
-	}
 	p.transportMu.Unlock()
 	if !soleRequest {
 		return nil, errors.New("upstream HTTP/3 connection capacity is busy")
 	}
+	generation.closeIdleHTTP3Connections()
 
 	timer := time.NewTimer(upstreamHTTP3RecycleTimeout)
 	defer timer.Stop()
@@ -1342,8 +1347,7 @@ var streamingResponseBuffers = sync.Pool{
 
 func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int, method string, response *http.Response) error {
 	controller := http.NewResponseController(w)
-	responseHeaders := wireHeaders(response.Header)
-	announcedTrailers, err := exportedTrailers(response.Trailer)
+	announcedTrailers, err := wireTrailers(response.Trailer)
 	if err != nil {
 		return fmt.Errorf("upstream response trailers: %w", err)
 	}
@@ -1351,7 +1355,11 @@ func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int
 	if len(responseTrailerNames(announcedTrailers)) > 0 && !canHaveBody {
 		return errors.New("response trailers require a response body section")
 	}
-	copyResponseHeaders(w.Header(), responseHeaders)
+	// copyResponseHeaders reads its source and copies every value slice it keeps,
+	// so the wireHeaders clone this used to take was garbage by the time it
+	// returned -- one map plus one slice per field, on the hot path for every
+	// response no action transforms.
+	copyResponseHeaders(w.Header(), response.Header)
 	declaredTrailers := declareResponseTrailers(w.Header(), announcedTrailers)
 	forceChunked := downstreamProtoMajor == 1 && response.ProtoMajor >= 2 && canHaveBody
 	if forceChunked {
@@ -1369,7 +1377,7 @@ func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int
 	if _, err := io.CopyBuffer(streamed, response.Body, *buffer); err != nil {
 		return err
 	}
-	responseTrailers, err := exportedTrailers(response.Trailer)
+	responseTrailers, err := wireTrailers(response.Trailer)
 	if err != nil {
 		return fmt.Errorf("upstream response trailers: %w", err)
 	}

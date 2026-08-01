@@ -484,11 +484,6 @@ func flatCompatHeaders(headers map[string][]string) map[string]string {
 	return flat
 }
 
-// parseCompatScriptResult converts the value handed to $done into an action
-// result. A bundle passes the response projection itself rather than the
-// {response: {...}} envelope the native contract uses, so the value is treated
-// as the patch. `bodyBytes` is accepted alongside `body` because the bundles
-// mirror a binary payload into both fields.
 // parseCompatScriptResult translates the value a bundle handed $done.
 //
 // A Loon completion wraps the projection in a `response` envelope. The shipped
@@ -571,8 +566,24 @@ func compatProjectionIsEmpty(value goja.Value) bool {
 	if !ok || len(patch) == 0 {
 		return false
 	}
-	if _, wrapped := patch["response"]; wrapped {
-		return false
+	// Recurse rather than short-circuit. parseCompatScriptResult runs the
+	// envelope's inner object through the same compatProjection filter, so an
+	// envelope whose inner members are all transport hints is exactly the empty
+	// projection this detector exists to report -- and returning false here made
+	// it the one shape it refused to look inside, leaving the apple-wloc failure
+	// mode (a permanent silent no-op with no error and no warning) undiagnosable
+	// through the engine log ring.
+	//
+	// Two sub-cases stay unreported, matching the flat path's own conventions: a
+	// non-object inner already fails loudly at parse, so warning first would only
+	// add noise ahead of an error, and an empty inner mirrors the deliberate
+	// exemption len(patch) == 0 gives the flat $done({}).
+	if envelope, wrapped := patch["response"]; wrapped {
+		inner, ok := stringAnyMap(unwrapCompatValue(envelope))
+		if !ok || len(inner) == 0 {
+			return false
+		}
+		return len(compatProjection(inner)) == 0
 	}
 	return len(compatProjection(patch)) == 0
 }

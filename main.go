@@ -172,7 +172,7 @@ func main() {
 	}
 	proxy := newInterceptProxy(store, certificates, *bundleStoreDir)
 	proxy.setEngineLogPublisher(logs)
-	go stopWhenMITMDisabled(ctx, store, stopRuntime)
+	go stopWhenMITMDisabled(ctx, store, stopRuntime, startupPublishGrace)
 	log.Printf("intercept: modular TLS and HTTP/3 SOCKS5 TCP/UDP service listening on %s (http2=%t quic_fallback_protection=%t)", cfg.Listen, cfg.MITM.HTTP2, cfg.MITM.QUICFallbackProtection)
 	logs.Publish(EngineLog{
 		Level: "info", Source: "engine",
@@ -216,7 +216,14 @@ func checkInterceptHealth(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.CancelFunc) {
+// startupPublishGrace is how long a freshly started process waits for its
+// coordinator to publish before it will honour a "nothing is active" verdict.
+//
+// It must exceed the coordinator's own publish window, which is a socket wait
+// plus one control-API round trip.
+const startupPublishGrace = 15 * time.Second
+
+func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.CancelFunc, grace time.Duration) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	// A withdrawn bundle makes Current fail on every tick, so the summary is
@@ -224,6 +231,27 @@ func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.
 	// not a reason to stop: the control socket is how a new bundle arrives, and
 	// mihomo already fails closed on a processor that is not ready.
 	reported := false
+	// A stale bundle that decodes cleanly is not the same as no bundle, and it
+	// used to be treated as authoritative the moment this process started.
+	//
+	// Turning the MITM master off and back on is exactly that shape. Off stops
+	// this service, so the bundle its store points at says disabled. On writes
+	// the document, the path unit starts this process, and the coordinator then
+	// pushes the enabled bundle -- but a cold start adopts the durable pointer
+	// first, saw "no active extension", and stopped within about 460 ms, racing
+	// the commit. The commit landed on some runs and was lost to the exit on
+	// others, so the master switch was a one-way door: the document said enabled,
+	// the console reported expected-but-not-running, and only an explicit
+	// `systemctl start` recovered it.
+	//
+	// systemd's ExecCondition=--check-enabled reads the *file*, so it has already
+	// established that the master is on. Until an active configuration has
+	// actually been observed, give the coordinator its publish window rather than
+	// stopping on a verdict this process is about to be corrected on. Once one has
+	// been observed, the master really was turned off while running, which is what
+	// this loop is for, and it stops immediately as before.
+	observedActive := false
+	deadline := time.Now().Add(grace)
 	for {
 		select {
 		case <-ctx.Done():
@@ -239,10 +267,14 @@ func stopWhenMITMDisabled(ctx context.Context, store *configStore, stop context.
 			}
 			reported = false
 			if !cfg.MITM.Enabled || !hasActiveExtensions(cfg) {
+				if !observedActive && time.Now().Before(deadline) {
+					continue
+				}
 				log.Print("intercept: no active interception extension; stopping service")
 				stop()
 				return
 			}
+			observedActive = true
 		}
 	}
 }

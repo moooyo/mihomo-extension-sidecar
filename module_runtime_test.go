@@ -652,6 +652,41 @@ func persistentFillerSnapshot(count int) *persistentSnapshot {
 	return &persistentSnapshot{modules: modules}
 }
 
+// TestStoragePersistentCommitsAreBoundedPerAction pins the call bound storage
+// was missing. console has maxConsoleLogsPerAction and network has
+// maxModuleNetworkCallsPerAction; storage had size bounds but nothing stopping
+// one action from driving thousands of whole-store marshal+fsync+rename cycles
+// under the process-wide persistentWriteMu, blocking every other extension's
+// writes for its entire rule timeout.
+func TestStoragePersistentCommitsAreBoundedPerAction(t *testing.T) {
+	t.Parallel()
+	runtime := newScriptRuntime(filepath.Join(t.TempDir(), "store.json"))
+	moduleID := "io.example.fixture"
+	vm := goja.New()
+	storage := runtime.storageObject(vm, moduleID)
+	for index := 0; index < maxPersistentCommitsPerAction; index++ {
+		// Alternating values, because an identical rewrite short-circuits before
+		// any I/O -- which is exactly how a loop defeated the only guard there was.
+		if !callStorageBoolean(t, storage, "set", vm.ToValue("key"), vm.ToValue(fmt.Sprintf("value-%02d", index))) {
+			t.Fatalf("commit %d inside the budget was refused", index)
+		}
+	}
+	if callStorageBoolean(t, storage, "set", vm.ToValue("key"), vm.ToValue("over-budget")) {
+		t.Fatal("a commit past the per-action budget was accepted")
+	}
+	last := fmt.Sprintf("value-%02d", maxPersistentCommitsPerAction-1)
+	if !callStorageBoolean(t, storage, "set", vm.ToValue("key"), vm.ToValue(last)) {
+		t.Fatal("an identical-value no-op was refused after the budget; it costs no I/O and must stay free")
+	}
+
+	// The budget is per action, and storageObject is built once per execute.
+	nextVM := goja.New()
+	nextStorage := runtime.storageObject(nextVM, moduleID)
+	if !callStorageBoolean(t, nextStorage, "set", nextVM.ToValue("key"), nextVM.ToValue("next-action")) {
+		t.Fatal("a new action did not get a fresh commit budget")
+	}
+}
+
 func invokeStorageBoolean(storage *goja.Object, method string, arguments ...goja.Value) (bool, error) {
 	call, ok := goja.AssertFunction(storage.Get(method))
 	if !ok {

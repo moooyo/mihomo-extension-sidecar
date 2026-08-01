@@ -527,6 +527,53 @@ func TestConfigStoreRetriesTransientReadErrorsForTheSameFileVersion(t *testing.T
 	}
 }
 
+// TestConfigStoreStatFailureRetainsSnapshot pins the other half of the retain
+// contract. A read failure has always retained the last valid snapshot; the
+// stat one line above it used to return an error instead, so which of the two
+// syscalls happened to observe a momentary fault decided whether every caller
+// failed closed against a perfectly good compiled configuration.
+func TestConfigStoreStatFailureRetainsSnapshot(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	body, err := json.Marshal(validNativeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	writeConfigAt(t, path, body, baseTime)
+	store, err := newConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An unlink-recreate editor, a bind-mount remount or a transient EACCES all
+	// open this window: the path cannot be stat'd at all.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		retained, err := store.Current()
+		if err != nil {
+			t.Fatalf("attempt %d: stat failure discarded the snapshot: %v", attempt, err)
+		}
+		if retained.generation != 1 || !retained.MITM.HTTP2 {
+			t.Fatalf("attempt %d retained = generation=%d http2=%t", attempt, retained.generation, retained.MITM.HTTP2)
+		}
+	}
+	if !store.readErrorUnstatable {
+		t.Fatal("an unstattable path was not remembered, so Current logs on every request")
+	}
+
+	writeConfigAt(t, path, body, baseTime.Add(time.Second))
+	recovered, err := store.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.readErrorUnstatable || recovered.generation != 1 {
+		t.Fatalf("recovered state = unstatable=%t generation=%d", store.readErrorUnstatable, recovered.generation)
+	}
+}
+
 func writeConfigAt(t *testing.T, path string, body []byte, modTime time.Time) {
 	t.Helper()
 	if err := os.WriteFile(path, body, 0o600); err != nil {
