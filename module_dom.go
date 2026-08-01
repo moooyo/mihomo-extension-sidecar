@@ -35,6 +35,13 @@ type domDocument struct {
 	vm      *goja.Runtime
 	root    *html.Node
 	wrapped map[*html.Node]*goja.Object
+	// nodes is the reverse of wrapped. Without it nodeOf had to walk wrapped
+	// looking for the object, which made the pinned remove-nodes idiom
+	// (querySelectorAll then removeChild on each match) quadratic in the size of
+	// the selection: every removeChild scanned every node the document had ever
+	// handed out, in Go's randomized map order. Both maps are reclaimed with the
+	// document, so this retains nothing past the action.
+	nodes map[*goja.Object]*html.Node
 }
 
 func installDOMAPI(vm *goja.Runtime) error {
@@ -69,7 +76,12 @@ func newDOMDocument(vm *goja.Runtime, source string) (*goja.Object, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse document: %w", err)
 	}
-	document := &domDocument{vm: vm, root: root, wrapped: make(map[*html.Node]*goja.Object)}
+	document := &domDocument{
+		vm:      vm,
+		root:    root,
+		wrapped: make(map[*html.Node]*goja.Object),
+		nodes:   make(map[*goja.Object]*html.Node),
+	}
 	if count := countDOMNodes(root); count > maxDOMNodes {
 		return nil, fmt.Errorf("document has %d nodes, exceeding %d", count, maxDOMNodes)
 	}
@@ -100,11 +112,15 @@ func (d *domDocument) documentObject() *goja.Object {
 		return d.vm.ToValue(d.selectAll(d.root, call.Argument(0)))
 	})
 	_ = object.Set("querySelector", func(call goja.FunctionCall) goja.Value {
-		matches := d.selectAll(d.root, call.Argument(0))
-		if len(matches) == 0 {
+		// Query rather than selectAll-and-discard: the old shape walked the whole
+		// subtree, allocated a goja object for every match and then returned the
+		// first, so probing for one optional node cost as much as collecting every
+		// node that matched.
+		match := cascadia.Query(d.root, d.compileSelector(call.Argument(0)))
+		if match == nil {
 			return goja.Null()
 		}
-		return matches[0]
+		return d.wrap(match)
 	})
 	// documentElement, head, and body are looked up on every read rather than
 	// captured once, because the bundle appends to head and then serializes
@@ -143,7 +159,7 @@ func (d *domDocument) firstElement(tag string) goja.Value {
 	return d.wrap(found)
 }
 
-func (d *domDocument) selectAll(scope *html.Node, selector goja.Value) []goja.Value {
+func (d *domDocument) compileSelector(selector goja.Value) cascadia.Selector {
 	text := selector.String()
 	if len(text) > maxDOMSelectorBytes {
 		panic(d.vm.NewTypeError("selector exceeds %d bytes", maxDOMSelectorBytes))
@@ -152,6 +168,11 @@ func (d *domDocument) selectAll(scope *html.Node, selector goja.Value) []goja.Va
 	if err != nil {
 		panic(d.vm.NewGoError(fmt.Errorf("invalid selector %q: %w", text, err)))
 	}
+	return compiled
+}
+
+func (d *domDocument) selectAll(scope *html.Node, selector goja.Value) []goja.Value {
+	compiled := d.compileSelector(selector)
 	matched := make([]goja.Value, 0)
 	for _, node := range cascadia.QueryAll(scope, compiled) {
 		matched = append(matched, d.wrap(node))
@@ -166,6 +187,7 @@ func (d *domDocument) wrap(node *html.Node) *goja.Object {
 	}
 	object := d.vm.NewObject()
 	d.wrapped[node] = object
+	d.nodes[object] = node
 
 	_ = object.Set("appendChild", func(call goja.FunctionCall) goja.Value {
 		child := d.nodeOf(call.Argument(0))
@@ -259,12 +281,11 @@ func (d *domDocument) nodeOf(value goja.Value) *html.Node {
 	if !ok {
 		panic(d.vm.NewTypeError("expected a node from this document"))
 	}
-	for node, candidate := range d.wrapped {
-		if candidate == object {
-			return node
-		}
+	node, ok := d.nodes[object]
+	if !ok {
+		panic(d.vm.NewTypeError("expected a node from this document"))
 	}
-	panic(d.vm.NewTypeError("expected a node from this document"))
+	return node
 }
 
 func domTextContent(node *html.Node) string {

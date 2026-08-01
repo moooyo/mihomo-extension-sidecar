@@ -12,6 +12,46 @@ import (
 	"github.com/dop251/goja"
 )
 
+// TestCompatProjectionIsEmptyLooksInsideTheEnvelope pins the one shape the
+// detector used to refuse to inspect. parseCompatScriptResult runs the
+// envelope's inner object through the same compatProjection filter, so an
+// envelope carrying only transport hints is exactly the empty projection this
+// exists to report -- and since this runtime presents as Loon, the envelope is
+// the shape bundles actually send. Short-circuiting on it left the apple-wloc
+// failure mode (a permanent silent no-op, no error) invisible in the engine log
+// ring, which CLAUDE.md names as the way to tell a no-op from a crash.
+func TestCompatProjectionIsEmptyLooksInsideTheEnvelope(t *testing.T) {
+	t.Parallel()
+	vm := goja.New()
+	for name, test := range map[string]struct {
+		value any
+		empty bool
+	}{
+		"envelope of transport hints only": {value: map[string]any{"response": map[string]any{"policy": "DIRECT", "node": "x"}}, empty: true},
+		"envelope with a body":             {value: map[string]any{"response": map[string]any{"body": "payload"}}, empty: false},
+		"envelope with a status":           {value: map[string]any{"response": map[string]any{"status": 204}}, empty: false},
+		// $done({}) is deliberately exempt on the flat path, so the envelope form
+		// of the same "I chose not to act" completion stays exempt too.
+		"empty envelope": {value: map[string]any{"response": map[string]any{}}, empty: false},
+		// A non-object inner already fails loudly at parse; warning first would
+		// only put noise ahead of the error.
+		"non-object envelope":  {value: map[string]any{"response": "nope"}, empty: false},
+		"flat transport hints": {value: map[string]any{"policy": "DIRECT"}, empty: true},
+		"flat body":            {value: map[string]any{"body": "payload"}, empty: false},
+		"flat empty":           {value: map[string]any{}, empty: false},
+	} {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			if got := compatProjectionIsEmpty(vm.ToValue(test.value)); got != test.empty {
+				t.Fatalf("compatProjectionIsEmpty = %t, want %t", got, test.empty)
+			}
+		})
+	}
+	if compatProjectionIsEmpty(goja.Undefined()) || compatProjectionIsEmpty(goja.Null()) || compatProjectionIsEmpty(nil) {
+		t.Fatal("a bundle that completed with nothing at all is not an empty projection")
+	}
+}
+
 // runCompatScript drives a script the way a published proxy-client bundle
 // behaves: it returns immediately and signals completion by calling $done.
 func runCompatScript(t *testing.T, source string, options compatOptions) (goja.Value, error) {

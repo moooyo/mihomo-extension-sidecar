@@ -1581,9 +1581,13 @@ type configStore struct {
 	readErrorModTime time.Time
 	readErrorSize    int64
 	readErrorFile    os.FileInfo
-	contentDigest    [sha256.Size]byte
-	cfg              Config
-	logs             engineLogPublisher
+	// readErrorUnstatable suppresses the duplicate read-failure log when the path
+	// could not be stat'd at all. The identity-keyed suppression above needs a
+	// FileInfo; without one, Current would log on every single request.
+	readErrorUnstatable bool
+	contentDigest       [sha256.Size]byte
+	cfg                 Config
+	logs                engineLogPublisher
 
 	// bundleSource, when set, reports the pushed bundle and whether this process
 	// has ever made one live.
@@ -1663,15 +1667,31 @@ func (s *configStore) Current() (Config, error) {
 			return Config{}, errNoActiveBundle
 		}
 	}
-	info, err := os.Stat(s.path)
-	if err != nil {
-		return Config{}, fmt.Errorf("stat config: %w", err)
-	}
-	if s.matchesGoodFile(info) {
-		return s.cfg, nil
-	}
-	if s.matchesBadFile(info) {
-		return s.cfg, nil
+	// A stat failure must not be worse than a read failure. Fourteen lines below,
+	// a readDocument error logs once and retains the last valid snapshot, which is
+	// the documented contract: "retains the last valid snapshot after an invalid
+	// external replacement... transient read errors remain retryable". Returning
+	// an error here made the outcome depend on which of the two syscalls happened
+	// to observe the same momentary fault -- an editor that unlinks and recreates,
+	// a bind-mount remount, a transient EACCES/EIO -- and during that window every
+	// caller fails closed against a perfectly good compiled snapshot: ServeHTTP
+	// answers 503, GetCertificate reports an unrecognised SNI so the handshake
+	// fails, and handleSOCKSConnection drops the session.
+	//
+	// The stat exists only to feed the identity caches, so skip them when it fails
+	// and let readDocument re-derive its own FileInfo. A file that is genuinely
+	// gone still ends at "serve nothing" through the bundle seam's
+	// errNoActiveBundle, which is the channel designed for that.
+	info, statErr := os.Stat(s.path)
+	if statErr != nil {
+		info = nil
+	} else {
+		if s.matchesGoodFile(info) {
+			return s.cfg, nil
+		}
+		if s.matchesBadFile(info) {
+			return s.cfg, nil
+		}
 	}
 	readDocument := s.readDocument
 	if readDocument == nil {
@@ -1679,16 +1699,22 @@ func (s *configStore) Current() (Config, error) {
 	}
 	body, readInfo, err := readDocument(s.path)
 	if err != nil {
-		if !s.matchesReadErrorFile(info) {
-			log.Print("intercept: could not read replacement config; retaining the last valid snapshot")
-			if s.engineLogsEnabled() {
-				s.publishEngineLog("warn", "configuration read failed: "+err.Error())
+		// Two suppressions, because Current runs on every request and an
+		// unstattable path has no identity to key one on.
+		if info != nil {
+			if !s.matchesReadErrorFile(info) {
+				s.reportConfigReadFailure(err)
+				s.rememberReadErrorFile(info)
 			}
-			s.rememberReadErrorFile(info)
+		} else if !s.readErrorUnstatable {
+			s.reportConfigReadFailure(err)
+			s.clearReadErrorFile()
+			s.readErrorUnstatable = true
 		}
 		return s.cfg, nil
 	}
 	s.clearReadErrorFile()
+	s.readErrorUnstatable = false
 	if readInfo == nil {
 		readInfo = info
 	}
@@ -1791,4 +1817,11 @@ func (s *configStore) clearReadErrorFile() {
 	s.readErrorModTime = time.Time{}
 	s.readErrorSize = 0
 	s.readErrorFile = nil
+}
+
+func (s *configStore) reportConfigReadFailure(err error) {
+	log.Print("intercept: could not read replacement config; retaining the last valid snapshot")
+	if s.engineLogsEnabled() {
+		s.publishEngineLog("warn", "configuration read failed: "+err.Error())
+	}
 }

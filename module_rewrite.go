@@ -171,7 +171,7 @@ func executeRewrite(rule ScriptRule, module Module, request scriptMessage) (scri
 	// choose the host while the pattern still carries the rest of the URL
 	// through. An unresolvable key declines the action, which leaves the request
 	// going where it was already going.
-	settings, err := scriptSettingValues(module, rule)
+	settings, err := scriptSettingValuesReadOnly(module, rule)
 	if err != nil {
 		return scriptResult{}, err
 	}
@@ -213,7 +213,7 @@ func executeBodyReplace(rule ScriptRule, module Module, request scriptMessage, r
 	if len(body) > maxReplaceBodyBytes {
 		return scriptResult{}, fmt.Errorf("body exceeds %d bytes", maxReplaceBodyBytes)
 	}
-	settings, err := scriptSettingValues(module, rule)
+	settings, err := scriptSettingValuesReadOnly(module, rule)
 	if err != nil {
 		return scriptResult{}, err
 	}

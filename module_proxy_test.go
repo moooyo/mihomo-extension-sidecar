@@ -1557,6 +1557,65 @@ func TestStreamingResponseRejectsUnsafeTrailers(t *testing.T) {
 	}
 }
 
+// TestStreamingResponseDropsUnrepublishableOriginTrailers pins the distinction
+// wireTrailers draws against the budget checks above. The names
+// validResponseTrailerName rejects are the RFC 7230 4.1.2 set a proxy must not
+// forward in a trailer section: an origin that emits one is quirky, not hostile,
+// so the field is dropped. Refusing instead failed the whole exchange -- and on
+// the passthrough leg ServeHTTP turns that error into
+// panic(http.ErrAbortHandler), tearing the client connection down before a byte
+// is written, for a response this process was only relaying.
+func TestStreamingResponseDropsUnrepublishableOriginTrailers(t *testing.T) {
+	t.Parallel()
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		ProtoMajor: 2,
+		Header:     http.Header{"Content-Type": {"text/plain"}},
+		Trailer:    http.Header{"Cache-Control": {"no-store"}, "Grpc-Status": {"0"}},
+		Body:       io.NopCloser(strings.NewReader("payload")),
+	}
+	writer := httptest.NewRecorder()
+	if err := writeStreamingProxyResponse(writer, 2, http.MethodGet, response); err != nil {
+		t.Fatalf("a relayable response was refused over an origin trailer: %v", err)
+	}
+	if got := writer.Body.String(); got != "payload" {
+		t.Fatalf("body = %q", got)
+	}
+	header := writer.Header()
+	if header.Get("Cache-Control") != "" || header.Get(http.TrailerPrefix+"Cache-Control") != "" {
+		t.Fatalf("unrepublishable trailer was forwarded: %v", header)
+	}
+	if header.Get("Grpc-Status") == "" && header.Get(http.TrailerPrefix+"Grpc-Status") == "" {
+		t.Fatalf("legitimate trailer was dropped alongside it: %v", header)
+	}
+}
+
+// TestRequestBodyDecodeIsBoundedByTheActionLimit pins the request half of
+// moduleBodyReadLimit. The wire read was already bounded by the action limit
+// while the decode used the 64 MiB process cap, so an action declaring
+// maxBodyBytes 1024 still let a client expand a body far past it while holding
+// one of the two body slots. The response path keeps the global cap on purpose.
+func TestRequestBodyDecodeIsBoundedByTheActionLimit(t *testing.T) {
+	t.Parallel()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(bytes.Repeat([]byte("a"), 64<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	const actionLimit = int64(1024)
+	if int64(compressed.Len()) >= actionLimit {
+		t.Fatalf("fixture must stay under the wire limit to exercise the decode bound, got %d bytes", compressed.Len())
+	}
+	incoming := httptest.NewRequest(http.MethodPost, "https://api.example.com/v1", bytes.NewReader(compressed.Bytes()))
+	incoming.Header.Set("Content-Encoding", "gzip")
+	if _, err := readDecodedModuleRequestBody(httptest.NewRecorder(), incoming, actionLimit); err == nil {
+		t.Fatal("a decoded request body far past the action limit was accepted")
+	}
+}
+
 func TestStreamingBodylessResponseRejectsTrailers(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {

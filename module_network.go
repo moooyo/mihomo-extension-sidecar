@@ -311,11 +311,14 @@ func (r *moduleNetworkRequester) performRequest(options map[string]any, waitForS
 	if err != nil {
 		return moduleNetworkResponse{}, err
 	}
-	responseHeaders, err := exportedHeaders(response.Header)
-	if err != nil {
-		return moduleNetworkResponse{}, fmt.Errorf("network response headers: %w", err)
-	}
-	responseTrailers, err := exportedTrailers(response.Trailer)
+	// wireHeaders, not exportedHeaders: this block came off the wire from the
+	// origin the script named, so net/http already parsed and bounded it, and the
+	// script budget exportedHeaders enforces is calibrated for what a script
+	// invents. Running it here failed the script's own request whenever an origin
+	// answered with more fields than that budget allows -- the same conflation
+	// wireHeaders was written to end on the proxy path.
+	responseHeaders := wireHeaders(response.Header)
+	responseTrailers, err := wireTrailers(response.Trailer)
 	if err != nil {
 		return moduleNetworkResponse{}, fmt.Errorf("network response trailers: %w", err)
 	}
