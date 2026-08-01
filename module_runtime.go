@@ -23,7 +23,6 @@ import (
 
 	"github.com/dlclark/regexp2/v2"
 	"github.com/dop251/goja"
-	"github.com/itchyny/gojq"
 )
 
 func init() {
@@ -38,8 +37,6 @@ type scriptRuntime struct {
 	statePath         string
 	networkSlots      chan struct{}
 	logs              engineLogPublisher
-	jqMu              sync.Mutex
-	jqPrograms        map[scriptProgramKey]*gojq.Code
 }
 
 // persistentSnapshot and every map reachable from it are immutable after
@@ -1151,6 +1148,18 @@ func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*
 				}
 			}
 			rule.program = program
+			// The jq artifact belongs to this generation for the same reason the
+			// goja one does. Compiling here rather than threading a second map
+			// out of validate is deliberate: the whole shipped corpus is under
+			// 1.5 ms of jq compilation, and a generation is only built when the
+			// document digest actually changed.
+			if rule.JQProgram != "" {
+				code, jqErr := compileJQProgram(rule.JQProgram)
+				if jqErr != nil {
+					return nil, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, jqErr)
+				}
+				rule.jq = code
+			}
 			rule.settings = settings
 			entry.rules = append(entry.rules, compiledScriptRule{
 				rule:  rule,

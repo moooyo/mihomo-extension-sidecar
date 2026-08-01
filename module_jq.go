@@ -46,6 +46,18 @@ func compileJQProgram(program string) (*gojq.Code, error) {
 	return code, nil
 }
 
+// jqProgram returns the action's compiled expression, mirroring scriptProgram.
+//
+// The snapshot carries it in production. The on-demand compile is for a rule
+// assembled directly in a test, which never goes through compileScriptConfig --
+// the same reason scriptProgram keeps its fallback.
+func jqProgram(rule ScriptRule) (*gojq.Code, error) {
+	if rule.jq != nil {
+		return rule.jq, nil
+	}
+	return compileJQProgram(rule.JQProgram)
+}
+
 // errJQBodyNotJSON reports a body a JSON filter has nothing to say about.
 //
 // This used to be an ordinary failure, on the reasoning that the action matched
@@ -187,7 +199,7 @@ func (r *scriptRuntime) executeJQ(
 	request scriptMessage,
 	response *scriptMessage,
 ) (scriptResult, error) {
-	code, err := r.jqCode(module, rule)
+	code, err := jqProgram(rule)
 	if err != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}

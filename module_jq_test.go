@@ -250,6 +250,85 @@ func TestJQNumericOperationsSurviveWidening(t *testing.T) {
 	}
 }
 
+// A bundle that changes a jq expression must take effect without a restart.
+//
+// The compiled program used to live in a process-lifetime map on scriptRuntime,
+// keyed by {moduleID, actionID, ScriptDigest} -- and a jq action's ScriptDigest
+// is always empty, because validate's jq branch returns before the digest check
+// and a jq action carries no script body. So the key was the same for every
+// generation of the same action, and the first expression the process ever
+// compiled kept running. The control API exists to make a commit take effect;
+// for jq actions it silently did not.
+func TestJQExpressionChangeTakesEffectWithoutRestart(t *testing.T) {
+	t.Parallel()
+	runtime := newScriptRuntime()
+	module := Module{ID: "io.example.fixture", Enabled: true}
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+
+	serve := func(program string) string {
+		rule := ScriptRule{
+			ID: "clean", Phase: "response", BodyMode: "text",
+			JQProgram: program, TimeoutMS: 1000, MaxBodyBytes: 1 << 20,
+		}
+		response := scriptMessage{
+			URL: request.URL, StatusCode: 200, Headers: make(http.Header),
+			Body: []byte(`{"keep":1,"drop":2}`),
+		}
+		result, err := runtime.execute(
+			context.Background(), Config{}, nil, module, rule, request, &response)
+		if err != nil {
+			t.Fatalf("program %q: %v", program, err)
+		}
+		return string(result.Body)
+	}
+
+	if got := serve("del(.drop)"); got != `{"keep":1}` {
+		t.Fatalf("first generation = %s, want {\"keep\":1}", got)
+	}
+	if got := serve("del(.keep)"); got != `{"drop":2}` {
+		t.Fatalf("second generation = %s, want {\"drop\":2}; the first expression is still being served", got)
+	}
+}
+
+// The snapshot, not a global, owns the artifact: two decodes of the same
+// document must not hand back the same compiled program. A reintroduced
+// process-lifetime cache would.
+func TestJQProgramBelongsToTheConfigSnapshot(t *testing.T) {
+	t.Parallel()
+	document := jqSnapshotFixture(t, "del(.drop)")
+
+	first, err := decodeConfig(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := decodeConfig(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRule := first.runtime.modules[0].rules[0].rule
+	secondRule := second.runtime.modules[0].rules[0].rule
+	if firstRule.jq == nil {
+		t.Fatal("a compiled snapshot must carry the jq artifact")
+	}
+	if firstRule.jq == secondRule.jq {
+		t.Fatal("two decodes share one compiled program; the artifact escaped the snapshot")
+	}
+}
+
+// jqSnapshotFixture renders a valid document whose single action is a jq one.
+func jqSnapshotFixture(t *testing.T, program string) []byte {
+	t.Helper()
+	cfg := validNativeConfig()
+	rule := &cfg.Modules[0].Scripts[0]
+	rule.ScriptURL, rule.ScriptDigest, rule.ScriptBody = "", "", ""
+	rule.JQProgram = program
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
 func TestJQRejectsAnInvalidProgramAtCompileTime(t *testing.T) {
 	t.Parallel()
 	// A broken expression must fail when the config is validated, not on the
