@@ -41,11 +41,31 @@ func (b *requestTrailerBody) Read(buffer []byte) (int, error) {
 	return read, err
 }
 
+// preparedModuleRequest is what the request phase hands back.
+//
+// It replaced a four-value return whose middle two booleans read identically at
+// every call site. The fourth field is the reason it exists: the response-phase
+// candidate set is computed while the outbound headers are built, because that
+// is where the post-rewrite URL is known, and the response phase filters it by
+// status instead of walking every rule again.
+type preparedModuleRequest struct {
+	outbound *http.Request
+	// handled means the exchange was already answered from a synthetic result
+	// and the caller must not dial upstream.
+	handled bool
+	// bodyBufferRetained means the caller's pre-action body reservation has to
+	// stay held past preparation.
+	bodyBufferRetained bool
+	// responseCandidates is the response-phase match with the status filter not
+	// yet applied. Nil when the request was answered or refused.
+	responseCandidates []matchedScriptRule
+}
+
 func (p *interceptProxy) prepareModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg Config, host string) (*http.Request, bool, error) {
 	probe := moduleRequestProbe(incoming, host)
 	rules := matchingScriptRules(cfg, "request", probe)
-	outbound, handled, _, err := p.prepareModuleRequestWithRules(w, incoming, cfg, probe, rules)
-	return outbound, handled, err
+	prepared, err := p.prepareModuleRequestWithRules(w, incoming, cfg, probe, rules)
+	return prepared.outbound, prepared.handled, err
 }
 
 func moduleRequestProbe(incoming *http.Request, host string) scriptMessage {
@@ -71,17 +91,28 @@ func requestNeedsModuleBodyReservation(incoming *http.Request, rules []matchedSc
 	return !requestCanStreamWithoutModuleBuffer(incoming, rules)
 }
 
+// requestCanStreamWithoutModuleBuffer reports whether a request nothing will
+// read can be forwarded without being read into memory first.
+//
+// An undeclared length is not a reason to buffer. A chunked HTTP/1.1 upload and
+// an HTTP/2 one both arrive with ContentLength -1, and refusing to stream them
+// meant a request with zero matched rules -- one this sidecar forwards
+// byte-for-byte -- was fully resident and held one of the two body slots for as
+// long as the client took to send it.
+//
+// HTTP/3 is the exception and the guard must stay. roundTripHTTP3 replays the
+// request against QUIC version 2 after a version negotiation error, and the
+// replay needs GetBody, which only the buffered path supplies.
 func requestCanStreamWithoutModuleBuffer(incoming *http.Request, rules []matchedScriptRule) bool {
 	if len(rules) > 0 || !requestHasBodySection(incoming) {
 		return len(rules) == 0
 	}
-	return incoming.ProtoMajor != 3 && incoming.ContentLength >= 0 &&
-		incoming.ContentLength <= maxModuleHTTPBody && len(incoming.TransferEncoding) == 0
+	return incoming.ProtoMajor != 3 && incoming.ContentLength <= maxModuleHTTPBody
 }
 
 func requestCanConditionallyStreamWithModuleActions(incoming *http.Request, rules []matchedScriptRule) bool {
 	if len(rules) == 0 || !requestHasPayload(incoming) || incoming.ProtoMajor == 3 ||
-		incoming.ContentLength < 0 || incoming.ContentLength > maxModuleHTTPBody || len(incoming.TransferEncoding) > 0 {
+		incoming.ContentLength > maxModuleHTTPBody {
 		return false
 	}
 	encoding, err := normalizedContentEncoding(incoming.Header)
@@ -107,27 +138,23 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	cfg Config,
 	probe scriptMessage,
 	requestRules []matchedScriptRule,
-) (*http.Request, bool, bool, error) {
+) (preparedModuleRequest, error) {
 	if incoming.ContentLength > maxModuleHTTPBody {
-		return nil, false, false, fmt.Errorf("request exceeds %d bytes", maxModuleHTTPBody)
-	}
-	requestHeaders, err := exportedHeaders(incoming.Header)
-	if err != nil {
-		return nil, false, false, fmt.Errorf("request headers: %w", err)
+		return preparedModuleRequest{}, fmt.Errorf("request exceeds %d bytes", maxModuleHTTPBody)
 	}
 	message := probe
-	message.Headers = requestHeaders
+	message.Headers = wireHeaders(incoming.Header)
 	incomingHadBodySection := requestHasBodySection(incoming)
 	if requestCanStreamWithoutModuleBuffer(incoming, requestRules) {
-		outbound, streamErr := streamingModuleRequest(w, incoming, cfg, message)
-		return outbound, false, false, streamErr
+		outbound, responseCandidates, streamErr := streamingModuleRequest(w, incoming, cfg, message)
+		return preparedModuleRequest{outbound: outbound, responseCandidates: responseCandidates}, streamErr
 	}
 	conditionalStream := requestCanConditionallyStreamWithModuleActions(incoming, requestRules)
 	bodyBufferRetained := false
 	if !conditionalStream {
-		body, bodyErr := readDecodedModuleRequestBody(w, incoming)
+		body, bodyErr := readDecodedModuleRequestBody(w, incoming, moduleBodyReadLimit(requestRules))
 		if bodyErr != nil {
-			return nil, false, false, bodyErr
+			return preparedModuleRequest{}, bodyErr
 		}
 		message.Body = body
 		bodyBufferRetained = incomingHadBodySection || len(body) > 0 || len(incoming.Trailer) > 0
@@ -139,14 +166,14 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 
 	for _, matched := range requestRules {
 		if err := authorizeModuleRequestActionURL(cfg, matched.Module, message.URL); err != nil {
-			return nil, false, bodyBufferRetained, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
+			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
 		}
 		if matched.Rule.BodyMode != "none" && int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
-			return nil, false, bodyBufferRetained, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
+			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
 		}
 		result, err := p.scripts.execute(incoming.Context(), cfg, p.upstreamRoots, matched.Module, matched.Rule, message, nil)
 		if err != nil {
-			return nil, false, bodyBufferRetained, err
+			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
 		}
 		if result.Abort {
 			// The server owns an unread request body. Closing it here may
@@ -154,7 +181,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			panic(http.ErrAbortHandler)
 		}
 		if err := validateModuleResultBody(matched.Module, matched.Rule, "request", result); err != nil {
-			return nil, false, bodyBufferRetained, err
+			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
 		}
 		if result.Synthetic {
 			status := result.StatusCode
@@ -166,12 +193,12 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			}
 			// Returning lets net/http close the unread server body after the
 			// final response. Direct Close can synchronously drain an upload.
-			return nil, true, false, nil
+			return preparedModuleRequest{handled: true}, nil
 		}
 		if result.ChangedURL {
 			parsed, authorizeErr := authorizeModuleRequestURLRewriteConfig(cfg, matched.Module, message.URL, result.URL)
 			if authorizeErr != nil {
-				return nil, false, bodyBufferRetained, fmt.Errorf("extension %s request URL rewrite: %w", matched.Module.ID, authorizeErr)
+				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request URL rewrite: %w", matched.Module.ID, authorizeErr)
 			}
 			message.URL = parsed.String()
 			urlChanged = true
@@ -189,38 +216,41 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 		switch {
 		case bodyChanged:
 			if err := drainModuleRequestBody(w, incoming); err != nil {
-				return nil, false, bodyBufferRetained, err
+				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
 			}
 		case urlChanged:
-			body, bodyErr := readDecodedModuleRequestBody(w, incoming)
+			body, bodyErr := readDecodedModuleRequestBody(w, incoming, moduleBodyReadLimit(requestRules))
 			if bodyErr != nil {
-				return nil, false, false, bodyErr
+				return preparedModuleRequest{}, bodyErr
 			}
 			message.Body = body
 			bodyBufferRetained = true
 		default:
-			outbound, streamErr := streamingModuleRequest(w, incoming, cfg, message)
-			return outbound, false, false, streamErr
+			outbound, responseCandidates, streamErr := streamingModuleRequest(w, incoming, cfg, message)
+			return preparedModuleRequest{outbound: outbound, responseCandidates: responseCandidates}, streamErr
 		}
 	}
 
-	outbound, err := bufferedModuleRequest(incoming, cfg, message, incomingHadBodySection)
+	outbound, responseCandidates, err := bufferedModuleRequest(incoming, cfg, message, incomingHadBodySection)
 	if err != nil {
-		return nil, false, bodyBufferRetained, err
+		return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
 	}
-	return outbound, false, bodyBufferRetained, nil
+	return preparedModuleRequest{
+		outbound: outbound, bodyBufferRetained: bodyBufferRetained, responseCandidates: responseCandidates,
+	}, nil
 }
 
-func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg Config, message scriptMessage) (*http.Request, error) {
+func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg Config, message scriptMessage) (*http.Request, []matchedScriptRule, error) {
 	parsedURL, err := url.Parse(message.URL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
 	outbound := incoming.Clone(incoming.Context())
 	outbound.URL = parsedURL
 	outbound.Host = parsedURL.Host
 	outbound.RequestURI = ""
-	outbound.Header = forwardRequestHeaders(cfg, message)
+	outbound.Header = forwardRequestHeaders(message, responseCandidates)
 	if requestHasBodySection(incoming) {
 		outbound.Body = &requestTrailerBody{
 			ReadCloser:  http.MaxBytesReader(w, incoming.Body, maxModuleHTTPBody),
@@ -228,7 +258,7 @@ func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg C
 			destination: outbound.Trailer,
 		}
 	}
-	return outbound, nil
+	return outbound, responseCandidates, nil
 }
 
 // forwardRequestHeaders builds the headers for the upstream leg of message.
@@ -240,28 +270,53 @@ func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg C
 // untouched so the metered origin leg stays compressed — and so a client that
 // explicitly refused identity is not answered with it anyway.
 //
-// message already carries the post-rewrite URL and method the response phase
-// will match on, so this probe is a superset of the response-time match; the
-// status code is the only thing unknown here, which matchStatus=false covers.
-func forwardRequestHeaders(cfg Config, message scriptMessage) http.Header {
+// The caller supplies responseCandidates, the status-agnostic response-phase
+// match against this same post-rewrite message. It is a superset of the
+// response-time match -- the status code is the only thing unknown here -- so
+// the response phase filters it rather than walking every rule a second time.
+func forwardRequestHeaders(message scriptMessage, responseCandidates []matchedScriptRule) http.Header {
 	headers := cloneProxyHeaders(message.Headers)
 	sanitizeForwardRequestHeaders(headers)
-	if len(matchingScriptRulesWithStatus(cfg, "response", message, false)) > 0 {
+	if len(responseCandidates) > 0 {
 		headers.Set("Accept-Encoding", "identity")
 	}
 	return headers
 }
 
-func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMessage, incomingHadBodySection bool) (*http.Request, error) {
+// responseRulesForStatus applies the one predicate the request-time probe could
+// not evaluate. matchingScriptRulesWithStatus differs from its matchStatus=false
+// form by exactly this check, so filtering the probe here is identical to
+// walking every rule again -- and the walk it replaces also re-parsed the URL.
+func responseRulesForStatus(candidates []matchedScriptRule, status int) []matchedScriptRule {
+	var filtered []matchedScriptRule
+	for index, candidate := range candidates {
+		if len(candidate.Rule.Match.StatusCodes) > 0 && !containsInt(candidate.Rule.Match.StatusCodes, status) {
+			if filtered == nil {
+				filtered = append(make([]matchedScriptRule, 0, len(candidates)), candidates[:index]...)
+			}
+			continue
+		}
+		if filtered != nil {
+			filtered = append(filtered, candidate)
+		}
+	}
+	if filtered == nil {
+		return candidates
+	}
+	return filtered
+}
+
+func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMessage, incomingHadBodySection bool) (*http.Request, []matchedScriptRule, error) {
 	parsedURL, err := url.Parse(message.URL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
 	outbound := incoming.Clone(incoming.Context())
 	outbound.URL = parsedURL
 	outbound.Host = parsedURL.Host
 	outbound.RequestURI = ""
-	outbound.Header = forwardRequestHeaders(cfg, message)
+	outbound.Header = forwardRequestHeaders(message, responseCandidates)
 	outbound.Body = io.NopCloser(bytes.NewReader(message.Body))
 	outbound.ContentLength = int64(len(message.Body))
 	outbound.GetBody = func() (io.ReadCloser, error) {
@@ -272,10 +327,44 @@ func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMes
 		outbound.GetBody = nil
 		outbound.ContentLength = 0
 	}
-	return outbound, nil
+	return outbound, responseCandidates, nil
 }
 
-func readDecodedModuleRequestBody(w http.ResponseWriter, incoming *http.Request) ([]byte, error) {
+// moduleBodyReadLimit is the largest body any matched action could accept.
+//
+// An action whose BodyMode is "none" never reads the body, so it does not
+// constrain the read. That distinction is the whole design: reading with
+// MaxBodyBytes directly was tried and reverted, because it let such an action's
+// limit become a ceiling on the whole message and failed the read before the
+// per-rule loop could exempt it -- turning an upstream exchange that had already
+// succeeded into a 502. Taking the maximum over only the actions that do read a
+// body leaves those per-rule checks as the authority for which action refuses,
+// and merely stops the process holding bytes no matched action could ever accept.
+//
+// No interested action means nothing reads the body and the global cap stands:
+// the message still has to be forwarded.
+//
+// This bounds the wire read only. The decode limit deliberately stays at the
+// global cap, because transformModuleResponse treats any decode failure as
+// "cannot filter this, forward it untouched" -- so a tighter decode bound would
+// convert a fail-closed refusal into a silently unfiltered response.
+func moduleBodyReadLimit(rules []matchedScriptRule) int64 {
+	limit := int64(0)
+	for _, matched := range rules {
+		if matched.Rule.BodyMode == "none" {
+			continue
+		}
+		if matched.Rule.MaxBodyBytes > limit {
+			limit = matched.Rule.MaxBodyBytes
+		}
+	}
+	if limit <= 0 || limit > maxModuleHTTPBody {
+		return maxModuleHTTPBody
+	}
+	return limit
+}
+
+func readDecodedModuleRequestBody(w http.ResponseWriter, incoming *http.Request, readLimit int64) ([]byte, error) {
 	if incoming.Body == nil {
 		return nil, nil
 	}
@@ -285,7 +374,7 @@ func readDecodedModuleRequestBody(w http.ResponseWriter, incoming *http.Request)
 	}
 	incoming.Body = http.MaxBytesReader(w, incoming.Body, maxModuleHTTPBody)
 	defer incoming.Body.Close()
-	body, err := readBounded(incoming.Body, maxModuleHTTPBody)
+	body, err := readBounded(incoming.Body, readLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -344,17 +433,13 @@ func (p *interceptProxy) transformModuleResponse(
 	// check below could exempt a "none" mode action, and the upstream request had
 	// already succeeded, so the client got a 502. The request path already reads
 	// with the global cap and checks per rule afterwards.
-	responseHeaders, err := exportedHeaders(response.Header)
-	if err != nil {
-		return nil, fmt.Errorf("upstream response headers: %w", err)
-	}
-	responseMessage.Headers = responseHeaders
+	responseMessage.Headers = wireHeaders(response.Header)
 	encoding, err := normalizedContentEncoding(responseMessage.Headers)
 	if err != nil {
 		p.reportSkippedResponseActions(request, scripts, err)
 		return nil, nil
 	}
-	body, err := readBounded(response.Body, maxModuleHTTPBody)
+	body, err := readBounded(response.Body, moduleBodyReadLimit(scripts))
 	if err != nil {
 		return nil, err
 	}

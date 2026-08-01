@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -35,7 +36,25 @@ type interceptProxy struct {
 	transportMu sync.Mutex
 	upstream    *upstreamTransportGeneration
 	http3Slots  chan struct{}
+
+	// The client-facing TLS leg's shared session ticket keys. Every connection
+	// clones a config from these rather than building its own, which is what
+	// makes resumption possible at all; see mitmTLSConfig.
+	tlsMu      sync.Mutex
+	tlsKeys    [][32]byte
+	tlsKeysSet time.Time
+	tlsNow     func() time.Time
 }
+
+const (
+	// How long one client-facing session ticket key issues tickets for, and how
+	// many are kept so a ticket issued just before a rotation still resumes.
+	// This is what crypto/tls does for a server that manages its own keys; the
+	// keys are set explicitly here only because a per-connection clone cannot
+	// inherit ones the template never generated.
+	mitmTicketKeyLifetime = 24 * time.Hour
+	mitmTicketKeyHistory  = 2
+)
 
 const (
 	maxIdleUpstreamHTTPConnections        = 64
@@ -62,6 +81,10 @@ const (
 	// milliseconds; waiting longer would only pin this request's connection, and
 	// its upstream one, behind a shortage it cannot outlast.
 	moduleBodySlotWait = 250 * time.Millisecond
+
+	// Enough that a burst across a handful of origins keeps resuming, small
+	// enough that a retired generation's cache is trivial to drop.
+	upstreamSessionCacheEntries = 64
 
 	upstreamHTTP3RecycleTimeout          = 250 * time.Millisecond
 	interceptCertificateTrustLogInterval = time.Minute
@@ -259,6 +282,10 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 	if err != nil {
 		return err
 	}
+	tlsConfig, err := p.mitmTLSConfig(cfg.MITM.HTTP2)
+	if err != nil {
+		return err
+	}
 	listener := newSingleConnListener(conn)
 	server := &http.Server{
 		Handler:           p,
@@ -266,17 +293,75 @@ func (p *interceptProxy) serveTLSConnection(conn net.Conn, target string) error 
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          log.New(p.tlsErrors.writer(target), "", 0),
-		TLSConfig: &tls.Config{
-			MinVersion:     tls.VersionTLS12,
-			GetCertificate: p.certificates.GetCertificate,
-			NextProtos:     mitmTLSNextProtos(cfg.MITM.HTTP2),
-		},
+		TLSConfig:         tlsConfig,
 	}
 	err = server.ServeTLS(listener, "", "")
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 		return nil
 	}
 	return err
+}
+
+// mitmTLSConfig builds this connection's client-facing TLS config from keys the
+// whole process shares.
+//
+// Every connection used to construct its own tls.Config, and a server's session
+// ticket keys belong to its config: a ticket issued on one connection could
+// never be decrypted on the next, so the MITM leg never resumed and every
+// connection paid a full handshake and a signature. Measured against this
+// certificate: a fresh config per connection resumes on no connection, a clone
+// of a template whose keys were never set resumes on none either, and a clone of
+// one carrying explicit keys resumes from the second connection on, under both
+// TLS 1.2 and TLS 1.3.
+//
+// The clone is not incidental. http.Server.ServeTLS hands its TLSConfig to
+// http2ConfigureServer, which writes to it, and this proxy builds one
+// http.Server per connection -- so a config shared by pointer would be written
+// by every connection at once. Each connection gets its own object and only the
+// keys are shared.
+//
+// NextProtos comes from the caller's snapshot rather than the template because
+// MITM.HTTP2 can change under a running process.
+func (p *interceptProxy) mitmTLSConfig(http2 bool) (*tls.Config, error) {
+	keys, err := p.sessionTicketKeys()
+	if err != nil {
+		return nil, err
+	}
+	config := &tls.Config{
+		MinVersion:     tls.VersionTLS12,
+		GetCertificate: p.certificates.GetCertificate,
+		NextProtos:     mitmTLSNextProtos(http2),
+	}
+	config.SetSessionTicketKeys(keys)
+	return config, nil
+}
+
+// sessionTicketKeys returns the keys to issue and accept tickets under, newest
+// first, rotating them on the same daily schedule crypto/tls uses for a server
+// that manages its own. The previous key is kept so a ticket issued just before
+// a rotation still resumes rather than silently falling back to a full
+// handshake.
+func (p *interceptProxy) sessionTicketKeys() ([][32]byte, error) {
+	now := time.Now
+	if p.tlsNow != nil {
+		now = p.tlsNow
+	}
+	p.tlsMu.Lock()
+	defer p.tlsMu.Unlock()
+	if len(p.tlsKeys) > 0 && now().Sub(p.tlsKeysSet) < mitmTicketKeyLifetime {
+		return append([][32]byte(nil), p.tlsKeys...), nil
+	}
+	var fresh [32]byte
+	if _, err := rand.Read(fresh[:]); err != nil {
+		return nil, fmt.Errorf("session ticket key: %w", err)
+	}
+	rotated := append([][32]byte{fresh}, p.tlsKeys...)
+	if len(rotated) > mitmTicketKeyHistory {
+		rotated = rotated[:mitmTicketKeyHistory]
+	}
+	p.tlsKeys = rotated
+	p.tlsKeysSet = now()
+	return append([][32]byte(nil), rotated...), nil
 }
 
 func mitmTLSNextProtos(http2 bool) []string {
@@ -329,10 +414,15 @@ func (p *interceptProxy) serveUDPAssociation(ctx context.Context, control net.Co
 			GetCertificate: p.certificates.GetCertificate,
 		},
 		QUICConfig: &quic.Config{
-			Versions:        []quic.Version{quic.Version1, quic.Version2},
-			MaxIdleTimeout:  90 * time.Second,
-			KeepAlivePeriod: 20 * time.Second,
-			Allow0RTT:       false,
+			Versions: []quic.Version{quic.Version1, quic.Version2},
+			// Same reason as the upstream transport: a 20s keepalive alongside a
+			// 90s idle timeout means the connection never idles out, so an idle
+			// client kept its association, its UDP socket and this server alive
+			// until the SOCKS control connection went away. Here the association
+			// bounds the leak, so this is consistency rather than a slot bug --
+			// but IdleTimeout above says 90 seconds and should mean it.
+			MaxIdleTimeout: 90 * time.Second,
+			Allow0RTT:      false,
 		},
 	}
 	defer server.Close()
@@ -425,12 +515,12 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.releaseBodySlot()
 		}
 	}()
-	outbound, handled, requestBodyBufferRetained, prepareErr := p.prepareModuleRequestWithRules(w, r, cfg, requestProbe, requestRules)
-	if bodySlotHeld && !requestBodyBufferRetained {
+	prepared, prepareErr := p.prepareModuleRequestWithRules(w, r, cfg, requestProbe, requestRules)
+	if bodySlotHeld && !prepared.bodyBufferRetained {
 		p.releaseBodySlot()
 		bodySlotHeld = false
 	}
-	if handled {
+	if prepared.handled {
 		return
 	}
 	if prepareErr != nil {
@@ -440,6 +530,7 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	outbound := prepared.outbound
 	response, cleanup, err := p.roundTrip(outbound, cfg)
 	if cleanup != nil {
 		defer cleanup()
@@ -453,7 +544,10 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	responseProbe := scriptMessage{
 		URL: outbound.URL.String(), Method: outbound.Method, StatusCode: response.StatusCode,
 	}
-	responseRules := matchingScriptRules(cfg, "response", responseProbe)
+	// Filtered from the probe taken while the outbound headers were built, which
+	// is a superset of this match: the status code was the only thing it could
+	// not evaluate. Walking every rule again would also re-parse the URL.
+	responseRules := responseRulesForStatus(prepared.responseCandidates, response.StatusCode)
 	if !bodySlotHeld && len(responseRules) > 0 {
 		// The upstream leg has already run, so a capacity rejection here cannot be
 		// an "unavailable, try again": the request was made. This is the same
@@ -643,6 +737,16 @@ func (p *interceptProxy) acquireUpstreamTransportGeneration(cfg Config) (*upstre
 		generation = newUpstreamTransportGeneration(cfg)
 		generation.retired = true
 	case generation == nil || cfg.generation > generation.generation:
+		// A newer document is not by itself a reason to drop warm connections.
+		// The generation number advances on any content change, and almost none
+		// of them reach the upstream leg -- a setting, an enable toggle, a
+		// script body, a match pattern all leave the proxy, the protocol and the
+		// target authorization untouched. Only when the fingerprint moves has
+		// this pool stopped being authorized for what it holds.
+		if generation != nil && newUpstreamTransportProjection(cfg).fingerprint == generation.projection.fingerprint {
+			generation.generation = cfg.generation
+			break
+		}
 		previous := generation
 		generation = newUpstreamTransportGeneration(cfg)
 		p.upstream = generation
@@ -857,6 +961,11 @@ func (p *interceptProxy) newHTTPTransportForProjection(projection upstreamTransp
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    p.upstreamRoots,
+			// Without a cache every re-dial to an origin is a full handshake
+			// through the mihomo leg. The cache belongs to the transport, so it
+			// dies with the generation that owns it and never outlives the
+			// allowlist that authorized those origins.
+			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
 		},
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 			host, portText, err := net.SplitHostPort(address)
@@ -881,13 +990,25 @@ func (p *interceptProxy) newHTTP3Transport(generation *upstreamTransportGenerati
 	return &http3.Transport{
 		MaxResponseHeaderBytes: int(maxModuleNetworkHeaderBytes),
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS13,
-			RootCAs:    p.upstreamRoots,
+			MinVersion:         tls.VersionTLS13,
+			RootCAs:            p.upstreamRoots,
+			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
 		},
 		QUICConfig: &quic.Config{
-			Versions:        []quic.Version{version},
-			MaxIdleTimeout:  upstreamHTTPIdleTimeout,
-			KeepAlivePeriod: 20 * time.Second,
+			Versions: []quic.Version{version},
+			// No KeepAlivePeriod. A keepalive shorter than MaxIdleTimeout makes
+			// the idle timeout dead code -- the connection is never idle, so it
+			// never closes, so the slot acquireHTTP3ConnectionSlot took is never
+			// released and the 64-connection budget only ever shrinks. The two
+			// settings arrived together in the initial HTTP/3 commit and cancel
+			// each other out.
+			//
+			// Letting the idle timeout govern makes HTTP/3 behave like the
+			// HTTP/1 and HTTP/2 pool, which reclaims on the same 90 seconds
+			// through IdleConnTimeout. The cost is a fresh handshake for an
+			// origin untouched for 90 seconds, which is what the other two
+			// protocols already pay.
+			MaxIdleTimeout: upstreamHTTPIdleTimeout,
 		},
 		Dial: func(ctx context.Context, address string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
 			host, portText, err := net.SplitHostPort(address)
@@ -1221,10 +1342,7 @@ var streamingResponseBuffers = sync.Pool{
 
 func writeStreamingProxyResponse(w http.ResponseWriter, downstreamProtoMajor int, method string, response *http.Response) error {
 	controller := http.NewResponseController(w)
-	responseHeaders, err := exportedHeaders(response.Header)
-	if err != nil {
-		return fmt.Errorf("upstream response headers: %w", err)
-	}
+	responseHeaders := wireHeaders(response.Header)
 	announcedTrailers, err := exportedTrailers(response.Trailer)
 	if err != nil {
 		return fmt.Errorf("upstream response trailers: %w", err)

@@ -358,6 +358,9 @@ func (r *moduleNetworkRequester) transport(origin string, target socksTarget) (*
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    r.roots,
+			// Per-origin transport, so the cache is per origin too. A script that
+			// makes several calls to the same host pays one handshake.
+			ClientSessionCache: tls.NewLRUClientSessionCache(upstreamSessionCacheEntries),
 		},
 		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
 			host, port, splitErr := net.SplitHostPort(address)

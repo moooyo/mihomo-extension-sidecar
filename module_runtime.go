@@ -23,7 +23,6 @@ import (
 
 	"github.com/dlclark/regexp2/v2"
 	"github.com/dop251/goja"
-	"github.com/itchyny/gojq"
 )
 
 func init() {
@@ -38,8 +37,6 @@ type scriptRuntime struct {
 	statePath         string
 	networkSlots      chan struct{}
 	logs              engineLogPublisher
-	jqMu              sync.Mutex
-	jqPrograms        map[scriptProgramKey]*gojq.Code
 }
 
 // persistentSnapshot and every map reachable from it are immutable after
@@ -780,6 +777,38 @@ func stringAnyMap(value any) (map[string]any, bool) {
 	return typed, ok
 }
 
+// maxWireHeaderBytes bounds headers that arrived over the wire.
+//
+// This file does not enforce it: net/http already did, before the headers ever
+// reached a script message. Both inbound servers set MaxHeaderBytes to it, and
+// both upstream transports set MaxResponseHeaderBytes to it. Naming it makes
+// the inbound bound explicit rather than an accident of whichever validator
+// happened to run on the way past.
+const maxWireHeaderBytes = maxModuleNetworkHeaderBytes
+
+// wireHeaders projects headers that arrived over the wire into a script message.
+//
+// It deliberately does not run exportedHeaders. That function is the validator
+// for what a *script* produces, and running it over inbound traffic conflated
+// two jobs: net/http has already parsed these, so the names are valid tokens,
+// the values carry no control characters, case-folded duplicates are merged
+// under one canonical key, and the whole block is inside maxWireHeaderBytes.
+//
+// The conflation was not only wasted work on every intercepted exchange -- a
+// sort, a case-fold map and a full rebuild -- it rejected legitimate traffic.
+// exportedHeaders bounds field and value *counts* as well as bytes, and those
+// counts are calibrated for what a script may invent, not for what an origin
+// may send: a response with more than maxScriptHeaderFields fields was refused,
+// and on the response path that refusal is a 502 for an exchange the origin
+// answered perfectly well.
+//
+// The script budget still governs script output, which is where it belongs. A
+// script that echoes a header block larger than that budget is refused there --
+// by the limit written for it, rather than by an inbound check standing in.
+func wireHeaders(source http.Header) http.Header {
+	return cloneProxyHeaders(source)
+}
+
 func exportedHeaders(value any) (http.Header, error) {
 	if typed, ok := value.(http.Header); ok {
 		return exportedStringSliceHeaders(map[string][]string(typed))
@@ -1151,6 +1180,18 @@ func compileScriptConfigWithPrograms(cfg Config, programs map[scriptProgramKey]*
 				}
 			}
 			rule.program = program
+			// The jq artifact belongs to this generation for the same reason the
+			// goja one does. Compiling here rather than threading a second map
+			// out of validate is deliberate: the whole shipped corpus is under
+			// 1.5 ms of jq compilation, and a generation is only built when the
+			// document digest actually changed.
+			if rule.JQProgram != "" {
+				code, jqErr := compileJQProgram(rule.JQProgram)
+				if jqErr != nil {
+					return nil, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, jqErr)
+				}
+				rule.jq = code
+			}
 			rule.settings = settings
 			entry.rules = append(entry.rules, compiledScriptRule{
 				rule:  rule,

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"hash"
 	"net/netip"
 	"strconv"
 )
@@ -13,6 +16,18 @@ type upstreamTransportProjection struct {
 	proxy      ProxyConfig
 	http2      bool
 	targets    upstreamTargetProjection
+	// fingerprint identifies everything a pooled transport depends on, and
+	// deliberately excludes generation.
+	//
+	// A generation number advances whenever the validated document changes at
+	// all, but almost nothing a commit changes reaches the upstream leg: a
+	// setting, an enable toggle, a script body, a match pattern all leave the
+	// proxy credentials, the protocol choice and the target authorization
+	// exactly as they were. Retiring the pool on the number meant every commit
+	// dropped every warm connection and every TLS session with it. Comparing
+	// this instead keeps connections that are still authorized for exactly the
+	// targets they were opened for.
+	fingerprint [sha256.Size]byte
 }
 
 type upstreamTargetProjection struct {
@@ -43,6 +58,15 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 		activeHosts:  projectedActiveHostMatcher(cfg),
 		networkGrant: false,
 	}
+	// Written in the same walk that builds the projection, over the same source
+	// fields, so a field cannot be added to one and forgotten in the other
+	// without the two going obviously out of step.
+	digest := sha256.New()
+	writeFingerprintField(digest, cfg.UpstreamProxy.Address)
+	writeFingerprintField(digest, cfg.UpstreamProxy.Username)
+	writeFingerprintField(digest, cfg.UpstreamProxy.Password)
+	writeFingerprintBool(digest, cfg.MITM.HTTP2)
+	writeFingerprintBool(digest, cfg.MITM.Enabled)
 	for _, module := range cfg.Modules {
 		if !module.Enabled {
 			continue
@@ -51,23 +75,53 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 			hosts:    projectedModuleHostMatcher(cfg, module),
 			mappings: make([]HostMapping, 0, len(module.HostMappings)),
 		}
+		// The module boundary is in the digest so that moving a host from one
+		// module to another cannot collide with leaving it where it was.
+		writeFingerprintField(digest, module.ID)
+		for _, host := range module.CaptureHosts {
+			writeFingerprintField(digest, host)
+		}
 		for _, mapping := range module.HostMappings {
 			projectedModule.mappings = append(projectedModule.mappings, HostMapping{
 				Pattern: mapping.Pattern,
 				Target:  mapping.Target,
 			})
+			writeFingerprintField(digest, mapping.Pattern)
+			writeFingerprintField(digest, mapping.Target)
 		}
 		targets.modules = append(targets.modules, projectedModule)
 		if module.Network {
 			targets.networkGrant = true
 		}
+		writeFingerprintBool(digest, module.Network)
 	}
-	return upstreamTransportProjection{
+	writeFingerprintBool(digest, targets.networkGrant)
+
+	projection := upstreamTransportProjection{
 		generation: cfg.generation,
 		proxy:      cfg.UpstreamProxy,
 		http2:      cfg.MITM.HTTP2,
 		targets:    targets,
 	}
+	digest.Sum(projection.fingerprint[:0])
+	return projection
+}
+
+// writeFingerprintField writes a length-prefixed value, so that two different
+// field splits cannot produce the same byte stream.
+func writeFingerprintField(digest hash.Hash, value string) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = digest.Write(length[:])
+	_, _ = digest.Write([]byte(value))
+}
+
+func writeFingerprintBool(digest hash.Hash, value bool) {
+	if value {
+		_, _ = digest.Write([]byte{1})
+		return
+	}
+	_, _ = digest.Write([]byte{0})
 }
 
 func newInboundUDPAuthorization(cfg Config) inboundUDPAuthorization {

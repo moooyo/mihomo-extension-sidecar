@@ -361,7 +361,7 @@ func TestPrepareModuleRequestKeepsEmptyHTTP3BodyForTrailerReplay(t *testing.T) {
 		t.Fatal("HTTP/3 trailer-only request did not reserve body capacity")
 	}
 
-	outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+	outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 		httptest.NewRecorder(), incoming, Config{}, probe, nil,
 	)
 	if err != nil || handled || !retained || body.reads == 0 || body.closes == 0 || outbound.Body == nil || outbound.GetBody == nil {
@@ -392,7 +392,7 @@ func TestPrepareModuleRequestAllowsFirstBodylessHTTP3VersionReplay(t *testing.T)
 		t.Fatal("bodyless HTTP/3 request unexpectedly reserved body capacity")
 	}
 
-	outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+	outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 		httptest.NewRecorder(), incoming, Config{}, probe, nil,
 	)
 	if err != nil || handled || retained {
@@ -406,23 +406,64 @@ func TestPrepareModuleRequestAllowsFirstBodylessHTTP3VersionReplay(t *testing.T)
 	}
 }
 
-func TestPrepareModuleRequestBuffersUnknownLengthUnmatchedBody(t *testing.T) {
+// A request with zero matched rules is forwarded byte-for-byte, so an
+// undeclared length is no reason to hold it in memory. Both shapes that carry
+// one -- chunked HTTP/1.1 and HTTP/2 -- used to be fully read and to hold one of
+// the two process-wide body slots for as long as the client took to send.
+func TestPrepareModuleRequestStreamsUnknownLengthUnmatchedBody(t *testing.T) {
+	cases := []struct {
+		name             string
+		protoMajor       int
+		transferEncoding []string
+	}{
+		{name: "chunked HTTP/1.1", protoMajor: 1, transferEncoding: []string{"chunked"}},
+		{name: "HTTP/2 without a declared length", protoMajor: 2},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := &trackingReadCloser{reader: bytes.NewReader([]byte("payload"))}
+			incoming := httptest.NewRequest(http.MethodPost, "http://api.example.com/upload", nil)
+			incoming.Body = body
+			incoming.ContentLength = -1
+			incoming.ProtoMajor = testCase.protoMajor
+			incoming.TransferEncoding = testCase.transferEncoding
+
+			proxy := &interceptProxy{scripts: newScriptRuntime()}
+			_, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), incoming, Config{}, "api.example.com")
+			if err != nil || handled {
+				t.Fatalf("handled=%v err=%v", handled, err)
+			}
+			if body.reads != 0 {
+				t.Fatalf("the body was read into memory: reads=%d", body.reads)
+			}
+			if requestNeedsModuleBodyReservation(incoming, nil) {
+				t.Fatal("a streamed body still reserved a body slot")
+			}
+		})
+	}
+}
+
+// HTTP/3 keeps buffering, and the guard that keeps it buffering must stay.
+// roundTripHTTP3 replays the request against QUIC version 2 after a version
+// negotiation error, and resetHTTP3RequestBodyForReplay hard-errors without
+// GetBody -- which only the buffered path supplies.
+func TestPrepareModuleRequestBuffersUnknownLengthHTTP3Body(t *testing.T) {
 	body := &trackingReadCloser{reader: bytes.NewReader([]byte("payload"))}
 	incoming := httptest.NewRequest(http.MethodPost, "http://api.example.com/upload", nil)
 	incoming.Body = body
 	incoming.ContentLength = -1
-	incoming.TransferEncoding = []string{"chunked"}
+	incoming.ProtoMajor = 3
 
 	proxy := &interceptProxy{scripts: newScriptRuntime()}
 	outbound, handled, err := proxy.prepareModuleRequest(httptest.NewRecorder(), incoming, Config{}, "api.example.com")
 	if err != nil || handled {
 		t.Fatalf("handled=%v err=%v", handled, err)
 	}
-	if body.reads == 0 || outbound.Body == body || outbound.GetBody == nil {
-		t.Fatalf("unknown body bypassed buffering: reads=%d body=%T getBody=%v", body.reads, outbound.Body, outbound.GetBody != nil)
+	if body.reads == 0 || outbound.GetBody == nil {
+		t.Fatalf("an HTTP/3 body must stay replayable: reads=%d getBody=%v", body.reads, outbound.GetBody != nil)
 	}
 	if !requestNeedsModuleBodyReservation(incoming, nil) {
-		t.Fatal("unknown-length body did not reserve a body slot")
+		t.Fatal("a buffered HTTP/3 body did not reserve a body slot")
 	}
 }
 
@@ -519,7 +560,7 @@ func TestPrepareModuleRequestStreamsAllNoneIdentityBody(t *testing.T) {
 		t.Fatal("conditional stream did not reserve a body slot before action execution")
 	}
 
-	outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+	outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 		httptest.NewRecorder(), incoming, cfg, probe, rules,
 	)
 	if err != nil || handled || retained {
@@ -563,7 +604,7 @@ func TestBodylessRequestActionReservesSlotUntilItsResultIsKnown(t *testing.T) {
 				t.Fatal("bodyless action did not reserve a slot before execution")
 			}
 
-			outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+			outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 				httptest.NewRecorder(), incoming, cfg, probe, rules,
 			)
 			if err != nil || handled || retained != test.wantRetained {
@@ -639,7 +680,7 @@ func TestPrepareModuleRequestAllNoneEncodedAndHTTP3BodiesRemainBuffered(t *testi
 		probe := moduleRequestProbe(incoming, "api.example.com")
 		rules := matchingScriptRules(cfg, "request", probe)
 
-		outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+		outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 			httptest.NewRecorder(), incoming, cfg, probe, rules,
 		)
 		if err != nil || handled || !retained {
@@ -662,7 +703,7 @@ func TestPrepareModuleRequestAllNoneEncodedAndHTTP3BodiesRemainBuffered(t *testi
 		probe := moduleRequestProbe(incoming, "api.example.com")
 		rules := matchingScriptRules(cfg, "request", probe)
 
-		outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+		outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 			httptest.NewRecorder(), incoming, cfg, probe, rules,
 		)
 		if err != nil || handled || !retained || body.reads == 0 || outbound.GetBody == nil {
@@ -679,7 +720,7 @@ func TestPrepareModuleRequestAllNoneEncodedAndHTTP3BodiesRemainBuffered(t *testi
 		probe := moduleRequestProbe(incoming, "api.example.com")
 		rules := matchingScriptRules(cfg, "request", probe)
 
-		_, _, _, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+		_, _, _, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 			httptest.NewRecorder(), incoming, cfg, probe, rules,
 		)
 		if err == nil || !strings.Contains(err.Error(), "exactly one value") || body.reads != 0 {
@@ -755,7 +796,7 @@ func TestPrepareModuleRequestPreservesMixedActionOrderAndBodyVisibility(t *testi
 			probe := moduleRequestProbe(incoming, "api.example.com")
 			rules := matchingScriptRules(cfg, "request", probe)
 
-			outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+			outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 				httptest.NewRecorder(), incoming, cfg, probe, rules,
 			)
 			if err != nil || handled || !retained || body.reads == 0 {
@@ -805,7 +846,7 @@ func TestPrepareModuleRequestAllNoneRewriteStillBuffersCompleteDecodedBody(t *te
 			probe := moduleRequestProbe(incoming, "api.example.com")
 			rules := matchingScriptRules(cfg, "request", probe)
 
-			outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+			outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 				httptest.NewRecorder(), incoming, cfg, probe, rules,
 			)
 			if err != nil || handled || !retained || body.reads == 0 || outbound.URL.String() != test.target || outbound.GetBody == nil {
@@ -837,7 +878,7 @@ func TestPrepareModuleRequestAllNoneReplacementDrainsForLateTrailers(t *testing.
 	probe := moduleRequestProbe(incoming, "api.example.com")
 	rules := matchingScriptRules(cfg, "request", probe)
 
-	outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+	outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 		httptest.NewRecorder(), incoming, cfg, probe, rules,
 	)
 	if err != nil || handled || !retained || body.reads == 0 || body.closes == 0 || outbound.GetBody == nil {
@@ -863,7 +904,7 @@ func TestPrepareModuleRequestAllNoneSyntheticAndAbortSkipBody(t *testing.T) {
 		rules := matchingScriptRules(cfg, "request", probe)
 		recorder := httptest.NewRecorder()
 
-		outbound, handled, retained, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+		outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 			recorder, incoming, cfg, probe, rules,
 		)
 		if err != nil || !handled || retained || outbound != nil || body.reads != 0 || body.closes != 0 {
@@ -893,7 +934,7 @@ func TestPrepareModuleRequestAllNoneSyntheticAndAbortSkipBody(t *testing.T) {
 			defer func() {
 				panicked = recover() == http.ErrAbortHandler
 			}()
-			_, _, _, _ = (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequestWithRules(
+			_, _, _, _ = prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 				httptest.NewRecorder(), incoming, cfg, probe, rules,
 			)
 		}()
@@ -1617,6 +1658,156 @@ func (w *controlledResponseWriter) FlushError() error {
 	return w.flushErr
 }
 
+// The read bound is the largest limit among the actions that actually read a
+// body. An action in "none" mode reads none, so it must not contribute a
+// ceiling -- that is the mistake TestResponseActionLimitDoesNotBoundTheUpstreamBody
+// exists to catch, expressed here at the level of the choice itself.
+// An origin is not bound by the budget written for what a script may invent.
+//
+// exportedHeaders limits field and value counts as well as bytes, and those
+// counts are calibrated for a script. Running it over inbound traffic meant a
+// response carrying more than maxScriptHeaderFields fields was refused -- and on
+// the response path the upstream exchange has already succeeded, so that refusal
+// reaches the client as a 502 for a response the origin answered perfectly well.
+// The wire bound is maxWireHeaderBytes, which net/http enforced before any of
+// this ran.
+func TestAWideOriginHeaderBlockIsNotJudgedByTheScriptBudget(t *testing.T) {
+	t.Parallel()
+	// Changes the status rather than the headers: a script that returns headers
+	// replaces the whole set, which would hide whether the projection carried the
+	// origin's own fields through.
+	source := `function transform() { return {response: {status: 201}} }`
+	module := nativeRuntimeModule()
+	module.Enabled = true
+	rule := nativeRuntimeRule(source, "response", "none")
+	module.Scripts = []ScriptRule{rule}
+	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+	scripts := []matchedScriptRule{{Module: module, Rule: rule}}
+
+	// Well past the script field budget, and still a small block on the wire --
+	// comfortably inside what net/http already accepted.
+	wide := make(http.Header, maxScriptHeaderFields+64)
+	for index := 0; index < maxScriptHeaderFields+64; index++ {
+		wide[fmt.Sprintf("X-Origin-%04d", index)] = []string{"1"}
+	}
+	if len(wide) <= maxScriptHeaderFields {
+		t.Fatalf("fixture built %d fields, want more than the %d field script budget", len(wide), maxScriptHeaderFields)
+	}
+	// The split itself: the same block that the script-output validator refuses
+	// is carried by the wire projection. Before they were one function, this
+	// rejection was what an origin got.
+	if _, err := exportedHeaders(wide); err == nil {
+		t.Fatal("the script header validator accepted a block wider than its own field budget")
+	}
+	if len(wireHeaders(wide)) != len(wide) {
+		t.Fatal("the wire projection dropped fields")
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
+	response := &http.Response{
+		StatusCode: http.StatusOK, Header: wide, Body: io.NopCloser(strings.NewReader("body")),
+	}
+	transformed, err := (&interceptProxy{scripts: newScriptRuntime()}).transformModuleResponse(request, response, cfg, scripts)
+	if err != nil {
+		t.Fatalf("a wide origin header block was refused: %v", err)
+	}
+	if transformed == nil || transformed.StatusCode != 201 {
+		t.Fatalf("the action did not run over a wide header block: %+v", transformed)
+	}
+	if got := transformed.Header.Get("X-Origin-0100"); got != "1" {
+		t.Fatalf("an origin header was dropped in projection: X-Origin-0100=%q", got)
+	}
+}
+
+// The request path takes the same projection, so a client sending a wide header
+// block must reach the upstream leg rather than a 502 built from a script limit.
+func TestAWideClientHeaderBlockReachesUpstream(t *testing.T) {
+	t.Parallel()
+	incoming := httptest.NewRequest(http.MethodGet, "http://api.example.com/v1", nil)
+	for index := 0; index < maxScriptHeaderFields+64; index++ {
+		incoming.Header.Set(fmt.Sprintf("X-Client-%04d", index), "1")
+	}
+
+	outbound, handled, err := (&interceptProxy{scripts: newScriptRuntime()}).prepareModuleRequest(
+		httptest.NewRecorder(), incoming, Config{}, "api.example.com")
+	if err != nil || handled {
+		t.Fatalf("a wide client header block was refused: handled=%v err=%v", handled, err)
+	}
+	if got := outbound.Header.Get("X-Client-0100"); got != "1" {
+		t.Fatalf("a client header was dropped in projection: X-Client-0100=%q", got)
+	}
+}
+
+// prepareForTest keeps the four-value shape these tests were written against
+// now that preparation returns a named result.
+func prepareForTest(
+	p *interceptProxy,
+	w http.ResponseWriter,
+	incoming *http.Request,
+	cfg Config,
+	probe scriptMessage,
+	rules []matchedScriptRule,
+) (*http.Request, bool, bool, error) {
+	prepared, err := p.prepareModuleRequestWithRules(w, incoming, cfg, probe, rules)
+	return prepared.outbound, prepared.handled, prepared.bodyBufferRetained, err
+}
+
+// forwardRequestHeadersForTest computes the candidate set the production caller
+// computes while building the outbound request.
+func forwardRequestHeadersForTest(cfg Config, message scriptMessage) http.Header {
+	return forwardRequestHeaders(message, matchingScriptRulesWithStatus(cfg, "response", message, false))
+}
+
+func TestModuleBodyReadLimitIgnoresActionsThatDoNotReadTheBody(t *testing.T) {
+	t.Parallel()
+	module := nativeRuntimeModule()
+	rule := func(mode string, max int64) matchedScriptRule {
+		r := nativeRuntimeRule(`function transform() { return {} }`, "response", mode)
+		r.MaxBodyBytes = max
+		return matchedScriptRule{Module: module, Rule: r}
+	}
+	cases := []struct {
+		name  string
+		rules []matchedScriptRule
+		want  int64
+	}{
+		{name: "no rules at all forwards, so the global cap stands", rules: nil, want: maxModuleHTTPBody},
+		{
+			name:  "a none-mode action never bounds the read",
+			rules: []matchedScriptRule{rule("none", 1024)},
+			want:  maxModuleHTTPBody,
+		},
+		{
+			name:  "a reading action bounds it to its own limit",
+			rules: []matchedScriptRule{rule("text", 1<<20)},
+			want:  1 << 20,
+		},
+		{
+			name:  "the largest reader wins, so every action still gets its bytes",
+			rules: []matchedScriptRule{rule("text", 1<<20), rule("binary", 8<<20)},
+			want:  8 << 20,
+		},
+		{
+			name:  "a none-mode action alongside a reader does not shrink it",
+			rules: []matchedScriptRule{rule("none", 1024), rule("text", 4<<20)},
+			want:  4 << 20,
+		},
+		{
+			name:  "a limit above the global cap cannot raise it",
+			rules: []matchedScriptRule{rule("text", maxModuleHTTPBody*2)},
+			want:  maxModuleHTTPBody,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := moduleBodyReadLimit(testCase.rules); got != testCase.want {
+				t.Fatalf("read limit = %d, want %d", got, testCase.want)
+			}
+		})
+	}
+}
+
 // MaxBodyBytes bounds the projection an action is handed, not what the upstream
 // is allowed to send. Reading the upstream response with it made the smallest
 // legal value a ceiling on the whole response: readBounded failed before the
@@ -1787,18 +1978,72 @@ func TestAcceptEncodingIsPinnedOnlyWhenAResponseActionCouldRun(t *testing.T) {
 
 	// A response rule scoped to a status code still counts at request time: the
 	// status is not knowable yet, so it has to be treated as a possible match.
-	if got := forwardRequestHeaders(withRule(statusScoped), message).Get("Accept-Encoding"); got != "identity" {
+	if got := forwardRequestHeadersForTest(withRule(statusScoped), message).Get("Accept-Encoding"); got != "identity" {
 		t.Fatalf("a status-scoped response action did not pin identity: Accept-Encoding=%q", got)
 	}
 	// A request-phase-only extension never reads the response body.
-	if got := forwardRequestHeaders(withRule(nativeRuntimeRule(source, "request", "text")), message).Get("Accept-Encoding"); got != "gzip, br" {
+	if got := forwardRequestHeadersForTest(withRule(nativeRuntimeRule(source, "request", "text")), message).Get("Accept-Encoding"); got != "gzip, br" {
 		t.Fatalf("a request-only extension pinned identity: Accept-Encoding=%q", got)
 	}
 	// So does a host this extension does not capture.
 	elsewhere := message
 	elsewhere.URL = "https://other.example.com/v1"
-	if got := forwardRequestHeaders(withRule(statusScoped), elsewhere).Get("Accept-Encoding"); got != "gzip, br" {
+	if got := forwardRequestHeadersForTest(withRule(statusScoped), elsewhere).Get("Accept-Encoding"); got != "gzip, br" {
 		t.Fatalf("an uncaptured host pinned identity: Accept-Encoding=%q", got)
+	}
+}
+
+// Filtering the request-time probe by status must produce exactly what a fresh
+// status-aware walk produces. That equality is the whole licence for reusing the
+// probe instead of walking every rule a second time, so it is asserted
+// differentially rather than assumed -- the same way the transport projection is
+// checked against its naive reference.
+func TestFilteredProbeEqualsAFreshStatusAwareWalk(t *testing.T) {
+	t.Parallel()
+	source := `function transform() { return {} }`
+	module := nativeRuntimeModule()
+	module.Enabled = true
+
+	unscoped := nativeRuntimeRule(source, "response", "text")
+	unscoped.ID = "unscoped"
+	okOnly := nativeRuntimeRule(source, "response", "text")
+	okOnly.ID = "ok-only"
+	okOnly.Match.StatusCodes = []int{200}
+	errorsOnly := nativeRuntimeRule(source, "response", "text")
+	errorsOnly.ID = "errors-only"
+	errorsOnly.Match.StatusCodes = []int{500, 502}
+	notFound := nativeRuntimeRule(source, "response", "text")
+	notFound.ID = "not-found"
+	notFound.Match.StatusCodes = []int{404}
+	module.Scripts = []ScriptRule{unscoped, okOnly, errorsOnly, notFound}
+	cfg := Config{Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+
+	probeMessage := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet}
+	candidates := matchingScriptRulesWithStatus(cfg, "response", probeMessage, false)
+	if len(candidates) != 4 {
+		t.Fatalf("the probe found %d candidates, want all 4", len(candidates))
+	}
+
+	for _, status := range []int{200, 404, 500, 502, 0, 204, 301} {
+		fresh := matchingScriptRules(cfg, "response", scriptMessage{
+			URL: probeMessage.URL, Method: probeMessage.Method, StatusCode: status,
+		})
+		filtered := responseRulesForStatus(candidates, status)
+		if len(filtered) != len(fresh) {
+			t.Fatalf("status %d: filtered %d rules, a fresh walk found %d", status, len(filtered), len(fresh))
+		}
+		for index := range fresh {
+			if filtered[index].Rule.ID != fresh[index].Rule.ID {
+				t.Fatalf("status %d: filtered[%d]=%s, fresh[%d]=%s",
+					status, index, filtered[index].Rule.ID, index, fresh[index].Rule.ID)
+			}
+		}
+	}
+
+	// Filtering must not scribble on the candidate set: the probe is also what
+	// pinned Accept-Encoding, and a later status must see it whole.
+	if len(candidates) != 4 {
+		t.Fatalf("filtering mutated the shared candidate set: %d left", len(candidates))
 	}
 }
 

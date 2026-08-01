@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 
 	"github.com/itchyny/gojq"
 )
@@ -43,6 +46,18 @@ func compileJQProgram(program string) (*gojq.Code, error) {
 	return code, nil
 }
 
+// jqProgram returns the action's compiled expression, mirroring scriptProgram.
+//
+// The snapshot carries it in production. The on-demand compile is for a rule
+// assembled directly in a test, which never goes through compileScriptConfig --
+// the same reason scriptProgram keeps its fallback.
+func jqProgram(rule ScriptRule) (*gojq.Code, error) {
+	if rule.jq != nil {
+		return rule.jq, nil
+	}
+	return compileJQProgram(rule.JQProgram)
+}
+
 // errJQBodyNotJSON reports a body a JSON filter has nothing to say about.
 //
 // This used to be an ordinary failure, on the reasoning that the action matched
@@ -62,9 +77,35 @@ var errJQBodyNotJSON = errors.New("action body is not JSON")
 
 // runJQ transforms one JSON document. A body that does not parse as JSON yields
 // errJQBodyNotJSON, which the caller turns into a no-op rather than a failure.
+//
+// The body is decoded with UseNumber rather than into plain `any`, because the
+// default decoding makes every JSON number a float64 and silently rounds any
+// integer above 2^53 before the program ever runs. That is not a property of a
+// filter: the identity program `.` corrupted a bilibili snowflake id from
+// ...456068 to ...456000, re-encoded it as a well-formed number, and reported
+// nothing. gojq is not the constraint -- it works on int, *big.Int and float64,
+// and json.Marshal writes a *big.Int as a bare integer literal -- so the loss
+// was entirely in the decode.
+//
+// The JavaScript path deliberately keeps the float64 behaviour. Loon runs
+// JavaScript, JSON.parse is spec-bound to IEEE-754 doubles, and every published
+// bundle is written against that; widening numbers there would diverge from the
+// client this runtime presents as.
 func runJQ(ctx context.Context, code *gojq.Code, body []byte, settings map[string]any) ([]byte, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
 	var input any
-	if err := json.Unmarshal(body, &input); err != nil {
+	if err := decoder.Decode(&input); err != nil {
+		return nil, errJQBodyNotJSON
+	}
+	// json.Unmarshal accepts a single value and trailing whitespace, nothing
+	// else. Decode alone would accept a stream, so a body of two concatenated
+	// documents would start being filtered as if it were the first one.
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, errJQBodyNotJSON
+	}
+	input, representable := normaliseJQNumbers(input)
+	if !representable {
 		return nil, errJQBodyNotJSON
 	}
 	if settings == nil {
@@ -95,6 +136,61 @@ func runJQ(ctx context.Context, code *gojq.Code, body []byte, settings map[strin
 	return encoded, nil
 }
 
+// normaliseJQNumbers replaces every json.Number in a decoded document with the
+// concrete numeric type gojq operates on: an int where the value fits one, a
+// *big.Int where it does not, and a float64 for anything with a fraction or an
+// exponent.
+//
+// The false return is for a literal no numeric type can hold -- 1e400 and the
+// like. It is deliberately not an error. json.Unmarshal rejected such a document
+// outright, so before this change the body was already classed as unfilterable
+// and forwarded untouched; reporting it now would turn a response the origin
+// sent perfectly well into the 502 that the response phase produces for a failed
+// action. A transform that cannot run must not destroy what it cannot edit.
+//
+// Converting explicitly rather than handing gojq the json.Number values it also
+// accepts keeps the mapping this repository's own, and testable, instead of an
+// implementation detail of the dependency.
+func normaliseJQNumbers(value any) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, element := range typed {
+			normalised, ok := normaliseJQNumbers(element)
+			if !ok {
+				return nil, false
+			}
+			typed[key] = normalised
+		}
+		return typed, true
+	case []any:
+		for index, element := range typed {
+			normalised, ok := normaliseJQNumbers(element)
+			if !ok {
+				return nil, false
+			}
+			typed[index] = normalised
+		}
+		return typed, true
+	case json.Number:
+		// int64(int(...)) guards a 32-bit platform, where the narrowing would
+		// otherwise truncate silently -- the exact failure mode this function
+		// exists to remove.
+		if integer, err := typed.Int64(); err == nil && int64(int(integer)) == integer {
+			return int(integer), true
+		}
+		if wide, ok := new(big.Int).SetString(typed.String(), 10); ok {
+			return wide, true
+		}
+		number, err := typed.Float64()
+		if err != nil || math.IsInf(number, 0) || math.IsNaN(number) {
+			return nil, false
+		}
+		return number, true
+	default:
+		return value, true
+	}
+}
+
 // executeJQ runs a jq action against whichever message the action's phase owns.
 func (r *scriptRuntime) executeJQ(
 	ctx context.Context,
@@ -103,7 +199,7 @@ func (r *scriptRuntime) executeJQ(
 	request scriptMessage,
 	response *scriptMessage,
 ) (scriptResult, error) {
-	code, err := r.jqCode(module, rule)
+	code, err := jqProgram(rule)
 	if err != nil {
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}

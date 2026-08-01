@@ -147,6 +147,11 @@ func assertProjectionExcludesScriptRuntime(t *testing.T, root reflect.Type) {
 		if current.PkgPath() == "github.com/dop251/goja" && current.Name() == "Program" {
 			t.Fatalf("projection type %s retains goja.Program", root)
 		}
+		// The jq artifact is snapshot-owned for the same reason the goja one is,
+		// so it is prohibited here for the same reason.
+		if current.PkgPath() == "github.com/itchyny/gojq" && current.Name() == "Code" {
+			t.Fatalf("projection type %s retains gojq.Code", root)
+		}
 		if _, exists := seen[current]; exists {
 			return
 		}

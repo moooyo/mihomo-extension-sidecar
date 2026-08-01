@@ -142,8 +142,16 @@ type ScriptRule struct {
 	ReplaceBody  *BodyReplace `json:"replace_body,omitempty"`
 	TimeoutMS    int          `json:"timeout_ms"`
 	MaxBodyBytes int64        `json:"max_body_bytes"`
-	// program and settings belong to the immutable compiled config snapshot.
+	// program, jq and settings belong to the immutable compiled config snapshot.
+	//
+	// jq is here rather than in a runtime-side cache for the reason program is:
+	// an artifact compiled from this rule must die with the generation that
+	// carries it. A process-lifetime cache keyed on the rule's identity cannot
+	// see a bundle that changes the expression, and a jq action's ScriptDigest
+	// is always empty, so such a cache served the first expression it ever
+	// compiled for a given (extension, action) until the process restarted.
 	program  *goja.Program
+	jq       *gojq.Code
 	settings map[string]any
 }
 
@@ -1783,24 +1791,4 @@ func (s *configStore) clearReadErrorFile() {
 	s.readErrorModTime = time.Time{}
 	s.readErrorSize = 0
 	s.readErrorFile = nil
-}
-
-// jqCode returns the compiled program for a jq action, compiling once per
-// distinct expression. Compilation is not free, and an action runs per request.
-func (r *scriptRuntime) jqCode(module Module, rule ScriptRule) (*gojq.Code, error) {
-	key := scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}
-	r.jqMu.Lock()
-	defer r.jqMu.Unlock()
-	if r.jqPrograms == nil {
-		r.jqPrograms = make(map[scriptProgramKey]*gojq.Code)
-	}
-	if code, ok := r.jqPrograms[key]; ok {
-		return code, nil
-	}
-	code, err := compileJQProgram(rule.JQProgram)
-	if err != nil {
-		return nil, err
-	}
-	r.jqPrograms[key] = code
-	return code, nil
 }
