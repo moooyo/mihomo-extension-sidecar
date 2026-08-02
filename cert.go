@@ -59,7 +59,22 @@ func (s *certificateStore) currentCertificate() (*tls.Certificate, error) {
 	}
 	if s.certificate != nil && s.certPath == cfg.TLSCert && s.keyPath == cfg.TLSKey &&
 		certInfo.ModTime().Equal(s.certModTime) && keyInfo.ModTime().Equal(s.keyModTime) {
-		return s.certificate, nil
+		// The cache key is the file's mtime, and one of the checks below is not a
+		// property of the file: leaf validity is a property of the clock. Serving
+		// the cached leaf without re-checking it meant that once renewal had
+		// failed for long enough -- 397-day leaves, RENEW_BEFORE of 30 days and a
+		// daily timer, so 30 consecutive failures -- this process would present an
+		// expired certificate to every client indefinitely, and the SOCKS probe
+		// checkInterceptHealth performs cannot see it.
+		if err := validateInterceptLeafValidity(s.certificate.Leaf, time.Now()); err == nil {
+			return s.certificate, nil
+		}
+		// Do not fall back to it either: staleOrError retains the last valid leaf
+		// for a transient read failure, and an expired leaf is not that. Dropping
+		// it makes the reload below authoritative, and if the file on disk is the
+		// same expired one the error surfaces instead of the certificate.
+		log.Print("intercept: the cached interception leaf is no longer within its validity window; reloading")
+		s.certificate = nil
 	}
 	certificate, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 	if err != nil {
@@ -92,6 +107,19 @@ func (s *certificateStore) staleOrError(err error) (*tls.Certificate, error) {
 	return s.certificate, nil
 }
 
+// validateInterceptLeafValidity is the one check in validateInterceptLeaf that
+// depends on the clock rather than on the file, so it is the one a cache keyed
+// on the file's mtime has to repeat.
+func validateInterceptLeafValidity(leaf *x509.Certificate, now time.Time) error {
+	if leaf == nil {
+		return errors.New("missing TLS leaf certificate")
+	}
+	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
+		return errors.New("interception TLS leaf certificate is not currently valid")
+	}
+	return nil
+}
+
 func validateInterceptLeaf(leaf *x509.Certificate, requiredHosts []string, now time.Time) error {
 	if leaf == nil {
 		return errors.New("missing TLS leaf certificate")
@@ -99,8 +127,8 @@ func validateInterceptLeaf(leaf *x509.Certificate, requiredHosts []string, now t
 	if leaf.IsCA {
 		return errors.New("interception runtime must not receive a CA certificate")
 	}
-	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
-		return errors.New("interception TLS leaf certificate is not currently valid")
+	if err := validateInterceptLeafValidity(leaf, now); err != nil {
+		return err
 	}
 	for _, host := range requiredHosts {
 		probe := host
