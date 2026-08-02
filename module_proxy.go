@@ -58,6 +58,10 @@ type preparedModuleRequest struct {
 	// bodyBufferRetained means the caller's pre-action body reservation has to
 	// stay held past preparation.
 	bodyBufferRetained bool
+	// bodyBufferBytes is what the buffer actually holds, so the caller can shrink
+	// a reservation that was taken before the length was known down to the real
+	// residency. Zero on the streaming paths, which buffer nothing.
+	bodyBufferBytes int64
 	// responseCandidates is the response-phase match with the status filter not
 	// yet applied. Nil when the request was answered or refused.
 	responseCandidates []matchedScriptRule
@@ -153,13 +157,20 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	}
 	conditionalStream := requestCanConditionallyStreamWithModuleActions(incoming, requestRules)
 	bodyBufferRetained := false
+	bodyBufferBytes := int64(0)
 	if !conditionalStream {
 		body, bodyErr := readDecodedModuleRequestBody(w, incoming, moduleBodyReadLimit(requestRules))
 		if bodyErr != nil {
 			return preparedModuleRequest{}, bodyErr
 		}
 		message.Body = body
-		bodyBufferRetained = incomingHadBodySection || len(body) > 0 || len(incoming.Trailer) > 0
+		bodyBufferBytes = int64(len(body))
+		// Retention is about bytes and trailers actually held, not about whether
+		// the request arrived with a body section. quic-go attaches a non-nil Body
+		// and ContentLength -1 to every HTTP/3 request, including a plain GET, so
+		// the old disjunct made every H3 exchange "retain" a zero-byte buffer --
+		// and hold its whole undeclared-length reservation for the round trip.
+		bodyBufferRetained = len(body) > 0 || len(incoming.Trailer) > 0
 	}
 	message.Headers.Del("Content-Encoding")
 	message.Headers.Del("Content-Length")
@@ -181,15 +192,15 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 		// authorizeModuleRequestURLRewriteConfig below.
 		if urlChanged {
 			if err := authorizeModuleRequestActionURL(cfg, matched.Module, message.URL); err != nil {
-				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
+				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
 			}
 		}
 		if matched.Rule.BodyMode != "none" && int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
-			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
+			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
 		}
 		result, err := p.scripts.execute(incoming.Context(), cfg, p.upstreamRoots, matched.Module, matched.Rule, message, nil)
 		if err != nil {
-			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
+			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, err
 		}
 		if result.Abort {
 			// The server owns an unread request body. Closing it here may
@@ -197,7 +208,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 			panic(http.ErrAbortHandler)
 		}
 		if err := validateModuleResultBody(matched.Module, matched.Rule, "request", result); err != nil {
-			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
+			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, err
 		}
 		if result.Synthetic {
 			status := result.StatusCode
@@ -214,7 +225,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 		if result.ChangedURL {
 			parsed, authorizeErr := authorizeModuleRequestURLRewriteConfig(cfg, matched.Module, message.URL, result.URL)
 			if authorizeErr != nil {
-				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request URL rewrite: %w", matched.Module.ID, authorizeErr)
+				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, fmt.Errorf("extension %s request URL rewrite: %w", matched.Module.ID, authorizeErr)
 			}
 			message.URL = parsed.String()
 			urlChanged = true
@@ -232,7 +243,7 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 		switch {
 		case bodyChanged:
 			if err := drainModuleRequestBody(w, incoming); err != nil {
-				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
+				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, err
 			}
 		case urlChanged:
 			body, bodyErr := readDecodedModuleRequestBody(w, incoming, moduleBodyReadLimit(requestRules))
@@ -249,10 +260,11 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 
 	outbound, responseCandidates, err := bufferedModuleRequest(incoming, cfg, message, incomingHadBodySection)
 	if err != nil {
-		return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, err
+		return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes}, err
 	}
 	return preparedModuleRequest{
-		outbound: outbound, bodyBufferRetained: bodyBufferRetained, responseCandidates: responseCandidates,
+		outbound: outbound, bodyBufferRetained: bodyBufferRetained, bodyBufferBytes: bodyBufferBytes,
+		responseCandidates: responseCandidates,
 	}, nil
 }
 
@@ -308,7 +320,12 @@ func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg C
 func forwardRequestHeaders(message scriptMessage, responseCandidates []matchedScriptRule) http.Header {
 	headers := cloneProxyHeaders(message.Headers)
 	sanitizeForwardRequestHeaders(headers)
-	if len(responseCandidates) > 0 {
+	// Only for a rule set that will actually decode the body. The streaming
+	// header-only path preserves the upstream Content-Encoding and Content-Length
+	// untouched, so pinning identity for it bought nothing and cost the client
+	// compression on every response for the host -- one declarative `headers`
+	// action was enough to disable it site-wide.
+	if len(responseCandidates) > 0 && !responseRulesStreamable(responseCandidates) {
 		headers.Set("Accept-Encoding", "identity")
 	}
 	return headers
@@ -719,7 +736,15 @@ func (p *interceptProxy) applyStreamingResponseHeaderEdits(
 // -- admission is still taken before any action can produce a side effect,
 // including for a bodyless request, because a script can synthesise a body from
 // nothing.
-const maxModuleBodyBudgetBytes = int64(maxModuleHTTPBody)
+//
+// The budget is deliberately a multiple of maxModuleHTTPBody rather than equal
+// to it. A reservation has to be taken before the body is read, so a response
+// of undeclared length reserves the whole of what it is allowed to read; when
+// the budget was exactly one maximal body, one such exchange excluded every
+// other one for its duration. Sizing the budget at four maximal bodies keeps
+// admission honest -- reserving what will actually be read rather than a
+// smaller number -- without turning every chunked response into a global lock.
+const maxModuleBodyBudgetBytes = int64(4 * maxModuleHTTPBody)
 
 // moduleBodyBudget admits resident body bytes rather than streams.
 type moduleBodyBudget struct {
@@ -830,4 +855,33 @@ func moduleBodyReservation(incoming *http.Request, rules []matchedScriptRule) in
 		return widest
 	}
 	return widest
+}
+
+// moduleResponseBodyReservation is what the buffered response path will hold.
+//
+// The response leg cannot reuse moduleBodyReservation, because the two answer
+// different questions. moduleBodyReadLimit deliberately skips bodyMode "none"
+// rules and falls back to the process-wide cap when none remains, so a response
+// rule set that is entirely "none" reads up to 64 MiB -- while the widest
+// declared limit across those same rules can be as little as 1 KiB. Reserving
+// the declared figure therefore under-counted the read by up to four orders of
+// magnitude, and the budget stopped bounding the thing it exists to bound.
+//
+// The widest declared limit stays as a floor because an action may synthesise a
+// body it never read, up to its own limit.
+func moduleResponseBodyReservation(response *http.Response, rules []matchedScriptRule) int64 {
+	reserve := moduleBodyReadLimit(rules)
+	if response != nil && response.ContentLength > 0 && response.ContentLength < reserve {
+		reserve = response.ContentLength
+	}
+	widest := int64(0)
+	for _, matched := range rules {
+		if matched.Rule.MaxBodyBytes > widest {
+			widest = matched.Rule.MaxBodyBytes
+		}
+	}
+	if widest > reserve {
+		return widest
+	}
+	return reserve
 }

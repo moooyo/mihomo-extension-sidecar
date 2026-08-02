@@ -1061,3 +1061,71 @@ func TestPersistentStorageQuotaIsPerExtension(t *testing.T) {
 		t.Fatalf("a second extension could not write after the first filled its quota (stored %s chunks): %q", stored, second.Body)
 	}
 }
+
+// A script's result is consumed on the Go side after the JS call returned, so a
+// throwing accessor panics out of goja where no frame is left to catch it. That
+// panic reached net/http, which tore the exchange down and logged a goroutine
+// stack -- on the MITM leg, through the TLS error writer, as a handshake error
+// for the captured host -- while the engine log the operator is told to consult
+// stayed silent.
+//
+// The deadline variant is the non-adversarial route to the same crash: the
+// action timeout can land inside a getter Export is already running, and that
+// arrives as *InterruptedError, which Runtime.Try cannot catch either.
+func TestAThrowingAccessorFailsTheActionInsteadOfPanicking(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		source    string
+		timeoutMS int
+	}{
+		"throwing getter on the result": {
+			source: `function transform() { return { get abort() { throw new Error("boom") } } }`,
+		},
+		"throwing getter nested in a patch": {
+			source: `function transform() { return { response: { get body() { throw new Error("boom") } } } }`,
+		},
+		"rejection whose stack throws": {
+			source: `function transform() {
+				const reason = {}
+				Object.defineProperty(reason, "stack", { get() { throw new Error("boom") } })
+				return Promise.reject(reason)
+			}`,
+		},
+		"deadline inside an accessor": {
+			source:    `function transform() { return { get abort() { for (;;) {} } } }`,
+			timeoutMS: 150,
+		},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rule := nativeRuntimeRule(testCase.source, "response", "none")
+			if testCase.timeoutMS != 0 {
+				rule.TimeoutMS = testCase.timeoutMS
+			}
+			request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+			response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header)}
+
+			// Any panic escaping execute fails the test rather than the process,
+			// which is the whole distinction being pinned.
+			var result scriptResult
+			var err error
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						t.Fatalf("a %T escaped the sandbox: %v", recovered, recovered)
+					}
+				}()
+				result, err = newScriptRuntime().execute(context.Background(), Config{}, nil,
+					nativeRuntimeModule(), rule, request, &response)
+			}()
+
+			if err == nil {
+				t.Fatalf("a throwing accessor produced no error; result = %+v", result)
+			}
+			if result.Abort || result.Synthetic || result.ChangedBody || result.ChangedHeaders || result.ChangedStatus || result.ChangedURL {
+				t.Fatalf("a failed action returned a partly applied result: %+v", result)
+			}
+		})
+	}
+}

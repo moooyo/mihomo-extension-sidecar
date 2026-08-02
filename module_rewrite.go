@@ -114,9 +114,23 @@ func (b *BodyReplace) validate() error {
 	if len(b.Pattern) == 0 || len(b.Pattern) > maxReplacePatternLen {
 		return fmt.Errorf("body replace pattern must contain 1 to %d bytes", maxReplacePatternLen)
 	}
+	// Bounded like a rewrite target, which it was not: the sibling field has
+	// carried this limit all along and the omission here was an oversight, not a
+	// distinction. Unbounded, `to` is a whole-document amplifier -- ReplaceAll
+	// allocates the result in one piece, and a declarative action is dispatched
+	// before any VM exists, so no deadline and no interrupt applies to it.
+	if len(b.To) > maxRewriteURLBytes {
+		return fmt.Errorf("body replace target exceeds %d bytes", maxRewriteURLBytes)
+	}
 	compiled, err := regexp.Compile(b.Pattern)
 	if err != nil {
 		return fmt.Errorf("body replace pattern is invalid: %w", err)
+	}
+	// A pattern that matches the empty string substitutes at every byte offset,
+	// so a 64 MiB body multiplies by the length of `to` with nothing to stop it.
+	// No body-replace directive this kind exists to carry ever wants that.
+	if compiled.MatchString("") {
+		return errors.New("body replace pattern must not match the empty string")
 	}
 	b.compiled = compiled
 	return nil
@@ -252,6 +266,14 @@ func executeBodyReplace(rule ScriptRule, module Module, request scriptMessage, r
 //
 // Writing forward also bounds the loop by the template length, so there is no
 // iteration cap to choose or to get wrong.
+//
+// The result is a Go regexp replacement template, not a finished string: both
+// callers hand it to ExpandString or ReplaceAll, where `$` introduces a capture
+// reference. The author's own template keeps that meaning -- weatherkit's
+// `.../v1/$1` relies on it -- but a substituted value must not acquire it, so
+// each value is written with its dollars escaped. Unescaped, a setting of
+// `p$ssw0rd` expanded to `p` and one of `$100` expanded to nothing, silently,
+// because both name capture groups that do not exist.
 func expandSettingsTemplate(template string, valueMap map[string]map[string]string, settings map[string]any) (string, bool) {
 	var out strings.Builder
 	rest := template
@@ -280,7 +302,7 @@ func expandSettingsTemplate(template string, valueMap map[string]map[string]stri
 			value = substitution
 		}
 		out.WriteString(rest[:start])
-		out.WriteString(value)
+		out.WriteString(strings.ReplaceAll(value, "$", "$$"))
 		rest = rest[start+end+2:]
 	}
 }
