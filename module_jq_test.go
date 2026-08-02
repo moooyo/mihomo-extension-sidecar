@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/itchyny/gojq"
 )
 
 func runJQFixture(t *testing.T, program, body string) (string, error) {
@@ -375,4 +377,79 @@ func TestJQTakesOnlyTheFirstOutput(t *testing.T) {
 	if got != `{"a":1}` {
 		t.Fatalf("got %s, want only the first output", got)
 	}
+}
+
+// A document whose shape the filter cannot act on is a no-op, not a failure.
+//
+// gojq raises at runtime for indexing a string, iterating a number, and so on.
+// Those used to be plain failures, and the response-phase exit is fail-closed,
+// so one of them turned an exchange the origin had completed successfully into
+// a 502 the client could not interpret. The shapes that trigger it are ordinary
+// live traffic: an error envelope where an object was expected, or "data": []
+// standing in for an empty object.
+//
+// The compensation used to live entirely in the catalog's linter, as regular
+// expressions over the program text -- which never ran for a manifest installed
+// from a URL or pasted in.
+func TestJQInputShapeMismatchIsANoOpRatherThanAFailure(t *testing.T) {
+	t.Parallel()
+	program := mustCompileJQ(t, `del(.ad_info) | .data.items |= map(select(.type != "ad"))`)
+
+	for name, body := range map[string]string{
+		"top-level array":             `[]`,
+		"top-level string":            `"forbidden"`,
+		"top-level number":            `42`,
+		"data is an array not object": `{"data":[]}`,
+		"data is a string":            `{"data":"none"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := runJQ(context.Background(), program, []byte(body), nil)
+			if err == nil {
+				t.Logf("filtered cleanly to %s", out)
+				return
+			}
+			if !errors.Is(err, errJQInputShape) && !errors.Is(err, errJQBodyNotJSON) {
+				t.Fatalf("error = %v; a shape the filter cannot act on must not fail the exchange", err)
+			}
+		})
+	}
+
+	// The document it is written against still gets filtered.
+	out, err := runJQ(context.Background(), program, []byte(`{"ad_info":1,"data":{"items":[{"type":"ad"},{"type":"video"}]}}`), nil)
+	if err != nil {
+		t.Fatalf("the shape the filter targets failed: %v", err)
+	}
+	if strings.Contains(string(out), "ad_info") || strings.Contains(string(out), `"ad"`) {
+		t.Fatalf("filter did not run: %s", out)
+	}
+}
+
+// The context error must not be misread as a shape mismatch. gojq reports a
+// cancelled or expired context as an ordinary iterator value, so classifying
+// before checking ctx.Err() would turn every action timeout and every client
+// disconnect into a silent pass-through of unfiltered content.
+func TestJQTimeoutIsAFailureNotANoOp(t *testing.T) {
+	t.Parallel()
+	program := mustCompileJQ(t, `[range(100000000)] | length`)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := runJQ(ctx, program, []byte(`{}`), nil)
+	if err == nil {
+		t.Fatal("a program that outran its deadline reported success")
+	}
+	if errors.Is(err, errJQInputShape) || errors.Is(err, errJQBodyNotJSON) {
+		t.Fatalf("error = %v; a deadline must fail the action, never pass the body through", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want the deadline to surface", err)
+	}
+}
+
+func mustCompileJQ(t *testing.T, program string) *gojq.Code {
+	t.Helper()
+	code, err := compileJQProgram(program)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code
 }

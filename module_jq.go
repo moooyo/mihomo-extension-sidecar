@@ -75,6 +75,17 @@ func jqProgram(rule ScriptRule) (*gojq.Code, error) {
 // this: a transform that cannot run must not destroy what it cannot edit.
 var errJQBodyNotJSON = errors.New("action body is not JSON")
 
+// errJQInputShape reports a document the compiled program cannot act on.
+//
+// It is the same category as errJQBodyNotJSON one level in: the body parsed,
+// but its shape is not the one the filter is written against, so gojq raises at
+// runtime. The compensation for this used to live entirely in the catalog's
+// linter, as two regular expressions over the program text -- which only ever
+// ran for extensions published from that repository, never for a manifest
+// installed from a URL or pasted in, and which could not see past a literal
+// `.data` anyway.
+var errJQInputShape = errors.New("action input has a shape the filter cannot act on")
+
 // runJQ transforms one JSON document. A body that does not parse as JSON yields
 // errJQBodyNotJSON, which the caller turns into a no-op rather than a failure.
 //
@@ -117,14 +128,43 @@ func runJQ(ctx context.Context, code *gojq.Code, body []byte, settings map[strin
 	// from concatenating documents into one malformed body.
 	value, ok := iterator.Next()
 	if !ok {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, errors.New("jq program produced no output")
 	}
 	if err, isError := value.(error); isError {
-		var halt *gojq.HaltError
-		if errors.As(err, &halt) && halt.Value() == nil {
-			return nil, errors.New("jq program halted")
+		// Order matters, and this check has to be first.
+		//
+		// gojq surfaces a cancelled or expired context as an ordinary iterator
+		// value rather than by ending the iteration, so classifying before
+		// checking it would file every action timeout and every client
+		// disconnect under "the filter could not run" -- and the answer to that
+		// is to pass the body through, which would silently forward exactly the
+		// content the action exists to remove.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("jq program failed: %w", err)
+		var halt *gojq.HaltError
+		if errors.As(err, &halt) {
+			if halt.Value() == nil {
+				return nil, errors.New("jq program halted")
+			}
+			return nil, fmt.Errorf("jq program failed: %w", err)
+		}
+		// Everything else gojq reports at runtime is a statement about this
+		// document's shape, not about the program: indexing a string, iterating
+		// a number, `has` on a scalar. The program compiled, so it is
+		// well-formed; this body is simply not one it can act on.
+		//
+		// That is the same situation errJQBodyNotJSON describes and it gets the
+		// same answer, for the same reason: a transform that cannot run must not
+		// destroy what it cannot edit. It used to be a failure, which the
+		// response-phase exit turns into a 502 on an exchange the origin
+		// completed successfully -- and the shapes that trigger it are ordinary
+		// live traffic. An error envelope where an object was expected, or
+		// `"data": []` standing in for an empty object, is enough.
+		return nil, fmt.Errorf("%w: %v", errJQInputShape, err)
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil {
@@ -217,6 +257,19 @@ func (r *scriptRuntime) executeJQ(
 	transformed, err := runJQ(ctx, code, body, settings)
 	if errors.Is(err, errJQBodyNotJSON) {
 		// Nothing to filter. Leave the message exactly as it arrived.
+		return scriptResult{}, nil
+	}
+	if errors.Is(err, errJQInputShape) {
+		// Same answer, but say so: unlike a non-JSON body, a shape mismatch may
+		// well mean the manifest and the origin have diverged, and an operator
+		// seeing an ad-filter quietly do nothing needs somewhere to look.
+		if engineLogPublishingEnabled(r.logs) {
+			r.logs.Publish(EngineLog{
+				Level: "warn", Source: "engine", Extension: module.ID, Action: rule.ID,
+				Phase: rule.Phase, URL: sanitizeEngineLogURL(request.URL),
+				Message: "jq action skipped: " + err.Error(),
+			})
+		}
 		return scriptResult{}, nil
 	}
 	if err != nil {
