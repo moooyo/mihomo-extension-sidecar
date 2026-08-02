@@ -350,7 +350,11 @@ func TestNativeNetworkRequesterReusesSameOriginAndClosesAtActionEnd(t *testing.T
 	requester := newModuleNetworkRequester(actionCtx, proxy, nil, make(chan struct{}, 1))
 
 	for index := 0; index < 2; index++ {
-		result, requestErr := requester.request(map[string]any{"url": origin + "/same-origin"})
+		req, buildErr := newModuleNetworkRequest(map[string]any{"url": origin + "/same-origin"})
+		if buildErr != nil {
+			t.Fatalf("request %d build: %v", index, buildErr)
+		}
+		result, requestErr := requester.request(req)
 		if requestErr != nil || result.status != http.StatusOK || string(result.body) != "reused" {
 			t.Fatalf("request %d result=%+v err=%v", index, result, requestErr)
 		}
@@ -387,7 +391,11 @@ func TestNativeNetworkRequesterReusesSameOriginAndClosesAtActionEnd(t *testing.T
 	nextActionCtx, cancelNextAction := context.WithCancel(context.Background())
 	defer cancelNextAction()
 	nextRequester := newModuleNetworkRequester(nextActionCtx, proxy, nil, make(chan struct{}, 1))
-	result, requestErr := nextRequester.request(map[string]any{"url": origin + "/next-action"})
+	nextReq, nextBuildErr := newModuleNetworkRequest(map[string]any{"url": origin + "/next-action"})
+	if nextBuildErr != nil {
+		t.Fatalf("next action build: %v", nextBuildErr)
+	}
+	result, requestErr := nextRequester.request(nextReq)
 	if requestErr != nil || string(result.body) != "reused" {
 		t.Fatalf("next action result=%+v err=%v", result, requestErr)
 	}
@@ -516,7 +524,11 @@ func TestNativeNetworkRequesterKeepsExactOriginsSeparate(t *testing.T) {
 		{origin: firstOrigin, body: "first"},
 		{origin: secondOrigin, body: "second"},
 	} {
-		result, requestErr := requester.request(map[string]any{"url": test.origin + "/isolated"})
+		req, buildErr := newModuleNetworkRequest(map[string]any{"url": test.origin + "/isolated"})
+		if buildErr != nil {
+			t.Fatalf("origin %s build: %v", test.origin, buildErr)
+		}
+		result, requestErr := requester.request(req)
 		if requestErr != nil || string(result.body) != test.body {
 			t.Fatalf("origin %s result=%+v err=%v", test.origin, result, requestErr)
 		}
@@ -679,4 +691,75 @@ func serveTestSOCKSTCPRelayConnection(conn net.Conn, upstreamAddress, username, 
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+// TestModuleNetworkRequestOwnsItsHeadersAndBody pins the boundary that
+// $httpClient and requestAsync cross.
+//
+// goja's Export hands back the very Go map it wrapped, so the options bag a
+// script passes in still belongs to the VM. A worker goroutine reading it while
+// the VM writes is `fatal error: concurrent map read and map write`, which no
+// recover() catches and which takes the whole sidecar down. The request the
+// worker receives must therefore share nothing with the script's own maps.
+//
+// This fails without -race, which matters: the race detector cannot be built on
+// every machine this repository is developed on.
+func TestModuleNetworkRequestOwnsItsHeadersAndBody(t *testing.T) {
+	t.Parallel()
+	// The exact shape scriptMessageObject publishes as $request.headers.
+	scriptHeaders := flatHeaders(http.Header{
+		"Cookie":     []string{"session=abc"},
+		"X-Original": []string{"keep"},
+	})
+	scriptBody := []byte("payload")
+	options := map[string]any{
+		"url":     "https://api.example.net/v1/data",
+		"method":  "POST",
+		"headers": scriptHeaders,
+		"body":    scriptBody,
+	}
+
+	req, err := newModuleNetworkRequest(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Everything the VM can still do to its own values after the call returned.
+	scriptHeaders["X-Original"] = "mutated"
+	scriptHeaders["X-Added"] = "late"
+	delete(scriptHeaders, "Cookie")
+	scriptBody[0] = 'X'
+
+	if got := req.headers.Get("X-Original"); got != "keep" {
+		t.Fatalf("built request aliases the script header map: X-Original=%q", got)
+	}
+	if got := req.headers.Get("Cookie"); got != "session=abc" {
+		t.Fatalf("built request aliases the script header map: Cookie=%q", got)
+	}
+	if _, present := req.headers["X-Added"]; present {
+		t.Fatal("built request aliases the script header map: a late key appeared")
+	}
+	if string(req.body) != "payload" {
+		t.Fatalf("built request aliases the script body: %q", req.body)
+	}
+	if !req.hasBody {
+		t.Fatal("hasBody must record that the script supplied one")
+	}
+}
+
+// TestModuleNetworkRequestRejectsBeforeReachingAWorker pins that validation now
+// happens where a failure can still become a real JS exception.
+func TestModuleNetworkRequestRejectsBeforeReachingAWorker(t *testing.T) {
+	t.Parallel()
+	for name, options := range map[string]map[string]any{
+		"unknown option": {"url": "https://api.example.net/", "policy": "DIRECT"},
+		"missing url":    {"method": "GET"},
+		"ip literal":     {"url": "https://127.0.0.1/"},
+		"bad method":     {"url": "https://api.example.net/", "method": "BAD METHOD"},
+		"userinfo":       {"url": "https://user:pass@api.example.net/"},
+	} {
+		if _, err := newModuleNetworkRequest(options); err == nil {
+			t.Fatalf("%s: newModuleNetworkRequest accepted %v", name, options)
+		}
+	}
 }

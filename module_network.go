@@ -28,18 +28,6 @@ const (
 	maxConcurrentModuleNetworkCalls = 8
 )
 
-func newModuleNetworkAPI(
-	vm *goja.Runtime,
-	ctx context.Context,
-	proxy ProxyConfig,
-	roots *x509.CertPool,
-	slots chan struct{},
-	loop *asyncLoop,
-) (*goja.Object, func()) {
-	requester := newModuleNetworkRequester(ctx, proxy, roots, slots)
-	return requester.newAPI(vm, loop), requester.Close
-}
-
 // moduleNetworkRequester belongs to one action. It never shares transports
 // across action or configuration snapshots.
 type moduleNetworkRequester struct {
@@ -92,7 +80,11 @@ func (r *moduleNetworkRequester) newAPI(vm *goja.Runtime, loop *asyncLoop) *goja
 		if !ok {
 			panic(vm.NewTypeError("network.request requires an options object"))
 		}
-		response, err := r.request(options)
+		req, err := newModuleNetworkRequest(options)
+		if err != nil {
+			panic(vm.NewGoError(fmt.Errorf("network.request failed: %w", err)))
+		}
+		response, err := r.request(req)
 		if err != nil {
 			panic(vm.NewGoError(fmt.Errorf("network.request failed: %w", err)))
 		}
@@ -121,8 +113,17 @@ func (r *moduleNetworkRequester) newAPI(vm *goja.Runtime, loop *asyncLoop) *goja
 				panic(vm.NewTypeError("network.requestAsync requires an options object"))
 			}
 			promise, resolve, reject := vm.NewPromise()
+			// Built before the worker starts, because the options bag still aliases
+			// the script's own maps. A build failure rejects rather than throws:
+			// that is the contract this entry point exists to keep, so moving
+			// validation onto this goroutine must not change where it surfaces.
+			req, buildErr := newModuleNetworkRequest(options)
+			if buildErr != nil {
+				_ = reject(vm.NewGoError(fmt.Errorf("network.requestAsync failed: %w", buildErr)))
+				return vm.ToValue(promise)
+			}
 			go func() {
-				response, err := r.requestWaiting(options)
+				response, err := r.requestWaiting(req)
 				loop.post(func() error {
 					if err != nil {
 						return reject(vm.NewGoError(fmt.Errorf("network.requestAsync failed: %w", err)))
@@ -194,62 +195,81 @@ func performModuleNetworkRequest(
 ) (moduleNetworkResponse, error) {
 	requester := newModuleNetworkRequester(ctx, proxy, roots, slots)
 	defer requester.Close()
-	return requester.request(options)
+	req, err := newModuleNetworkRequest(options)
+	if err != nil {
+		return moduleNetworkResponse{}, err
+	}
+	return requester.request(req)
 }
 
-func (r *moduleNetworkRequester) request(options map[string]any) (moduleNetworkResponse, error) {
-	return r.performRequest(options, false)
-}
-
-// requestWaiting blocks for a concurrency slot instead of failing fast.
+// moduleNetworkRequest is a request the requester owns outright.
 //
-// Only the asynchronous API uses it. A synchronous caller holds the VM for the
-// whole request, so waiting there would freeze the script and failing
-// immediately is the only safe answer; an awaited request can simply settle
-// later. Both are bounded by the action deadline, which is what actually stops
-// a script from waiting forever.
-func (r *moduleNetworkRequester) requestWaiting(options map[string]any) (moduleNetworkResponse, error) {
-	return r.performRequest(options, true)
+// It exists because the option bag a script hands in is not the requester's to
+// read. goja's Export returns the *same* Go map it wrapped, so a bundle writing
+// `$httpClient.get({headers: $request.headers}, cb)` and then annotating
+// `$request.headers` has the VM goroutine writing the very map a worker
+// goroutine would be reading -- `fatal error: concurrent map read and map
+// write`, which no recover() can catch and which takes the whole sidecar down
+// with every in-flight connection, the SOCKS listeners, the control API, and
+// the engine-log socket.
+//
+// Building this value is therefore part of the call, not part of the round
+// trip: newModuleNetworkRequest runs on the goroutine that owns the VM and
+// copies everything it needs. That also puts every validation error back on the
+// goroutine that can turn it into a real JS exception.
+type moduleNetworkRequest struct {
+	url     *url.URL
+	origin  string
+	target  socksTarget
+	method  string
+	headers http.Header
+	body    []byte
+	hasBody bool
 }
 
-func (r *moduleNetworkRequester) performRequest(options map[string]any, waitForSlot bool) (moduleNetworkResponse, error) {
+// newModuleNetworkRequest must be called on the goroutine that owns the VM.
+//
+// exportedHeaders and exportedBody both allocate fresh storage for every field
+// they accept, so the returned value shares nothing with the script's map.
+func newModuleNetworkRequest(options map[string]any) (moduleNetworkRequest, error) {
 	for key := range options {
 		switch key {
 		case "url", "method", "headers", "body":
 		default:
-			return moduleNetworkResponse{}, fmt.Errorf("unsupported option %q", key)
+			return moduleNetworkRequest{}, fmt.Errorf("unsupported option %q", key)
 		}
 	}
 	rawURL, ok := options["url"].(string)
 	if !ok || rawURL == "" || len(rawURL) > 4096 {
-		return moduleNetworkResponse{}, errors.New("url must be a non-empty string of at most 4096 bytes")
+		return moduleNetworkRequest{}, errors.New("url must be a non-empty string of at most 4096 bytes")
 	}
 	parsed, origin, target, err := parseModuleNetworkRequestURL(rawURL)
 	if err != nil {
-		return moduleNetworkResponse{}, err
+		return moduleNetworkRequest{}, err
 	}
 	method := http.MethodGet
 	if rawMethod, exists := options["method"]; exists {
 		method, ok = rawMethod.(string)
 		if !ok || !validModuleNetworkMethod(method) {
-			return moduleNetworkResponse{}, errors.New("method must be a valid HTTP token")
+			return moduleNetworkRequest{}, errors.New("method must be a valid HTTP token")
 		}
 	}
 	headers := make(http.Header)
 	if rawHeaders, exists := options["headers"]; exists {
 		headers, err = exportedHeaders(rawHeaders)
 		if err != nil {
-			return moduleNetworkResponse{}, err
+			return moduleNetworkRequest{}, err
 		}
 	}
 	body := []byte(nil)
-	if rawBody, exists := options["body"]; exists {
-		body, err = exportedBody(rawBody)
+	_, hasBody := options["body"]
+	if hasBody {
+		body, err = exportedBody(options["body"])
 		if err != nil {
-			return moduleNetworkResponse{}, err
+			return moduleNetworkRequest{}, err
 		}
 		if int64(len(body)) > maxModuleNetworkRequestBody {
-			return moduleNetworkResponse{}, fmt.Errorf("request body exceeds %d bytes", maxModuleNetworkRequestBody)
+			return moduleNetworkRequest{}, fmt.Errorf("request body exceeds %d bytes", maxModuleNetworkRequestBody)
 		}
 	}
 	if _, exists := headers["User-Agent"]; !exists {
@@ -259,8 +279,39 @@ func (r *moduleNetworkRequester) performRequest(options map[string]any, waitForS
 		headers.Set("Accept-Encoding", "identity")
 	}
 	if err := validateModuleNetworkHeaders(headers); err != nil {
-		return moduleNetworkResponse{}, err
+		return moduleNetworkRequest{}, err
 	}
+	return moduleNetworkRequest{
+		url:     parsed,
+		origin:  origin,
+		target:  target,
+		method:  method,
+		headers: headers,
+		body:    body,
+		hasBody: hasBody,
+	}, nil
+}
+
+func (r *moduleNetworkRequester) request(req moduleNetworkRequest) (moduleNetworkResponse, error) {
+	return r.performRequest(req, false)
+}
+
+// requestWaiting blocks for a concurrency slot instead of failing fast.
+//
+// Only a caller that has released the VM uses it. A synchronous caller holds
+// the VM for the whole request, so waiting there would freeze the script and
+// failing immediately is the only safe answer; a caller that has already
+// returned to the script -- an awaited request, or a $httpClient call whose
+// work runs on a worker goroutine -- can simply settle later. Both are bounded
+// by the action deadline, which is what actually stops a script from waiting
+// forever.
+func (r *moduleNetworkRequester) requestWaiting(req moduleNetworkRequest) (moduleNetworkResponse, error) {
+	return r.performRequest(req, true)
+}
+
+func (r *moduleNetworkRequester) performRequest(req moduleNetworkRequest, waitForSlot bool) (moduleNetworkResponse, error) {
+	parsed, origin, target := req.url, req.origin, req.target
+	method, headers, body := req.method, req.headers, req.body
 
 	if waitForSlot {
 		select {
@@ -285,7 +336,7 @@ func (r *moduleNetworkRequester) performRequest(options map[string]any, waitForS
 	}
 	request.Header = headers
 	request.ContentLength = int64(len(body))
-	if _, exists := options["body"]; !exists {
+	if !req.hasBody {
 		request.Body = nil
 		request.ContentLength = 0
 	}

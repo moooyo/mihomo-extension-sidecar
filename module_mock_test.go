@@ -108,3 +108,39 @@ func TestJQProgramSeesAnEmptySettingsObjectWhenThereAreNone(t *testing.T) {
 		t.Fatalf("got %s, want an empty settings object", got)
 	}
 }
+
+// A mock's body is declared in the manifest, not read off the wire, so the
+// action's max_body_bytes -- which bounds the message the action reads -- must
+// not also size it. It did, and MockResponse.validate never cross-checked the
+// two, so a manifest could describe a mock it was then forbidden to serve:
+// every matching request failed with a 502 and no validator had objected.
+//
+// `maxBodyBytes: 1024` beside a larger body is exactly what the catalog ships,
+// copied from a neighbouring action.
+func TestMockBodyIsNotSizedByTheActionBodyLimit(t *testing.T) {
+	t.Parallel()
+	module := Module{ID: "io.example.mock", Enabled: true, CaptureHosts: []string{"api.example.com"}}
+	rule := ScriptRule{
+		ID: "serve-mock", Phase: "response", BodyMode: "none",
+		MaxBodyBytes: 1024, TimeoutMS: 500,
+		Match: ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/"},
+		Mock:  &MockResponse{Status: 200, Body: strings.Repeat("x", 2048)},
+	}
+	request := scriptMessage{URL: "https://api.example.com/v1", Method: http.MethodGet, Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: 200, Headers: make(http.Header)}
+	result, err := newScriptRuntime().execute(context.Background(), Config{}, nil, module, rule, request, &response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateModuleResultBody(module, rule, "response", result); err != nil {
+		t.Fatalf("the mock this manifest declares cannot be served: %v", err)
+	}
+
+	// The mock's own bound still applies, and it is the only one that does.
+	oversize := rule
+	oversize.MaxBodyBytes = 64 << 20
+	oversize.Mock = &MockResponse{Status: 200, Body: strings.Repeat("x", maxMockBodyBytes+1)}
+	if err := oversize.Mock.validate(); err == nil {
+		t.Fatal("a mock body above maxMockBodyBytes was accepted; nothing else bounds it now")
+	}
+}

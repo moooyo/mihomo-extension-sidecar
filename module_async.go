@@ -76,9 +76,14 @@ func (l *asyncLoop) close() {
 }
 
 // wait runs queued callbacks on the calling goroutine until settled reports
-// completion or the action context ends. A callback error is uncatchable —
-// an interrupt or stack overflow — so it stops the loop instead of being
-// reported to the script.
+// completion or the action context ends.
+//
+// A callback error stops the loop and is returned. It is NOT uncatchable, which
+// an earlier comment here claimed: $httpClient callbacks and timer callbacks
+// are invoked as goja Callables, so an ordinary uncaught throw arrives here as
+// a *goja.Exception. Whether that should discard an already-completed result is
+// the caller's decision, not this loop's -- see executeProxyCompat, which uses
+// the projection and reports the throw beside it.
 func (l *asyncLoop) wait(ctx context.Context, settled func() bool) error {
 	for !settled() {
 		select {
@@ -129,7 +134,10 @@ func (l *asyncLoop) installTimerAPI(vm *goja.Runtime) error {
 		id := l.nextID
 		timer := time.AfterFunc(time.Duration(delay)*time.Millisecond, func() {
 			l.post(func() error {
-				l.forgetTimer(id)
+				if !l.claimTimer(id) {
+					// clearTimeout won the race, or the loop is closed.
+					return nil
+				}
 				_, err := callback(goja.Undefined(), extra...)
 				return err
 			})
@@ -163,12 +171,31 @@ func (l *asyncLoop) installTimerAPI(vm *goja.Runtime) error {
 	return vm.Set("clearInterval", clearTimeout)
 }
 
-func (l *asyncLoop) forgetTimer(id int64) {
+// claimTimer takes ownership of a timer's one delivery, reporting whether it
+// was still pending.
+//
+// A fired timer posts its callback and the queue is drained on the VM
+// goroutine, so there is a window between "posted" and "run" in which the
+// script may call clearTimeout. clearTimeout can only Stop() a timer that has
+// already fired -- which returns false -- and delete the map entry, so the
+// queued closure used to run regardless: a cleared timeout still invoked its
+// callback. Checking the map before running is the step the HTML timer spec
+// takes for exactly this reason.
+//
+// It is also where the entry is dropped for a timer that fires and is never
+// drained, which an action that settles first produces. Those used to sit in
+// the map holding one of the 64 per-action slots until close().
+func (l *asyncLoop) claimTimer(id int64) bool {
 	l.mu.Lock()
-	if l.timers != nil {
-		delete(l.timers, id)
+	defer l.mu.Unlock()
+	if l.timers == nil {
+		return false
 	}
-	l.mu.Unlock()
+	if _, pending := l.timers[id]; !pending {
+		return false
+	}
+	delete(l.timers, id)
+	return true
 }
 
 // promiseValue reports whether value is a Promise without deep-exporting it.

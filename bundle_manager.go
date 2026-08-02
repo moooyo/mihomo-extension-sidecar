@@ -374,6 +374,10 @@ type bundleReadback struct {
 	Staged        []string `json:"stagedBundles"`
 	Stored        []string `json:"storedBundles"`
 	Version       string   `json:"version"`
+	// DroppedLogs is non-zero only when a producer in this build emits an event
+	// the log validator refuses. That is a mistake in the code, not a runtime
+	// state, and it is otherwise invisible: Publish reports nothing back.
+	DroppedLogs uint64 `json:"droppedLogs"`
 }
 
 // Readback reports the live state.
@@ -396,6 +400,9 @@ func (m *bundleManager) Readback(version string) bundleReadback {
 		ActiveDigest: m.ActiveDigest(),
 		Staged:       staged,
 		Version:      version,
+	}
+	if m.logs != nil {
+		rb.DroppedLogs = m.logs.Dropped()
 	}
 	if cfg := m.active.Load(); cfg != nil {
 		rb.Generation = m.Generation()
@@ -477,10 +484,19 @@ func (m *bundleManager) publish(level, message string) {
 	if !engineLogPublishingEnabled(m.logs) {
 		return
 	}
+	// "engine" is the source for everything that is not a script's own console
+	// output; config.go's reload notices already use it. "bundle" was not in
+	// normalizeEngineLog's enum, so all eight lifecycle messages -- recover,
+	// stage, commit, pruned, purged, and three warnings -- were discarded on the
+	// way in. This file imports no logging package at all, so they were not
+	// reaching stderr either: they went nowhere, and Publish returns nothing, so
+	// nothing said so.
+	//
+	// Time is overwritten by the hub unconditionally, so setting it here only
+	// ever produced a value that was thrown away.
 	m.logs.Publish(EngineLog{
-		Time:    time.Now().UTC().Format(time.RFC3339Nano),
 		Level:   level,
-		Source:  "bundle",
+		Source:  "engine",
 		Message: message,
 	})
 }

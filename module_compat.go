@@ -310,9 +310,20 @@ func compatHTTPMethod(
 		if err != nil {
 			panic(vm.NewTypeError(err.Error()))
 		}
+		// Built here, on the goroutine that owns the VM. compatRequestOptions
+		// copies no values out of the script's object -- goja's Export hands back
+		// the very map the VM wrapped -- so the worker below must never read it.
+		req, buildErr := newModuleNetworkRequest(options)
 
 		go func() {
-			response, requestErr := requester.request(options)
+			var response moduleNetworkResponse
+			requestErr := buildErr
+			if requestErr == nil {
+				// $httpClient has already returned to the bundle, so the VM is idle
+				// and this can wait for a slot rather than fail fast. The action
+				// deadline still bounds the wait.
+				response, requestErr = requester.requestWaiting(req)
+			}
 			loop.post(func() error {
 				if requestErr != nil {
 					_, callErr := callback(goja.Undefined(), vm.ToValue(requestErr.Error()))
@@ -439,7 +450,32 @@ func (r *scriptRuntime) executeProxyCompat(
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}
 	if err := loop.wait(ctx, entry.settled); err != nil {
-		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+		// A callback error after $done has already been called is not a reason
+		// to discard the projection the bundle produced.
+		//
+		// The loop's comment claims a callback error is uncatchable -- "an
+		// interrupt or stack overflow" -- which is not so: $httpClient callbacks
+		// and timer callbacks are invoked as goja Callables, so any uncaught
+		// throw comes back as a *goja.Exception. A bundle that calls $done and
+		// then throws in the same callback therefore had its completed result
+		// thrown away, and the response phase answered 502 on an exchange the
+		// origin had served correctly.
+		//
+		// The check is here rather than inside wait: wait returning nil on a
+		// settled action would swallow a genuine bundle defect that happens to
+		// arrive after completion. Here, the result exists and is used, and the
+		// defect is still reported.
+		if !entry.completed {
+			return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+		}
+		if engineLogPublishingEnabled(r.logs) {
+			r.logs.Publish(EngineLog{
+				Level: "warn", Source: "engine", Extension: module.ID, Action: rule.ID,
+				Phase: rule.Phase, URL: sanitizeEngineLogURL(request(contextObject)),
+				ScriptDigest: rule.ScriptDigest,
+				Message:      "bundle threw after completing; its result is used anyway: " + err.Error(),
+			})
+		}
 	}
 	if compatProjectionIsEmpty(entry.result) && engineLogPublishingEnabled(r.logs) {
 		r.logs.Publish(EngineLog{

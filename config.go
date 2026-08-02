@@ -853,6 +853,11 @@ func mappedInterceptTarget(cfg Config, host string) string {
 			continue
 		}
 		for _, mapping := range module.HostMappings {
+			// See HostMapping.resolverForm: it names nameservers, not a
+			// destination, so it must not become one here either.
+			if mapping.resolverForm() {
+				continue
+			}
 			if !matchHostPattern(mapping.Pattern, host) {
 				continue
 			}
@@ -1009,6 +1014,31 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if rule.Entry != "" && declarative {
 				return fmt.Errorf("extension %q action %q declares an entry without a script", module.ID, rule.ID)
 			}
+			// Every kind carries a body mode and the two limits, so all three are
+			// checked once, above the branches. They used to sit below two
+			// `continue`s, so five of the seven kinds were bounds-checked by
+			// neither this validator nor the gateway's -- and this validator is
+			// what `5gpn-intercept --check-config` runs, so nothing caught them.
+			if rule.BodyMode != "none" && rule.BodyMode != "text" && rule.BodyMode != "binary" {
+				return fmt.Errorf("extension %q action %q body mode is invalid", module.ID, rule.ID)
+			}
+			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
+				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
+			}
+			// executeRewrite is the one declarative executor that never reads
+			// rule.Phase: on the response phase it still returns a changed URL,
+			// which transformModuleResponse refuses, failing an exchange the
+			// upstream had already answered successfully.
+			if rule.Rewrite != nil && rule.Phase != "request" {
+				return fmt.Errorf("extension %q action %q rewrite requires the request phase", module.ID, rule.ID)
+			}
+			// executeBodyReplace reads the message body without consulting the
+			// body mode. That works only because the response path buffers
+			// unconditionally; declaring it keeps a later streaming path from
+			// turning a replacement into a silent no-op.
+			if rule.ReplaceBody != nil && rule.BodyMode == "none" {
+				return fmt.Errorf("extension %q action %q replace_body requires a text or binary body", module.ID, rule.ID)
+			}
 			if rule.Reject {
 				continue
 			}
@@ -1023,8 +1053,6 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 				}
 			}
 			if rule.Mock != nil || rule.Headers != nil || rule.Rewrite != nil || rule.ReplaceBody != nil {
-				// A rewrite reads the request URL, not a body, so it is the one
-				// kind that may keep bodyMode none while still acting.
 				continue
 			}
 			if rule.JQProgram != "" {
@@ -1033,9 +1061,6 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 				}
 				if _, err := compileJQProgram(rule.JQProgram); err != nil {
 					return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
-				}
-				if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
-					return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
 				}
 				continue
 			}
@@ -1050,14 +1075,8 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if programs != nil {
 				programs[scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}] = program
 			}
-			if rule.BodyMode != "none" && rule.BodyMode != "text" && rule.BodyMode != "binary" {
-				return fmt.Errorf("extension %q action %q body mode is invalid", module.ID, rule.ID)
-			}
 			if rule.Entry != "" && rule.Entry != scriptEntryProxyCompat {
 				return fmt.Errorf("extension %q action %q entry mode is invalid", module.ID, rule.ID)
-			}
-			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
-				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
 			}
 			total += len(rule.ScriptBody)
 		}
@@ -1237,6 +1256,15 @@ func validateActionGate(module Module, rule ScriptRule) error {
 			if !slices.Contains(setting.Options, gate.Equals) {
 				return fmt.Errorf("enabled_when %q compares against %q, which is not one of that setting's options", gate.Key, gate.Equals)
 			}
+		default:
+			// A whitelist, matching the gateway parser. actionGateOpen compares
+			// the setting's rendered text, so a number gate written "1.0" never
+			// matches the value 1 (canonically "1") and a location renders as a
+			// Go map literal no author can predict. Both compile to an action
+			// that is silently skipped, and the comment above actionGateOpen
+			// asserts this case cannot arise -- which is only true once it is
+			// refused here.
+			return fmt.Errorf("enabled_when %q names a %s setting; only boolean and select settings can gate an action", gate.Key, setting.Type)
 		}
 		return nil
 	}
@@ -1438,17 +1466,22 @@ func validateHostMappings(captureHosts []string, mappings []HostMapping) error {
 
 // validHostTarget accepts the three forms of a Loon [Host] target.
 //
-// The sidecar does not act on a mapping — it dials every origin by name through
-// the authenticated egress and lets the gateway's resolver decide the address,
-// which is exactly where a mapping takes effect. But it does validate the
-// document it is handed, so a form it does not recognise is a form the operator
-// cannot deploy: refusing "server:1.1.1.1" here rejected the whole
-// configuration, one layer below anything that could explain why.
+// Two of the three change where the sidecar dials. The address and alias forms
+// replace the SOCKS target for a captured host, which is what a mapping is for.
+// The resolver form does not and cannot: it names nameservers for 5gpn-dns to
+// query, not a destination, and the sidecar skips it everywhere a mapping
+// becomes a dial target (see HostMapping.resolverForm).
 //
-// So the vocabulary is shared even though the behaviour is not. The address
-// form's scope refusal is duplicated rather than delegated for the same reason
-// the gateway has it: a mapping is the one way an extension could aim origin
-// traffic at a private address, and both sides validate what they accept.
+// This comment used to say the sidecar acted on no mapping at all. It does, and
+// believing otherwise is what let the resolver form through to the dialler,
+// where "server:1.1.1.1" was written out as a SOCKS domain name and refused by
+// the egress terminator -- a mapping that was 100% broken while every surface
+// reported the extension healthy.
+//
+// The address form's scope refusal is duplicated rather than delegated, for the
+// same reason the gateway has it: a mapping is the one way an extension could
+// aim origin traffic at a private address, and both sides validate what they
+// accept.
 func validHostTarget(value string) bool {
 	// Before canonicalHost, which splits host:port and would read
 	// "server:1.1.1.1" as the host "server" on the port "1.1.1.1".
@@ -1462,6 +1495,20 @@ func validHostTarget(value string) bool {
 	return !strings.HasPrefix(value, "*.") && value != "localhost" && !strings.HasSuffix(value, ".local") && validHostPattern(value)
 }
 
+// resolverForm reports whether this mapping names nameservers rather than a
+// destination.
+//
+// It is the one form the sidecar must not act on. 5gpn-dns dials those servers
+// itself; the extension's egress never reaches them, and substituting one as a
+// dial target produces a SOCKS request for a domain literally named
+// "server:1.1.1.1" -- which no egress binding names, so it is refused by the
+// interception listener's terminator before mihomo ever resolves anything. The
+// control plane already excludes the form for the same reason when it builds
+// egress selectors.
+func (m HostMapping) resolverForm() bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(m.Target)), hostTargetServerPrefix)
+}
+
 // hostTargetServerPrefix marks the resolver form. Loon's spelling, not ours.
 const hostTargetServerPrefix = "server:"
 
@@ -1470,15 +1517,58 @@ const hostTargetServerPrefix = "server:"
 // function exists to prevent.
 const maxHostTargetServers = 4
 
+// validHostTargetServers checks the resolver form's specs.
+//
+// The count bound alone let anything through, which mattered because the
+// gateway's own check had the same hole from the other direction. Each part's
+// dial address is now range-checked exactly like the address form: these become
+// live resolver groups inside 5gpn-dns, dialled verbatim on every resolution of
+// the mapped name, so a private or link-local address here is the same capability
+// the address form is refused for.
 func validHostTargetServers(rest string) bool {
-	count := 0
+	parts := make([]string, 0, maxHostTargetServers)
 	for _, part := range strings.Split(rest, ",") {
-		if strings.TrimSpace(part) == "" {
-			continue
+		if part = strings.TrimSpace(part); part != "" {
+			parts = append(parts, part)
 		}
-		count++
 	}
-	return count > 0 && count <= maxHostTargetServers
+	if len(parts) == 0 || len(parts) > maxHostTargetServers {
+		return false
+	}
+	for _, part := range parts {
+		dial, ok := hostTargetServerDialAddress(part)
+		if !ok {
+			return false
+		}
+		ip := net.ParseIP(dial)
+		if ip == nil || ip.To4() == nil || !hostTargetAddressAllowed(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// hostTargetServerDialAddress extracts the address a resolver spec dials.
+//
+// Only that address is ever contacted. A DoH endpoint's hostname is never
+// resolved -- the pinned suffix is what gets dialled -- so it is the only part
+// the scope check applies to.
+func hostTargetServerDialAddress(spec string) (string, bool) {
+	dial := spec
+	if at := strings.LastIndex(spec, "@"); at > 0 {
+		dial = spec[at+1:]
+	} else if strings.Contains(spec, "://") {
+		// A URL form with no pinned address would have to be resolved, and this
+		// daemon is what would resolve it.
+		return "", false
+	}
+	if dial == "" {
+		return "", false
+	}
+	if bare, _, err := net.SplitHostPort(dial); err == nil {
+		dial = bare
+	}
+	return dial, true
 }
 
 // hostTargetAddressAllowed refuses every address the gateway must never be

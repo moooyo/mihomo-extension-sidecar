@@ -1008,3 +1008,56 @@ func BenchmarkCompiledCaptureHostMatchers(b *testing.B) {
 		})
 	}
 }
+
+// The per-extension quota exists so one extension cannot consume the whole
+// store. Without it the only real bound was the global 4 MiB, while a single
+// extension could hold 256 keys of 64 KiB -- 16 MiB, four times the store. The
+// first extension to fill it made every other extension's storage.set return
+// false, permanently, with nothing logged anywhere.
+func TestPersistentStorageQuotaIsPerExtension(t *testing.T) {
+	t.Parallel()
+	statePath := filepath.Join(t.TempDir(), "store.json")
+	request := scriptMessage{URL: "https://api.example.com/", Headers: make(http.Header)}
+	response := scriptMessage{URL: request.URL, StatusCode: http.StatusOK, Headers: make(http.Header)}
+
+	greedy := nativeRuntimeModule()
+	greedy.ID = "io.example.greedy"
+	greedy.PersistentStorage = true
+	// 64 KiB per value, well under the per-value bound, repeated until the
+	// per-extension quota refuses one.
+	fill := nativeRuntimeRule(`function transform(context) {
+  const chunk = "x".repeat(65536)
+  let stored = 0
+  for (let i = 0; i < 32; i++) {
+    if (!context.storage.set("k" + i, chunk)) break
+    stored++
+  }
+  return {response: {body: String(stored)}}
+}`, "response", "text")
+	fill.TimeoutMS = 5000
+
+	runtime := newScriptRuntime(statePath)
+	result, err := runtime.execute(context.Background(), Config{}, nil, greedy, fill, request, &response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := string(result.Body)
+	if stored == "32" {
+		t.Fatal("the per-extension quota did not refuse anything; one extension can still consume the whole store")
+	}
+
+	// A second extension must still be able to write.
+	polite := nativeRuntimeModule()
+	polite.ID = "io.example.polite"
+	polite.PersistentStorage = true
+	write := nativeRuntimeRule(`function transform(context) {
+  return {response: {body: String(context.storage.set("token", "value"))}}
+}`, "response", "text")
+	second, err := runtime.execute(context.Background(), Config{}, nil, polite, write, request, &response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second.Body) != "true" {
+		t.Fatalf("a second extension could not write after the first filled its quota (stored %s chunks): %q", stored, second.Body)
+	}
+}

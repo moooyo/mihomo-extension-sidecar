@@ -238,18 +238,35 @@ func executeBodyReplace(rule ScriptRule, module Module, request scriptMessage, r
 // rather than substituting an empty string. For a body replacement that would
 // corrupt the document; for a rewrite target it would build a URL pointing at
 // nothing, or worse, at something else.
+//
+// Substituted text is written out and never scanned again. A setting value is
+// data, not more template: re-scanning it made `{{settings.k}}` expanding to
+// itself a fixed point that spun forever, and an expansion that grew each pass
+// allocate the whole string again every pass until the process died. Neither
+// was reachable by the deadline -- a declarative action is dispatched before
+// the VM exists, so there is no goja.Interrupt to fire and executeRewrite and
+// executeBodyReplace take no context -- and the two body slots this pinned are
+// the whole process's, so two such requests wedged every extension's captured
+// traffic until a restart. An operator could arm it with nothing but a text
+// setting whose value happens to contain its own placeholder.
+//
+// Writing forward also bounds the loop by the template length, so there is no
+// iteration cap to choose or to get wrong.
 func expandSettingsTemplate(template string, valueMap map[string]map[string]string, settings map[string]any) (string, bool) {
-	out := template
+	var out strings.Builder
+	rest := template
 	for {
-		start := strings.Index(out, "{{settings.")
+		start := strings.Index(rest, "{{settings.")
 		if start < 0 {
-			return out, true
+			out.WriteString(rest)
+			return out.String(), true
 		}
-		end := strings.Index(out[start:], "}}")
+		end := strings.Index(rest[start:], "}}")
 		if end < 0 {
-			return out, true
+			out.WriteString(rest)
+			return out.String(), true
 		}
-		key := out[start+len("{{settings.") : start+end]
+		key := rest[start+len("{{settings.") : start+end]
 		raw, exists := settings[key]
 		if !exists {
 			return "", false
@@ -262,7 +279,9 @@ func expandSettingsTemplate(template string, valueMap map[string]map[string]stri
 			}
 			value = substitution
 		}
-		out = out[:start] + value + out[start+end+2:]
+		out.WriteString(rest[:start])
+		out.WriteString(value)
+		rest = rest[start+end+2:]
 	}
 }
 

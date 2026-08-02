@@ -78,9 +78,16 @@ const (
 	maxConsoleLogArguments    = 16
 	maxConsoleArgumentBytes   = 512
 	maxPersistentStoreBytes   = 4 << 20
-	maxPersistentKeys         = 256
-	maxPersistentKeyBytes     = 256
-	maxPersistentValueBytes   = 64 << 10
+	// maxPersistentModuleBytes is the per-extension quota the architecture
+	// document describes. Without it the only real bound was the global one:
+	// 256 keys of 64 KiB is 16 MiB, four times the whole store, so one
+	// extension could fill the budget and every other extension's
+	// storage.set then returned false forever -- a cross-extension denial of
+	// service with no log line anywhere.
+	maxPersistentModuleBytes = 1 << 20
+	maxPersistentKeys        = 256
+	maxPersistentKeyBytes    = 256
+	maxPersistentValueBytes  = 64 << 10
 	// maxPersistentCommitsPerAction bounds durable store commits the way
 	// maxConsoleLogsPerAction and maxModuleNetworkCallsPerAction bound the other
 	// two script-reachable side channels. Storage had size bounds but no call
@@ -218,11 +225,22 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	}
 	var requester *moduleNetworkRequester
 	if module.Network {
-		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, r.networkSlots, loop)
-		defer closeNetwork()
-		contextObject["network"] = network
+		// One requester, and one surface chosen from rule.Entry.
+		//
+		// Both used to be built on every granted action: newModuleNetworkAPI
+		// makes its own requester, and a second bare one was made beside it.
+		// Only ever one of them was reachable. Under the native entry the bare
+		// requester has no consumer at all -- executeProxyCompat is the only
+		// one, and it is not called; under proxy-compat, contextObject is never
+		// handed to the VM (installProxyCompatAPI sets $-prefixed globals
+		// instead), so contextObject["network"] was unreachable JavaScript.
+		// Two requesters means two transport maps and two deferred Closes, and
+		// a reader with no way to tell which one is live.
 		requester = newModuleNetworkRequester(actionCtx, cfg.UpstreamProxy, roots, r.networkSlots)
 		defer requester.Close()
+		if rule.Entry != scriptEntryProxyCompat {
+			contextObject["network"] = requester.newAPI(vm, loop)
+		}
 	}
 
 	stopInterrupt := context.AfterFunc(actionCtx, func() {
@@ -498,9 +516,20 @@ func (r *scriptRuntime) storageObject(vm *goja.Runtime, moduleID string) *goja.O
 		nextModules := clonePersistentModules(current.modules)
 		nextBucket := clonePersistentBucket(bucket)
 		nextBucket[key] = value
+		// The per-extension quota, checked before the write rather than
+		// discovered at marshal time. The global bound is still enforced below;
+		// this is what stops one extension from consuming it.
+		if persistentBucketBytes(nextBucket) > maxPersistentModuleBytes {
+			r.reportStorageQuota(moduleID, "extension storage quota exhausted")
+			return vm.ToValue(false)
+		}
 		nextModules[moduleID] = nextBucket
 		next := &persistentSnapshot{modules: nextModules}
 		if err := r.persistPersistent(next); err != nil {
+			// Previously indistinguishable from every other false this function
+			// returns, and silent besides: an operator whose extension had
+			// filled the store saw writes fail with nothing to explain why.
+			r.reportStorageQuota(moduleID, err.Error())
 			return vm.ToValue(false)
 		}
 		r.persistent.Store(next)
@@ -1368,4 +1397,34 @@ func containsInt(values []int, want int) bool {
 		}
 	}
 	return false
+}
+
+// persistentBucketBytes measures one extension's stored bytes the way the
+// global bound measures the whole store: keys plus values, without the JSON
+// framing, which is close enough to compare against a quota and cheap enough to
+// run on every write.
+func persistentBucketBytes(bucket map[string]string) int {
+	total := 0
+	for key, value := range bucket {
+		total += len(key) + len(value)
+	}
+	return total
+}
+
+// reportStorageQuota makes a refused write visible.
+//
+// storage.set answers false for a bad key, a value that is too long, an
+// exhausted commit budget, a load failure and an exhausted quota alike, so a
+// script cannot tell them apart -- and nothing was logged either. The quota
+// cases are the ones an operator has to act on.
+func (r *scriptRuntime) reportStorageQuota(moduleID, message string) {
+	if !engineLogPublishingEnabled(r.logs) {
+		return
+	}
+	r.logs.Publish(EngineLog{
+		Level:     "warn",
+		Source:    "engine",
+		Extension: moduleID,
+		Message:   "persistent storage write refused: " + message,
+	})
 }

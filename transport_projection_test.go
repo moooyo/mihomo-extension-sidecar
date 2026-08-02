@@ -172,3 +172,63 @@ func assertProjectionExcludesScriptRuntime(t *testing.T, root reflect.Type) {
 	}
 	visit(root)
 }
+
+// The resolver form names nameservers for 5gpn-dns to query. It is not a
+// destination, and the sidecar must not dial it.
+//
+// It used to. Both places that turn a mapping into a SOCKS target took the
+// value verbatim, so "server:1.1.1.1" was written out as a SOCKS domain name --
+// mayBeIPAddress says true because of the colon, netip.ParseAddr then fails, and
+// the default branch encodes the literal string as ATYP=3. No egress binding
+// names it, because the control plane already excludes the form when it builds
+// selectors, so the connection died at the interception listener's terminator.
+//
+// The result was a mapping that was 100% broken while capture rules, the
+// certificate SAN set, the overlay generation and the readiness lease all
+// reported healthy, and the operator saw an egress authorisation refusal rather
+// than anything about DNS.
+func TestResolverFormMappingsAreNotDialled(t *testing.T) {
+	t.Parallel()
+	module := Module{
+		ID: "io.example.resolver", Enabled: true,
+		CaptureHosts: []string{"api.example.com", "alias.example.com"},
+		HostMappings: []HostMapping{
+			{Pattern: "api.example.com", Target: "server:1.1.1.1"},
+			{Pattern: "alias.example.com", Target: "origin.example.net"},
+		},
+	}
+	cfg := Config{Version: configVersion, MITM: MITMSettings{Enabled: true}, Modules: []Module{module}, ExecutionOrder: []string{module.ID}}
+
+	if got := mappedInterceptTarget(cfg, "api.example.com"); got != "api.example.com" {
+		t.Fatalf("mappedInterceptTarget = %q; a resolver spec must never become a dial host", got)
+	}
+	// The alias form is load-bearing and must still substitute.
+	if got := mappedInterceptTarget(cfg, "alias.example.com"); got != "origin.example.net" {
+		t.Fatalf("mappedInterceptTarget = %q, want the alias target", got)
+	}
+
+	projection := newUpstreamTransportProjection(cfg)
+	for _, projected := range projection.targets.modules {
+		for _, mapping := range projected.mappings {
+			if mapping.resolverForm() {
+				t.Fatalf("a resolver-form mapping reached the projection: %+v", mapping)
+			}
+		}
+	}
+}
+
+// A colon cannot appear in a domain name. Anything arriving here with one is a
+// host:port that was never split, a zoned IPv6 literal, or a resolver spec that
+// leaked out of a mapping -- all three used to be encoded as a domain and sent.
+func TestSOCKSAddressRefusesAColonInADomain(t *testing.T) {
+	t.Parallel()
+	if _, err := appendSOCKSAddress(nil, socksTarget{Host: "server:1.1.1.1", Port: 443}); err == nil {
+		t.Fatal("a resolver spec was encoded as a SOCKS domain name")
+	}
+	if _, err := appendSOCKSAddress(nil, socksTarget{Host: "fe80::1%eth0", Port: 443}); err == nil {
+		t.Fatal("a zoned IPv6 literal was encoded as a SOCKS domain name")
+	}
+	if _, err := appendSOCKSAddress(nil, socksTarget{Host: "origin.example.net", Port: 443}); err != nil {
+		t.Fatalf("an ordinary domain was refused: %v", err)
+	}
+}

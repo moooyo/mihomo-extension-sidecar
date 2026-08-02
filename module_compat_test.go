@@ -79,7 +79,11 @@ func runCompatScript(t *testing.T, source string, options compatOptions) (goja.V
 
 func compatFixtureOptions() compatOptions {
 	return compatOptions{
-		request:   map[string]any{"url": "https://api.example.com/v1", "method": "GET", "headers": map[string]any{}},
+		// headers is the shape scriptMessageObject actually publishes -- a Go
+		// map[string]string from flatHeaders, not a map[string]any. goja hands a
+		// bundle the very map, so a fixture that used the wrong type could not
+		// reproduce what a bundle does to the real one.
+		request:   map[string]any{"url": "https://api.example.com/v1", "method": "GET", "headers": flatHeaders(http.Header{})},
 		response:  map[string]any{"status": 200, "headers": map[string]any{}, "body": "ok"},
 		argument:  map[string]any{"mode": "clean", "level": float64(2)},
 		startTime: time.Now(),

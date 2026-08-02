@@ -236,6 +236,15 @@ func appendSOCKSAddress(out []byte, target socksTarget) ([]byte, error) {
 		if len(target.Host) == 0 || len(target.Host) > 255 {
 			return nil, errors.New("SOCKS target domain length is invalid")
 		}
+		// A domain name cannot contain a colon. Anything that reaches here with
+		// one is not a name -- it is a host:port that was never split, an IPv6
+		// literal with a zone that netip refused, or a "server:1.1.1.1" resolver
+		// spec that leaked out of a host mapping. Each of those was encoded as a
+		// domain and sent, which fails at the far end with an error naming the
+		// wrong thing.
+		if strings.ContainsRune(target.Host, ':') {
+			return nil, errors.New("SOCKS target domain contains a colon")
+		}
 		out = append(out, socksAddressDomain, byte(len(target.Host)))
 		out = append(out, target.Host...)
 	}

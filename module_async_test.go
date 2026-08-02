@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dop251/goja"
 )
 
 func asyncRuntimeCall(t *testing.T, source string, timeoutMS int) (scriptResult, error) {
@@ -149,5 +151,44 @@ func TestAsyncLoopDropsCallbacksPostedAfterClose(t *testing.T) {
 	case <-delivered:
 		t.Fatal("a callback posted after close must not run")
 	default:
+	}
+}
+
+// A cleared timeout must not run its callback.
+//
+// A fired timer posts its callback and the queue is drained on the VM
+// goroutine, so there is a window between "posted" and "run". clearTimeout can
+// only Stop() a timer that has already fired -- which returns false -- and
+// delete the map entry, so the queued closure used to run regardless.
+func TestClearTimeoutCancelsAnAlreadyFiredDelivery(t *testing.T) {
+	t.Parallel()
+	loop := newAsyncLoop()
+	defer loop.close()
+	vm := goja.New()
+	if err := loop.installTimerAPI(vm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vm.RunString(`
+let ran = false
+const id = setTimeout(() => { ran = true }, 0)
+`); err != nil {
+		t.Fatal(err)
+	}
+	// Let the timer fire and post before clearing it.
+	time.Sleep(20 * time.Millisecond)
+	if _, err := vm.RunString(`clearTimeout(id)`); err != nil {
+		t.Fatal(err)
+	}
+	settled := false
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	// Drain whatever is queued; the deadline ends the loop.
+	_ = loop.wait(ctx, func() bool { return settled })
+	value, err := vm.RunString(`ran`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.ToBoolean() {
+		t.Fatal("a cleared timeout ran its callback")
 	}
 }

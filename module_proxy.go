@@ -416,7 +416,18 @@ func validateModuleResultBody(module Module, rule ScriptRule, phase string, resu
 	if !result.ChangedBody {
 		return nil
 	}
-	return validateModuleResultBodySize(module.ID, rule.ID, phase, rule.MaxBodyBytes, int64(len(result.Body)))
+	limit := rule.MaxBodyBytes
+	if rule.Mock != nil {
+		// A mock's body is declared in the manifest, not read off the wire, and
+		// MockResponse.validate already sizes it against maxMockBodyBytes. Using
+		// the action's max_body_bytes here too meant a manifest could describe a
+		// mock it is not allowed to serve: `maxBodyBytes: 1024` beside a 2 KiB
+		// body -- an ordinary thing to copy from a neighbouring action -- failed
+		// every matching request with a 502, and no validator objected. The
+		// field bounds the message this action reads, and a mock reads none.
+		limit = maxMockBodyBytes
+	}
+	return validateModuleResultBodySize(module.ID, rule.ID, phase, limit, int64(len(result.Body)))
 }
 
 func validateModuleResultBodySize(moduleID, actionID, phase string, actionLimit, size int64) error {
