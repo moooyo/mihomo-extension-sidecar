@@ -310,9 +310,20 @@ func compatHTTPMethod(
 		if err != nil {
 			panic(vm.NewTypeError(err.Error()))
 		}
+		// Built here, on the goroutine that owns the VM. compatRequestOptions
+		// copies no values out of the script's object -- goja's Export hands back
+		// the very map the VM wrapped -- so the worker below must never read it.
+		req, buildErr := newModuleNetworkRequest(options)
 
 		go func() {
-			response, requestErr := requester.request(options)
+			var response moduleNetworkResponse
+			requestErr := buildErr
+			if requestErr == nil {
+				// $httpClient has already returned to the bundle, so the VM is idle
+				// and this can wait for a slot rather than fail fast. The action
+				// deadline still bounds the wait.
+				response, requestErr = requester.requestWaiting(req)
+			}
 			loop.post(func() error {
 				if requestErr != nil {
 					_, callErr := callback(goja.Undefined(), vm.ToValue(requestErr.Error()))

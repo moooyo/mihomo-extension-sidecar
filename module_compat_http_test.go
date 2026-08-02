@@ -213,3 +213,49 @@ func TestCompatHTTPClientEnforcesThePerActionCallBudget(t *testing.T) {
 		t.Fatalf("call budget produced %q, want the request limit to be enforced", body)
 	}
 }
+
+// TestCompatHTTPClientDoesNotShareTheRequestHeaderMapWithItsWorker drives the
+// exact bundle shape that took the process down: hand $request.headers to
+// $httpClient, then keep annotating the captured request while the call is in
+// flight.
+//
+// goja publishes $request.headers as the Go map flatHeaders built, and Export
+// returns that same map rather than a copy. With the request built on the
+// worker goroutine, these writes raced the worker's read and Go answered with
+// `fatal error: concurrent map read and map write` -- unrecoverable, and fatal
+// for every other connection the sidecar was serving.
+//
+// The annotation loop is ordinary bundle code, not a contrived stress: bundles
+// build an outbound request from the captured one and go on annotating it.
+func TestCompatHTTPClientDoesNotShareTheRequestHeaderMapWithItsWorker(t *testing.T) {
+	t.Parallel()
+	requester, origin := compatHTTPFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Cookie") != "session=abc" {
+			t.Errorf("worker saw Cookie=%q", r.Header.Get("Cookie"))
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+	source := `$request.headers["Cookie"] = "session=abc"
+$httpClient.get({url: "` + origin + `/v1/data", headers: $request.headers}, (error, response, body) => {
+  $done({ body: JSON.stringify({ error: String(error), status: response.status, payload: body }) })
+})
+for (let i = 0; i < 20000; i++) { $request.headers["X-Annotation-" + i] = String(i) }`
+	result, err := runCompatHTTPScript(t, source, requester)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := compatCallbackBody(t, result)
+	if !strings.Contains(body, `"status":200`) || !strings.Contains(body, `"error":"null"`) {
+		t.Fatalf("callback payload = %s", body)
+	}
+	if !strings.Contains(body, `"payload":"ok"`) {
+		t.Fatalf("callback payload = %s", body)
+	}
+}
+
+func compatCallbackBody(t *testing.T, result goja.Value) string {
+	t.Helper()
+	exported, _ := stringAnyMap(result.Export())
+	body, _ := exported["body"].(string)
+	return body
+}
