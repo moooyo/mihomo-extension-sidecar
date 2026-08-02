@@ -608,3 +608,93 @@ func writeBufferedModuleResponse(w http.ResponseWriter, method string, status in
 	publishResponseTrailers(w.Header(), trailers, declared)
 	return nil
 }
+
+// responseRulesStreamable reports whether every matched response rule can run
+// without the body being read.
+//
+// The response path buffers unconditionally, and moduleBodyReadLimit
+// deliberately skips "none" mode rules -- so when every matched rule is "none"
+// the limit falls back to the process-wide 64 MiB and the whole response is
+// held in memory. A single response-phase header edit scoped `^/` therefore
+// turned every large download on that host into a buffered transfer with no
+// first byte until the origin finished, holding one of the two process body
+// slots for the duration, and a hard 502 above 64 MiB on an exchange the
+// upstream had already completed.
+//
+// The subset is deliberately narrow: header edits only. That is the kind the
+// harm above was reported against, and it is the one that provably reads
+// neither the body nor the trailers -- executeHeaderEdits takes the message's
+// header map and returns an edited copy. A script action declaring "none" still
+// receives context.response.trailers, which are only known after the body
+// reaches EOF, so streaming one would silently change what it sees; a mock
+// replaces the body; jq and replaceBody need it.
+func responseRulesStreamable(rules []matchedScriptRule) bool {
+	if len(rules) == 0 {
+		return false
+	}
+	for _, matched := range rules {
+		if matched.Rule.Headers == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// applyStreamingResponseHeaderEdits runs a streamable rule set against the
+// upstream response's own header map, leaving the body untouched.
+//
+// It goes through scripts.execute like every other action, so the per-action
+// deadline, the enabledWhen gate and the completion logging all behave exactly
+// as they do on the buffered path.
+func (p *interceptProxy) applyStreamingResponseHeaderEdits(
+	request *http.Request,
+	response *http.Response,
+	cfg Config,
+	rules []matchedScriptRule,
+) error {
+	requestMessage := scriptMessage{
+		URL: request.URL.String(), Method: request.Method, Headers: wireHeaders(request.Header),
+	}
+	responseMessage := scriptMessage{
+		URL: request.URL.String(), Method: request.Method, StatusCode: response.StatusCode,
+		Headers: wireHeaders(response.Header),
+	}
+	changed := false
+	for _, matched := range rules {
+		result, err := p.scripts.execute(request.Context(), cfg, p.upstreamRoots, matched.Module, matched.Rule, requestMessage, &responseMessage)
+		if err != nil {
+			return err
+		}
+		if result.Abort {
+			panic(http.ErrAbortHandler)
+		}
+		if result.ChangedHeaders {
+			responseMessage.Headers = result.Headers
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	removeHopByHopHeaders(responseMessage.Headers)
+	// Framing stays the upstream's. This path does not touch the body, so the
+	// original Content-Length and Content-Encoding remain correct -- which is
+	// the opposite of the buffered path, where they must be dropped because the
+	// body was decoded.
+	responseMessage.Headers.Del("Content-Length")
+	responseMessage.Headers.Del("Content-Encoding")
+	responseMessage.Headers.Del("Transfer-Encoding")
+	for name := range response.Header {
+		switch http.CanonicalHeaderKey(name) {
+		case "Content-Length", "Content-Encoding", "Transfer-Encoding":
+			continue
+		}
+		response.Header.Del(name)
+	}
+	for name, values := range responseMessage.Headers {
+		for _, value := range values {
+			response.Header.Add(name, value)
+		}
+	}
+	return nil
+}

@@ -2204,3 +2204,93 @@ func TestOversizeUploadIsNotDrainedFromTheWire(t *testing.T) {
 	_ = client.Close()
 	<-served
 }
+
+// A response rule set that never reads the body must not buffer the response.
+//
+// moduleBodyReadLimit deliberately skips "none" mode rules, so when every
+// matched rule is "none" the limit falls back to the process-wide 64 MiB and
+// the whole response is held in memory. One response-phase header edit scoped
+// `^/` therefore buffered every download on that host, delayed its first byte
+// until the origin finished, held one of the two process body slots throughout,
+// and answered 502 above the cap on an exchange that had already succeeded.
+func TestResponseHeaderEditsStreamRatherThanBuffer(t *testing.T) {
+	t.Parallel()
+	headerRule := func(id string) matchedScriptRule {
+		return matchedScriptRule{
+			Module: Module{ID: "io.example.headers", CaptureHosts: []string{"api.example.com"}},
+			Rule: ScriptRule{
+				ID: id, Phase: "response", BodyMode: "none", TimeoutMS: 1000, MaxBodyBytes: 1 << 20,
+				Headers: &HeaderEdits{Set: map[string]string{"X-Edited": "1"}, Remove: []string{"X-Drop"}},
+			},
+		}
+	}
+	other := func(mutate func(*ScriptRule)) matchedScriptRule {
+		m := headerRule("other")
+		m.Rule.Headers = nil
+		mutate(&m.Rule)
+		return m
+	}
+
+	if !responseRulesStreamable([]matchedScriptRule{headerRule("a"), headerRule("b")}) {
+		t.Fatal("a header-only rule set must stream")
+	}
+	if responseRulesStreamable(nil) {
+		t.Fatal("an empty rule set is not a streaming decision")
+	}
+	for name, rule := range map[string]matchedScriptRule{
+		// A script declaring "none" still receives context.response.trailers,
+		// which only exist once the body reached EOF.
+		"script": other(func(r *ScriptRule) { r.ScriptBody = "function transform(){return null}" }),
+		"mock":   other(func(r *ScriptRule) { r.Mock = &MockResponse{Status: 200, Body: "{}"} }),
+		"jq":     other(func(r *ScriptRule) { r.BodyMode = "text"; r.JQProgram = "." }),
+		"replace": other(func(r *ScriptRule) {
+			r.BodyMode = "text"
+			r.ReplaceBody = &BodyReplace{Pattern: "a", To: "b"}
+		}),
+	} {
+		if responseRulesStreamable([]matchedScriptRule{headerRule("a"), rule}) {
+			t.Errorf("a rule set containing a %s action must not stream", name)
+		}
+	}
+}
+
+// The streaming edit rewrites the response's own header map and leaves framing
+// alone -- the opposite of the buffered path, which must drop Content-Length
+// and Content-Encoding because it decoded the body.
+func TestStreamingResponseHeaderEditsPreserveFraming(t *testing.T) {
+	t.Parallel()
+	proxy := &interceptProxy{scripts: newScriptRuntime()}
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1/items", nil)
+	response := &http.Response{
+		StatusCode: 200,
+		Header: http.Header{
+			"Content-Length":   []string{"1048576"},
+			"Content-Encoding": []string{"gzip"},
+			"X-Drop":           []string{"gone"},
+			"X-Keep":           []string{"kept"},
+		},
+	}
+	rules := []matchedScriptRule{{
+		Module: Module{ID: "io.example.headers", CaptureHosts: []string{"api.example.com"}},
+		Rule: ScriptRule{
+			ID: "edit", Phase: "response", BodyMode: "none", TimeoutMS: 1000, MaxBodyBytes: 1 << 20,
+			Headers: &HeaderEdits{Set: map[string]string{"X-Edited": "1"}, Remove: []string{"X-Drop"}},
+		},
+	}}
+	if err := proxy.applyStreamingResponseHeaderEdits(request, response, Config{}, rules); err != nil {
+		t.Fatal(err)
+	}
+	if got := response.Header.Get("X-Edited"); got != "1" {
+		t.Fatalf("the edit did not apply: %v", response.Header)
+	}
+	if response.Header.Get("X-Drop") != "" {
+		t.Fatalf("the removal did not apply: %v", response.Header)
+	}
+	if response.Header.Get("X-Keep") != "kept" {
+		t.Fatalf("an untouched header was lost: %v", response.Header)
+	}
+	// Framing survives, because this path never decoded the body.
+	if response.Header.Get("Content-Length") != "1048576" || response.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("framing was altered on a body this path never read: %v", response.Header)
+	}
+}

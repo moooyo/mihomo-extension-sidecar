@@ -548,6 +548,25 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is a superset of this match: the status code was the only thing it could
 	// not evaluate. Walking every rule again would also re-parse the URL.
 	responseRules := responseRulesForStatus(prepared.responseCandidates, response.StatusCode)
+	// A rule set that never reads the body streams. See responseRulesStreamable:
+	// the buffered path holds the whole response in memory -- up to the global
+	// 64 MiB, because moduleBodyReadLimit skips "none" mode rules -- so one
+	// header edit scoped `^/` used to buffer every download on that host, delay
+	// its first byte until the origin finished, hold a process body slot
+	// throughout, and 502 above the cap on an exchange that had succeeded.
+	if responseRulesStreamable(responseRules) {
+		if err := p.applyStreamingResponseHeaderEdits(outbound, response, cfg, responseRules); err != nil {
+			p.reportTransformFailure("response", responseProbe.URL, err)
+			log.Printf("intercept: response header edit failed host=%s protocol=%s", host, r.Proto)
+			http.Error(w, "interception response transformation failed", http.StatusBadGateway)
+			return
+		}
+		if copyErr := writeStreamingProxyResponse(w, r.ProtoMajor, r.Method, response); copyErr != nil {
+			log.Printf("intercept: upstream response copy failed host=%s protocol=%s: %v", host, r.Proto, copyErr)
+			panic(http.ErrAbortHandler)
+		}
+		return
+	}
 	if !bodySlotHeld && len(responseRules) > 0 {
 		// The upstream leg has already run, so a capacity rejection here cannot be
 		// an "unavailable, try again": the request was made. This is the same
