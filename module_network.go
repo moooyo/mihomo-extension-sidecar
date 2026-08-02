@@ -28,18 +28,6 @@ const (
 	maxConcurrentModuleNetworkCalls = 8
 )
 
-func newModuleNetworkAPI(
-	vm *goja.Runtime,
-	ctx context.Context,
-	proxy ProxyConfig,
-	roots *x509.CertPool,
-	slots chan struct{},
-	loop *asyncLoop,
-) (*goja.Object, func()) {
-	requester := newModuleNetworkRequester(ctx, proxy, roots, slots)
-	return requester.newAPI(vm, loop), requester.Close
-}
-
 // moduleNetworkRequester belongs to one action. It never shares transports
 // across action or configuration snapshots.
 type moduleNetworkRequester struct {

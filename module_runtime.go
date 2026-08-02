@@ -225,11 +225,22 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 	}
 	var requester *moduleNetworkRequester
 	if module.Network {
-		network, closeNetwork := newModuleNetworkAPI(vm, actionCtx, cfg.UpstreamProxy, roots, r.networkSlots, loop)
-		defer closeNetwork()
-		contextObject["network"] = network
+		// One requester, and one surface chosen from rule.Entry.
+		//
+		// Both used to be built on every granted action: newModuleNetworkAPI
+		// makes its own requester, and a second bare one was made beside it.
+		// Only ever one of them was reachable. Under the native entry the bare
+		// requester has no consumer at all -- executeProxyCompat is the only
+		// one, and it is not called; under proxy-compat, contextObject is never
+		// handed to the VM (installProxyCompatAPI sets $-prefixed globals
+		// instead), so contextObject["network"] was unreachable JavaScript.
+		// Two requesters means two transport maps and two deferred Closes, and
+		// a reader with no way to tell which one is live.
 		requester = newModuleNetworkRequester(actionCtx, cfg.UpstreamProxy, roots, r.networkSlots)
 		defer requester.Close()
+		if rule.Entry != scriptEntryProxyCompat {
+			contextObject["network"] = requester.newAPI(vm, loop)
+		}
 	}
 
 	stopInterrupt := context.AfterFunc(actionCtx, func() {
