@@ -1256,6 +1256,15 @@ func validateActionGate(module Module, rule ScriptRule) error {
 			if !slices.Contains(setting.Options, gate.Equals) {
 				return fmt.Errorf("enabled_when %q compares against %q, which is not one of that setting's options", gate.Key, gate.Equals)
 			}
+		default:
+			// A whitelist, matching the gateway parser. actionGateOpen compares
+			// the setting's rendered text, so a number gate written "1.0" never
+			// matches the value 1 (canonically "1") and a location renders as a
+			// Go map literal no author can predict. Both compile to an action
+			// that is silently skipped, and the comment above actionGateOpen
+			// asserts this case cannot arise -- which is only true once it is
+			// refused here.
+			return fmt.Errorf("enabled_when %q names a %s setting; only boolean and select settings can gate an action", gate.Key, setting.Type)
 		}
 		return nil
 	}
