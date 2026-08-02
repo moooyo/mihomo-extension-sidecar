@@ -520,6 +520,15 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if bodySlotHeld && !prepared.bodyBufferRetained {
 		p.releaseBodySlot(bodyReserved)
 		bodySlotHeld = false
+	} else if bodySlotHeld && prepared.bodyBufferBytes < bodyReserved {
+		// The reservation was taken before the length was known, so an
+		// undeclared-length request reserved everything it was allowed to read.
+		// Now the buffer exists: hold what it actually costs for the round trip
+		// rather than the worst case it might have been. Every HTTP/3 request is
+		// undeclared -- quic-go reports ContentLength -1 unconditionally -- so
+		// without this a plain H3 GET pinned the whole budget end to end.
+		p.releaseBodySlot(bodyReserved - prepared.bodyBufferBytes)
+		bodyReserved = prepared.bodyBufferBytes
 	}
 	if prepared.handled {
 		return
@@ -568,18 +577,25 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if !bodySlotHeld && len(responseRules) > 0 {
+	if len(responseRules) > 0 {
 		// The upstream leg has already run, so a capacity rejection here cannot be
 		// an "unavailable, try again": the request was made. This is the same
 		// condition as any other unrunnable response action and takes the same
 		// fail-closed exit rather than passing the raw response through.
-		bodyReserved = moduleBodyReservation(nil, responseRules)
-		if !p.acquireBodySlot(r.Context(), bodyReserved) {
+		//
+		// Reserved separately from the request leg rather than reusing whatever
+		// that leg happened to leave held: when the request buffer was retained
+		// both bodies are resident at once, and the previous form skipped the
+		// response reservation entirely in exactly that case. What is reserved is
+		// what transformModuleResponse will actually read, which is not the widest
+		// declared limit -- see moduleResponseBodyReservation.
+		responseReserved := moduleResponseBodyReservation(response, responseRules)
+		if !p.acquireBodySlot(r.Context(), responseReserved) {
 			p.reportModuleBodyCapacityBusy(r, host, "response", responseProbe)
 			http.Error(w, "interception response transformation failed", http.StatusBadGateway)
 			return
 		}
-		bodySlotHeld = true
+		defer p.releaseBodySlot(responseReserved)
 	}
 
 	transformed, transformErr := p.transformModuleResponse(outbound, response, cfg, responseRules)

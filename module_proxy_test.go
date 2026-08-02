@@ -388,22 +388,32 @@ func TestPrepareModuleRequestAllowsFirstBodylessHTTP3VersionReplay(t *testing.T)
 	incoming.Proto = "HTTP/3.0"
 	incoming.ProtoMajor = 3
 	incoming.ProtoMinor = 0
+	// quic-go's shape, not httptest's. Its H3 server attaches a non-nil Body and
+	// leaves ContentLength at -1 whenever no content-length header was sent, so
+	// a plain GET is indistinguishable from an undeclared upload by those two
+	// fields alone. httptest gives http.NoBody and 0, which is the one shape the
+	// production server never produces -- and the shape that hid this.
+	incoming.Body = io.NopCloser(bytes.NewReader(nil))
+	incoming.ContentLength = -1
 	probe := moduleRequestProbe(incoming, "api.example.com")
-	if requestNeedsModuleBodyReservation(incoming, nil) {
-		t.Fatal("bodyless HTTP/3 request unexpectedly reserved body capacity")
-	}
 
 	outbound, handled, retained, err := prepareForTest(&interceptProxy{scripts: newScriptRuntime()},
 		httptest.NewRecorder(), incoming, Config{}, probe, nil,
 	)
-	if err != nil || handled || retained {
-		t.Fatalf("handled=%v retained=%v err=%v", handled, retained, err)
+	if err != nil || handled {
+		t.Fatalf("handled=%v err=%v", handled, err)
+	}
+	// Nothing was buffered, so nothing may be held. Retaining a zero-byte buffer
+	// kept the whole undeclared-length reservation for the round trip, which on
+	// HTTP/3 is every request.
+	if retained {
+		t.Fatal("a bodyless HTTP/3 request retained its body reservation; H3 interception serializes to one request at a time")
 	}
 	if err := resetHTTP3RequestBodyForReplay(outbound); err != nil {
 		t.Fatal(err)
 	}
-	if outbound.Body != nil {
-		t.Fatalf("bodyless replay retained body %T", outbound.Body)
+	if outbound.Body != nil && outbound.ContentLength != 0 {
+		t.Fatalf("bodyless replay retained a non-empty body %T", outbound.Body)
 	}
 }
 
@@ -2360,4 +2370,58 @@ func TestModuleBodyReservationTracksTheDeclaredLength(t *testing.T) {
 	if got := moduleBodyReservation(bodyless, []matchedScriptRule{none}); got != 1<<20 {
 		t.Fatalf("bodyless reservation = %d, want the action's own limit", got)
 	}
+}
+
+// The response leg reserves what it will read, not what the actions declare.
+//
+// moduleBodyReadLimit deliberately skips bodyMode "none" rules and falls back to
+// the process-wide cap when none remains, so an all-"none" response rule set
+// reads up to 64 MiB. The reservation was the widest declared limit across those
+// same rules, which can be 1 KiB -- a 65536x under-count against a budget whose
+// whole purpose is bounding resident body memory.
+func TestResponseReservationCoversWhatWillActuallyBeRead(t *testing.T) {
+	t.Parallel()
+	noneRules := []matchedScriptRule{{Rule: ScriptRule{BodyMode: "none", MaxBodyBytes: 1024}}}
+
+	reserved := moduleResponseBodyReservation(nil, noneRules)
+	readLimit := moduleBodyReadLimit(noneRules)
+	if reserved < readLimit {
+		t.Fatalf("reserved %d for a read bounded at %d; the budget stops bounding what it exists to bound", reserved, readLimit)
+	}
+
+	// A declared upstream length is the honest figure and must not be inflated
+	// to the global cap.
+	declared := &http.Response{ContentLength: 4096}
+	if got := moduleResponseBodyReservation(declared, noneRules); got != 4096 {
+		t.Fatalf("declared-length reservation = %d, want 4096", got)
+	}
+
+	// The widest declared limit stays a floor: an action may synthesise a body it
+	// never read, up to its own limit.
+	synthesising := []matchedScriptRule{{Rule: ScriptRule{BodyMode: "text", MaxBodyBytes: 8 << 20}}}
+	if got := moduleResponseBodyReservation(&http.Response{ContentLength: 16}, synthesising); got != 8<<20 {
+		t.Fatalf("synthesis floor = %d, want %d", got, int64(8<<20))
+	}
+}
+
+// Both bodies are resident at once when the request leg retained its buffer, so
+// the response leg has to reserve on its own account. Reserving only when the
+// request leg had released meant the pairing that costs the most memory was the
+// one case that charged nothing for the response.
+func TestResponseLegReservesEvenWhenTheRequestBufferIsStillHeld(t *testing.T) {
+	t.Parallel()
+	budget := newModuleBodyBudget(maxModuleBodyBudgetBytes)
+	if !budget.acquire(context.Background(), maxModuleBodyBudgetBytes, moduleBodySlotWait) {
+		t.Fatal("could not take the whole budget")
+	}
+	// With the budget fully consumed, a response-leg reservation of any size must
+	// be refused rather than admitted for free.
+	if budget.acquire(context.Background(), 1, moduleBodySlotWait) {
+		t.Fatal("a reservation was admitted against an exhausted budget")
+	}
+	budget.release(maxModuleBodyBudgetBytes)
+	if !budget.acquire(context.Background(), 1, moduleBodySlotWait) {
+		t.Fatal("the budget did not recover after release")
+	}
+	budget.release(1)
 }
