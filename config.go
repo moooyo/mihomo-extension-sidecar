@@ -1076,6 +1076,12 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if len(rule.ScriptBody) == 0 || len(rule.ScriptBody) > 1<<20 || rule.ScriptDigest != digestText(rule.ScriptBody) {
 				return fmt.Errorf("extension %q action %q script snapshot is invalid", module.ID, rule.ID)
 			}
+			// Before goja sees it: the parser's recursion is bounded by the
+			// goroutine stack, and exceeding that is a fatal runtime throw rather
+			// than an error this function could return.
+			if err := checkScriptNesting(rule.ScriptBody); err != nil {
+				return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
+			}
 			filename := firstNonEmpty(rule.ScriptURL, "extension:"+module.ID+"/"+rule.ID)
 			program, err := goja.Compile(filename, rule.ScriptBody, false)
 			if err != nil {
