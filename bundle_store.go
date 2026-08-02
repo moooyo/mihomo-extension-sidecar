@@ -53,6 +53,15 @@ var (
 	// errBundleSchema means the artifact was written by a schema this build
 	// does not understand.
 	errBundleSchema = errors.New("unsupported bundle schema")
+	// errBundleInvalidDocument is a document this build cannot accept.
+	//
+	// It is terminal, and saying so is the whole point: a decode failure used to
+	// be an unclassified error, so the control API reported "internal"/500 and the
+	// gateway's classifier read that as retryable. Repeating a document this build
+	// will never accept is not a recovery, it is a loop -- and the message that
+	// would have explained it ("config version must be 6") was already in the
+	// response body, filed under the wrong category.
+	errBundleInvalidDocument = errors.New("bundle document is not acceptable to this build")
 )
 
 type bundleState string

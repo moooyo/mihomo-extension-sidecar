@@ -947,6 +947,15 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if !validHostPattern(host) {
 				return fmt.Errorf("extension %q has an invalid capture host %q", module.ID, host)
 			}
+			// Canonical, symmetrically with the gateway. The matcher stores this
+			// pattern verbatim and looks it up with canonicalHost(request host),
+			// so a mixed-case entry never matches anything and the extension
+			// silently intercepts nothing; activeHostPatterns meanwhile lowercases
+			// when deciding what to MITM, so the same host would be intercepted
+			// and then owned by no module.
+			if host != canonicalHost(host) {
+				return fmt.Errorf("extension %q capture host %q is not canonical", module.ID, host)
+			}
 		}
 		if module.CaptureDNS != "trust" && module.CaptureDNS != "china" {
 			return fmt.Errorf("extension %q capture_dns must be trust or china", module.ID)
