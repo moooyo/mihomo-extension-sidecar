@@ -636,16 +636,15 @@ func TestUpstreamDialBoundsTheSOCKSHandshake(t *testing.T) {
 // file, already waits with a timer and a ctx.Done. This one now matches it.
 func TestAcquireBodySlotWaitsForABurstToClear(t *testing.T) {
 	t.Parallel()
-	proxy := &interceptProxy{bodySlots: make(chan struct{}, 2)}
-	proxy.bodySlots <- struct{}{}
-	proxy.bodySlots <- struct{}{}
+	proxy := &interceptProxy{bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes)}
+	proxy.bodyBudget.acquire(context.Background(), maxModuleBodyBudgetBytes, time.Second)
 
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		proxy.releaseBodySlot()
+		proxy.releaseBodySlot(maxModuleBodyBudgetBytes)
 	}()
 	started := time.Now()
-	if !proxy.acquireBodySlot(context.Background()) {
+	if !proxy.acquireBodySlot(context.Background(), maxModuleBodyBudgetBytes) {
 		t.Fatal("a slot that freed well inside the wait window was still refused")
 	}
 	if elapsed := time.Since(started); elapsed < 20*time.Millisecond {
@@ -656,7 +655,7 @@ func TestAcquireBodySlotWaitsForABurstToClear(t *testing.T) {
 	// for the whole request, so waiting longer would only pin this connection
 	// behind a shortage it cannot outlast.
 	started = time.Now()
-	if proxy.acquireBodySlot(context.Background()) {
+	if proxy.acquireBodySlot(context.Background(), maxModuleBodyBudgetBytes) {
 		t.Fatal("a full pool admitted a third reservation")
 	}
 	if elapsed := time.Since(started); elapsed > moduleBodySlotWait*4 {
@@ -667,7 +666,7 @@ func TestAcquireBodySlotWaitsForABurstToClear(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	started = time.Now()
-	if proxy.acquireBodySlot(canceled) {
+	if proxy.acquireBodySlot(canceled, maxModuleBodyBudgetBytes) {
 		t.Fatal("a canceled request took a reservation")
 	}
 	if elapsed := time.Since(started); elapsed > moduleBodySlotWait/2 {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -514,7 +515,7 @@ func TestServeHTTPRejectsKnownOversizeBeforeSOCKSDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	proxy := &interceptProxy{
-		config: store, scripts: newScriptRuntime(), bodySlots: make(chan struct{}, 2),
+		config: store, scripts: newScriptRuntime(), bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes),
 	}
 	requestBody := &trackingReadCloser{reader: bytes.NewReader([]byte("must-not-be-read"))}
 	request := httptest.NewRequest(http.MethodPost, "http://api.example.com/upload", nil)
@@ -644,10 +645,10 @@ func TestServeHTTPFullBodySlotsRejectBodylessActionBeforeStorageSideEffect(t *te
 		t.Fatal(err)
 	}
 	proxy := &interceptProxy{
-		config: store, scripts: newScriptRuntime(statePath), bodySlots: make(chan struct{}, 2),
+		config: store, scripts: newScriptRuntime(statePath), bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes),
 	}
-	proxy.bodySlots <- struct{}{}
-	proxy.bodySlots <- struct{}{}
+	// Exhaust the whole budget so the next reservation has to wait.
+	proxy.bodyBudget.acquire(context.Background(), maxModuleBodyBudgetBytes, time.Second)
 	recorder := httptest.NewRecorder()
 	proxy.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil))
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "body capacity is busy") {
@@ -2161,7 +2162,7 @@ func TestOversizeUploadIsNotDrainedFromTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy := &interceptProxy{config: store, scripts: newScriptRuntime(), bodySlots: make(chan struct{}, 2)}
+	proxy := &interceptProxy{config: store, scripts: newScriptRuntime(), bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes)}
 
 	client, server := net.Pipe()
 	counting := &countingConn{Conn: server}
@@ -2292,5 +2293,71 @@ func TestStreamingResponseHeaderEditsPreserveFraming(t *testing.T) {
 	// Framing survives, because this path never decoded the body.
 	if response.Header.Get("Content-Length") != "1048576" || response.Header.Get("Content-Encoding") != "gzip" {
 		t.Fatalf("framing was altered on a body this path never read: %v", response.Header)
+	}
+}
+
+// Admission counts bytes, not streams.
+//
+// A two-slot semaphore made a bodyMode "none" proxy-compat action and a 16 MiB
+// buffered response cost the same unit of a capacity of two -- and the slot is
+// taken before the whole action loop runs and held across the upstream round
+// trip whenever the body buffer is retained, so "two streams" meant "two
+// extensions executing anywhere in this process". One slow extension starved
+// every other extension's captured traffic.
+func TestModuleBodyBudgetAdmitsByBytes(t *testing.T) {
+	t.Parallel()
+	budget := newModuleBodyBudget(1 << 20)
+	ctx := context.Background()
+
+	// Many small reservations coexist, where a capacity of two admitted two.
+	for i := 0; i < 16; i++ {
+		if !budget.acquire(ctx, 1<<10, time.Second) {
+			t.Fatalf("reservation %d of 16 KiB against a 1 MiB budget was refused", i)
+		}
+	}
+	// And the budget is still a budget.
+	if budget.acquire(ctx, 1<<20, 20*time.Millisecond) {
+		t.Fatal("a reservation past the limit was admitted")
+	}
+	for i := 0; i < 16; i++ {
+		budget.release(1 << 10)
+	}
+	if !budget.acquire(ctx, 1<<20, time.Second) {
+		t.Fatal("the whole budget was not free again after every release")
+	}
+	budget.release(1 << 20)
+
+	// A reservation larger than the whole budget is clamped rather than refused:
+	// the caller is already bounded by maxModuleHTTPBody, and refusing would
+	// make the largest legal body permanently unservable.
+	if !budget.acquire(ctx, 1<<30, time.Second) {
+		t.Fatal("an over-large reservation was refused instead of clamped")
+	}
+	budget.release(1 << 30)
+}
+
+// moduleBodyReservation asks for what the request is expected to hold resident,
+// not for a fixed unit.
+func TestModuleBodyReservationTracksTheDeclaredLength(t *testing.T) {
+	t.Parallel()
+	rule := matchedScriptRule{
+		Module: Module{ID: "io.example.reserve"},
+		Rule:   ScriptRule{ID: "a", Phase: "request", BodyMode: "text", MaxBodyBytes: 8 << 20, TimeoutMS: 1000},
+	}
+	small := httptest.NewRequest(http.MethodPost, "https://api.example.com/v1", strings.NewReader("x"))
+	small.ContentLength = 1024
+	if got := moduleBodyReservation(small, []matchedScriptRule{rule}); got != 8<<20 {
+		t.Fatalf("reservation = %d; an action may hand back up to its own limit", got)
+	}
+
+	// A bodyless request whose action can still synthesise a response reserves
+	// what that action is allowed to produce.
+	none := matchedScriptRule{
+		Module: rule.Module,
+		Rule:   ScriptRule{ID: "b", Phase: "request", BodyMode: "none", MaxBodyBytes: 1 << 20, TimeoutMS: 1000},
+	}
+	bodyless := httptest.NewRequest(http.MethodGet, "https://api.example.com/v1", nil)
+	if got := moduleBodyReservation(bodyless, []matchedScriptRule{none}); got != 1<<20 {
+		t.Fatalf("bodyless reservation = %d, want the action's own limit", got)
 	}
 }

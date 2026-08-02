@@ -30,8 +30,8 @@ type interceptProxy struct {
 	// logs is set by setEngineLogPublisher alongside scripts.logs and
 	// tlsErrors.logs. A proxy assembled field by field in a test has to set it
 	// too, or its capacity and transformation reports go nowhere.
-	logs      engineLogPublisher
-	bodySlots chan struct{}
+	logs       engineLogPublisher
+	bodyBudget *moduleBodyBudget
 
 	transportMu sync.Mutex
 	upstream    *upstreamTransportGeneration
@@ -182,7 +182,7 @@ func newInterceptProxy(config *configStore, certificates *certificateStore, stat
 	scripts := newScriptRuntime(filepath.Join(stateDir, interceptStoreFile))
 	return &interceptProxy{
 		config: config, certificates: certificates, scripts: scripts, tlsErrors: newTLSHandshakeErrorReporter(),
-		bodySlots: make(chan struct{}, 2), http3Slots: make(chan struct{}, maxUpstreamHTTP3Connections),
+		bodyBudget: newModuleBodyBudget(maxModuleBodyBudgetBytes), http3Slots: make(chan struct{}, maxUpstreamHTTP3Connections),
 	}
 }
 
@@ -505,19 +505,20 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestProbe := moduleRequestProbe(r, host)
 	requestRules := matchingScriptRules(cfg, "request", requestProbe)
 	bodySlotHeld := requestNeedsModuleBodyReservation(r, requestRules)
-	if bodySlotHeld && !p.acquireBodySlot(r.Context()) {
+	bodyReserved := moduleBodyReservation(r, requestRules)
+	if bodySlotHeld && !p.acquireBodySlot(r.Context(), bodyReserved) {
 		p.reportModuleBodyCapacityBusy(r, host, "request", requestProbe)
 		http.Error(w, "interception body capacity is busy", http.StatusServiceUnavailable)
 		return
 	}
 	defer func() {
 		if bodySlotHeld {
-			p.releaseBodySlot()
+			p.releaseBodySlot(bodyReserved)
 		}
 	}()
 	prepared, prepareErr := p.prepareModuleRequestWithRules(w, r, cfg, requestProbe, requestRules)
 	if bodySlotHeld && !prepared.bodyBufferRetained {
-		p.releaseBodySlot()
+		p.releaseBodySlot(bodyReserved)
 		bodySlotHeld = false
 	}
 	if prepared.handled {
@@ -572,7 +573,8 @@ func (p *interceptProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// an "unavailable, try again": the request was made. This is the same
 		// condition as any other unrunnable response action and takes the same
 		// fail-closed exit rather than passing the raw response through.
-		if !p.acquireBodySlot(r.Context()) {
+		bodyReserved = moduleBodyReservation(nil, responseRules)
+		if !p.acquireBodySlot(r.Context(), bodyReserved) {
 			p.reportModuleBodyCapacityBusy(r, host, "response", responseProbe)
 			http.Error(w, "interception response transformation failed", http.StatusBadGateway)
 			return
@@ -653,27 +655,11 @@ func (w *transferDeadlineWriter) Write(payload []byte) (int, error) {
 	return written, nil
 }
 
-func (p *interceptProxy) acquireBodySlot(ctx context.Context) bool {
-	if p.bodySlots == nil {
+func (p *interceptProxy) acquireBodySlot(ctx context.Context, bytes int64) bool {
+	if p.bodyBudget == nil {
 		return true
 	}
-	select {
-	case p.bodySlots <- struct{}{}:
-		return true
-	default:
-	}
-	// Bounded wait rather than an immediate refusal, the same shape
-	// acquireHTTP3ConnectionSlot uses for the other capacity limit in this file.
-	timer := time.NewTimer(moduleBodySlotWait)
-	defer timer.Stop()
-	select {
-	case p.bodySlots <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return false
-	}
+	return p.bodyBudget.acquire(ctx, bytes, moduleBodySlotWait)
 }
 
 // A capacity rejection is the one handler exit that is not a fault, which is what
@@ -704,9 +690,9 @@ func (p *interceptProxy) reportTransformFailure(phase, requestURL string, err er
 	})
 }
 
-func (p *interceptProxy) releaseBodySlot() {
-	if p.bodySlots != nil {
-		<-p.bodySlots
+func (p *interceptProxy) releaseBodySlot(bytes int64) {
+	if p.bodyBudget != nil {
+		p.bodyBudget.release(bytes)
 	}
 }
 

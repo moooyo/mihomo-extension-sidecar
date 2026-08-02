@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 )
 
 const maxModuleHTTPBody = int64(64 << 20)
@@ -697,4 +699,135 @@ func (p *interceptProxy) applyStreamingResponseHeaderEdits(
 		}
 	}
 	return nil
+}
+
+// maxModuleBodyBudgetBytes is the resident body memory the whole process will
+// commit to interception at once.
+//
+// It replaces a two-slot semaphore. That semaphore counted streams, not bytes,
+// so a bodyMode "none" proxy-compat action and a 16 MiB buffered response cost
+// the same unit of a capacity of two -- and because the slot is taken before
+// prepareModuleRequestWithRules runs the whole action loop, and held across the
+// upstream round trip whenever the body buffer is retained, "two streams"
+// meant "two extensions executing anywhere in this process". One slow
+// extension starved every other extension's captured traffic, request-phase
+// with a hard 503 and response-phase with a 502 on an exchange the origin had
+// already answered.
+//
+// 64 MiB is the same figure as maxModuleHTTPBody: one maximal body may be in
+// flight, or many ordinary ones. The invariant the count was there for survives
+// -- admission is still taken before any action can produce a side effect,
+// including for a bodyless request, because a script can synthesise a body from
+// nothing.
+const maxModuleBodyBudgetBytes = int64(maxModuleHTTPBody)
+
+// moduleBodyBudget admits resident body bytes rather than streams.
+type moduleBodyBudget struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	limit int64
+	used  int64
+}
+
+func newModuleBodyBudget(limit int64) *moduleBodyBudget {
+	budget := &moduleBodyBudget{limit: limit}
+	budget.cond = sync.NewCond(&budget.mu)
+	return budget
+}
+
+// acquire reserves want bytes, waiting up to wait for room.
+//
+// A reservation larger than the whole budget is clamped to it rather than
+// refused: the caller has already been bounded by maxModuleHTTPBody, and
+// refusing outright would make the largest legal body permanently unservable.
+func (b *moduleBodyBudget) acquire(ctx context.Context, want int64, wait time.Duration) bool {
+	if b == nil {
+		return true
+	}
+	if want < 0 {
+		want = 0
+	}
+	if want > b.limit {
+		want = b.limit
+	}
+	deadline := time.Now().Add(wait)
+
+	// A waiter that stops waiting has to be woken, and sync.Cond has no
+	// deadline. One timer per waiter broadcasts at the deadline; ctx
+	// cancellation is folded in the same way.
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { b.cond.Broadcast() })
+	defer stop()
+	timer := time.AfterFunc(wait, func() {
+		close(done)
+		b.cond.Broadcast()
+	})
+	defer timer.Stop()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for b.used+want > b.limit {
+		select {
+		case <-done:
+			return false
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		b.cond.Wait()
+	}
+	b.used += want
+	return true
+}
+
+func (b *moduleBodyBudget) release(want int64) {
+	if b == nil {
+		return
+	}
+	if want < 0 {
+		want = 0
+	}
+	if want > b.limit {
+		want = b.limit
+	}
+	b.mu.Lock()
+	b.used -= want
+	if b.used < 0 {
+		b.used = 0
+	}
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
+
+// moduleBodyReservation is what a request is expected to hold resident.
+//
+// A declared length is the honest figure, capped by what the matched rules are
+// allowed to read. An undeclared one, and a bodyless request whose actions may
+// still synthesise a response, reserve the largest limit any matched rule
+// carries -- which is what those actions are permitted to hand back.
+func moduleBodyReservation(incoming *http.Request, rules []matchedScriptRule) int64 {
+	limit := moduleBodyReadLimit(rules)
+	widest := int64(0)
+	for _, matched := range rules {
+		if matched.Rule.MaxBodyBytes > widest {
+			widest = matched.Rule.MaxBodyBytes
+		}
+	}
+	if widest == 0 {
+		widest = limit
+	}
+	if incoming != nil && incoming.ContentLength > 0 {
+		declared := incoming.ContentLength
+		if declared > limit {
+			declared = limit
+		}
+		if declared > widest {
+			return declared
+		}
+		return widest
+	}
+	return widest
 }
