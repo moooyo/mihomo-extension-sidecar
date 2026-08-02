@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Every declarative kind driven through execute(), which is what a matched
@@ -221,5 +222,69 @@ func TestRewriteTargetDeclinesAnUnresolvableSetting(t *testing.T) {
 	}
 	if result.ChangedURL || result.Synthetic {
 		t.Fatalf("result = %+v, want the request untouched", result)
+	}
+}
+
+// TestSettingsTemplateTreatsAValueAsDataNotTemplate pins the loop bound.
+//
+// A substituted value used to be rescanned from the start of the rebuilt
+// string, so a value containing its own placeholder was a fixed point and the
+// expansion never terminated. Nothing above could stop it: a declarative action
+// is dispatched before the VM is created, so there is no goja.Interrupt, and
+// neither executeRewrite nor executeBodyReplace takes a context. Two such
+// requests held both of the process's body slots and every extension's captured
+// traffic failed until a restart.
+//
+// The subtests are the three reachable shapes. The second needs no manifest
+// cooperation at all -- an operator can arm it from a text setting.
+func TestSettingsTemplateTreatsAValueAsDataNotTemplate(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		template string
+		valueMap map[string]map[string]string
+		settings map[string]any
+		want     string
+	}{
+		"self-referencing valueMap entry": {
+			template: "{{settings.region}}",
+			valueMap: map[string]map[string]string{"region": {"US": "{{settings.region}}"}},
+			settings: map[string]any{"region": "US"},
+			want:     "{{settings.region}}",
+		},
+		"operator sets a value that looks like its own placeholder": {
+			template: "https://api.example.net/{{settings.token}}",
+			settings: map[string]any{"token": "{{settings.token}}"},
+			want:     "https://api.example.net/{{settings.token}}",
+		},
+		"substitution that grows each pass": {
+			template: "{{settings.k}}",
+			settings: map[string]any{"k": "{{settings.k}}{{settings.k}}"},
+			want:     "{{settings.k}}{{settings.k}}",
+		},
+		"ordinary expansion still resolves every placeholder": {
+			template: "https://{{settings.host}}/v1/{{settings.path}}?k={{settings.host}}",
+			settings: map[string]any{"host": "origin.example.net", "path": "items"},
+			want:     "https://origin.example.net/v1/items?k=origin.example.net",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan string, 1)
+			go func() {
+				out, ok := expandSettingsTemplate(tc.template, tc.valueMap, tc.settings)
+				if !ok {
+					done <- "<declined>"
+					return
+				}
+				done <- out
+			}()
+			select {
+			case got := <-done:
+				if got != tc.want {
+					t.Fatalf("expanded %q, want %q", got, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("expansion did not terminate")
+			}
+		})
 	}
 }
