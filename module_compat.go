@@ -450,7 +450,32 @@ func (r *scriptRuntime) executeProxyCompat(
 		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
 	}
 	if err := loop.wait(ctx, entry.settled); err != nil {
-		return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+		// A callback error after $done has already been called is not a reason
+		// to discard the projection the bundle produced.
+		//
+		// The loop's comment claims a callback error is uncatchable -- "an
+		// interrupt or stack overflow" -- which is not so: $httpClient callbacks
+		// and timer callbacks are invoked as goja Callables, so any uncaught
+		// throw comes back as a *goja.Exception. A bundle that calls $done and
+		// then throws in the same callback therefore had its completed result
+		// thrown away, and the response phase answered 502 on an exchange the
+		// origin had served correctly.
+		//
+		// The check is here rather than inside wait: wait returning nil on a
+		// settled action would swallow a genuine bundle defect that happens to
+		// arrive after completion. Here, the result exists and is used, and the
+		// defect is still reported.
+		if !entry.completed {
+			return scriptResult{}, fmt.Errorf("extension %s action %s: %w", module.ID, rule.ID, err)
+		}
+		if engineLogPublishingEnabled(r.logs) {
+			r.logs.Publish(EngineLog{
+				Level: "warn", Source: "engine", Extension: module.ID, Action: rule.ID,
+				Phase: rule.Phase, URL: sanitizeEngineLogURL(request(contextObject)),
+				ScriptDigest: rule.ScriptDigest,
+				Message:      "bundle threw after completing; its result is used anyway: " + err.Error(),
+			})
+		}
 	}
 	if compatProjectionIsEmpty(entry.result) && engineLogPublishingEnabled(r.logs) {
 		r.logs.Publish(EngineLog{
