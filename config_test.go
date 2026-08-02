@@ -1239,3 +1239,80 @@ func TestSelectGateCompilesExactlyTheMatchingActionSet(t *testing.T) {
 		t.Fatalf("Cloud mode compiled %v", got)
 	}
 }
+
+// Every action kind carries a body mode and the two limits, and all three used
+// to be checked below two `continue`s -- one for reject, one for the other four
+// declarative kinds. Five of the seven kinds were therefore bounds-checked by
+// neither this validator nor the gateway's, and this validator is what
+// `5gpn-intercept --check-config` runs, so nothing in the publication path
+// caught any of it.
+func TestDeclarativeActionsAreBoundsCheckedLikeScripts(t *testing.T) {
+	t.Parallel()
+	base := func(mutate func(*ScriptRule)) Config {
+		cfg := validNativeConfig()
+		rule := ScriptRule{
+			ID: "declarative", Phase: "response", BodyMode: "none",
+			MaxBodyBytes: 1 << 20, TimeoutMS: 1000,
+			Match: ActionMatch{Hosts: []string{"api.example.com"}, Schemes: []string{"https"}, PathRegex: "^/"},
+			Mock:  &MockResponse{Status: 200, Body: "{}"},
+		}
+		mutate(&rule)
+		cfg.Modules[0].Scripts = []ScriptRule{rule}
+		return cfg
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*ScriptRule)
+		reason string
+	}{
+		"max_body_bytes below the floor": {
+			mutate: func(r *ScriptRule) { r.MaxBodyBytes = -1 },
+			reason: "a negative limit made every result body oversize, so the action failed unconditionally",
+		},
+		"max_body_bytes above the ceiling": {
+			mutate: func(r *ScriptRule) { r.MaxBodyBytes = 1 << 30 },
+			reason: "the process-wide bound is 64 MiB",
+		},
+		"timeout below the floor": {
+			mutate: func(r *ScriptRule) { r.TimeoutMS = 5 },
+			reason: "the gateway rejects it for jq and scripts; the same number has to mean the same thing here",
+		},
+		"body mode outside the enum": {
+			mutate: func(r *ScriptRule) { r.BodyMode = "banana" },
+			reason: "an unknown mode is not none, so it also defeats the streaming fast path",
+		},
+		"rewrite on the response phase": {
+			mutate: func(r *ScriptRule) {
+				r.Mock = nil
+				r.Rewrite = &URLRewrite{Pattern: `^https://api\.example\.com/(.*)$`, To: "https://api.example.com/v2/$1"}
+			},
+			reason: "executeRewrite never reads the phase, so it returns a URL change the response path refuses with a 502 on an exchange the upstream already answered",
+		},
+		"replace_body without a body": {
+			mutate: func(r *ScriptRule) {
+				r.Mock = nil
+				r.BodyMode = "none"
+				r.ReplaceBody = &BodyReplace{Pattern: "a", To: "b"}
+			},
+			reason: "it reads the body without consulting the mode, and only works because the response path buffers unconditionally",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := base(tc.mutate).validate(nil); err == nil {
+				t.Fatalf("accepted: %s", tc.reason)
+			}
+		})
+	}
+
+	// The shape the catalog actually ships must keep working: a mock whose
+	// declared max_body_bytes is smaller than its own body. The limit bounds the
+	// message an action reads, and a mock reads none.
+	t.Run("mock body larger than the action limit", func(t *testing.T) {
+		cfg := base(func(r *ScriptRule) {
+			r.MaxBodyBytes = 1024
+			r.Mock = &MockResponse{Status: 200, Body: strings.Repeat("x", 2048)}
+		})
+		if err := cfg.validate(nil); err != nil {
+			t.Fatalf("refused a manifest the catalog ships: %v", err)
+		}
+	})
+}

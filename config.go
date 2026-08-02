@@ -1009,6 +1009,31 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if rule.Entry != "" && declarative {
 				return fmt.Errorf("extension %q action %q declares an entry without a script", module.ID, rule.ID)
 			}
+			// Every kind carries a body mode and the two limits, so all three are
+			// checked once, above the branches. They used to sit below two
+			// `continue`s, so five of the seven kinds were bounds-checked by
+			// neither this validator nor the gateway's -- and this validator is
+			// what `5gpn-intercept --check-config` runs, so nothing caught them.
+			if rule.BodyMode != "none" && rule.BodyMode != "text" && rule.BodyMode != "binary" {
+				return fmt.Errorf("extension %q action %q body mode is invalid", module.ID, rule.ID)
+			}
+			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
+				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
+			}
+			// executeRewrite is the one declarative executor that never reads
+			// rule.Phase: on the response phase it still returns a changed URL,
+			// which transformModuleResponse refuses, failing an exchange the
+			// upstream had already answered successfully.
+			if rule.Rewrite != nil && rule.Phase != "request" {
+				return fmt.Errorf("extension %q action %q rewrite requires the request phase", module.ID, rule.ID)
+			}
+			// executeBodyReplace reads the message body without consulting the
+			// body mode. That works only because the response path buffers
+			// unconditionally; declaring it keeps a later streaming path from
+			// turning a replacement into a silent no-op.
+			if rule.ReplaceBody != nil && rule.BodyMode == "none" {
+				return fmt.Errorf("extension %q action %q replace_body requires a text or binary body", module.ID, rule.ID)
+			}
 			if rule.Reject {
 				continue
 			}
@@ -1023,8 +1048,6 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 				}
 			}
 			if rule.Mock != nil || rule.Headers != nil || rule.Rewrite != nil || rule.ReplaceBody != nil {
-				// A rewrite reads the request URL, not a body, so it is the one
-				// kind that may keep bodyMode none while still acting.
 				continue
 			}
 			if rule.JQProgram != "" {
@@ -1033,9 +1056,6 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 				}
 				if _, err := compileJQProgram(rule.JQProgram); err != nil {
 					return fmt.Errorf("extension %q action %q %w", module.ID, rule.ID, err)
-				}
-				if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
-					return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
 				}
 				continue
 			}
@@ -1050,14 +1070,8 @@ func validateModulesWithPrograms(modules []Module, programs map[scriptProgramKey
 			if programs != nil {
 				programs[scriptProgramKey{moduleID: module.ID, actionID: rule.ID, digest: rule.ScriptDigest}] = program
 			}
-			if rule.BodyMode != "none" && rule.BodyMode != "text" && rule.BodyMode != "binary" {
-				return fmt.Errorf("extension %q action %q body mode is invalid", module.ID, rule.ID)
-			}
 			if rule.Entry != "" && rule.Entry != scriptEntryProxyCompat {
 				return fmt.Errorf("extension %q action %q entry mode is invalid", module.ID, rule.ID)
-			}
-			if rule.TimeoutMS < 50 || rule.TimeoutMS > 30000 || rule.MaxBodyBytes < 1024 || rule.MaxBodyBytes > 64<<20 {
-				return fmt.Errorf("extension %q action %q limits are invalid", module.ID, rule.ID)
 			}
 			total += len(rule.ScriptBody)
 		}
