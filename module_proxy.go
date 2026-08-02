@@ -165,8 +165,22 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	bodyChanged := false
 
 	for _, matched := range requestRules {
-		if err := authorizeModuleRequestActionURL(cfg, matched.Module, message.URL); err != nil {
-			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
+		// Only once the URL has actually moved.
+		//
+		// On the probe's own URL this check is provably redundant: the rule only
+		// matched because compiledModule.hosts matched the same canonicalised
+		// host that moduleCapturesHost looks up, and the URL parsed upstream
+		// already, so neither half can fail. It costs three url.Parse calls, a
+		// net.ParseIP, a validHostTarget and two canonicalHost passes -- 741ns
+		// and 9 allocations measured -- for an answer that cannot be no.
+		//
+		// After a rewrite it is load-bearing and still runs: that is the case it
+		// was written for, and the rewrite itself is separately authorised by
+		// authorizeModuleRequestURLRewriteConfig below.
+		if urlChanged {
+			if err := authorizeModuleRequestActionURL(cfg, matched.Module, message.URL); err != nil {
+				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
+			}
 		}
 		if matched.Rule.BodyMode != "none" && int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
 			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
@@ -264,7 +278,7 @@ func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg C
 	if err != nil {
 		return nil, nil, err
 	}
-	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
+	responseCandidates := matchingScriptRulesParsed(cfg, "response", message, false, parsedURL)
 	outbound := outboundModuleRequest(incoming, parsedURL, forwardRequestHeaders(message, responseCandidates))
 	if requestHasBodySection(incoming) {
 		outbound.Body = &requestTrailerBody{
@@ -326,7 +340,7 @@ func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMes
 	if err != nil {
 		return nil, nil, err
 	}
-	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
+	responseCandidates := matchingScriptRulesParsed(cfg, "response", message, false, parsedURL)
 	outbound := outboundModuleRequest(incoming, parsedURL, forwardRequestHeaders(message, responseCandidates))
 	outbound.Body = io.NopCloser(bytes.NewReader(message.Body))
 	outbound.ContentLength = int64(len(message.Body))
