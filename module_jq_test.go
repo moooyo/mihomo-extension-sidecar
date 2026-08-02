@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -452,4 +453,43 @@ func mustCompileJQ(t *testing.T, program string) *gojq.Code {
 		t.Fatal(err)
 	}
 	return code
+}
+
+// TestExternalMaintainedJQProgramsCompile is the publication gate for jq.
+//
+// jq is the catalogue's main action kind -- 24 of its actions across two
+// extensions -- and nothing before publication ever parsed one. validate.mjs
+// lints the text with regular expressions but never compiles it,
+// generate-marketplace.mjs only checks it is a string, and both gateway
+// validators check the length and the body mode and stop there. gojq exists
+// only here, so this is the only place a publication gate can compile one.
+//
+// The catalogue extracts the expressions to JSON rather than this test reading
+// its YAML: this module has a fixed dependency list and yaml is not on it.
+func TestExternalMaintainedJQProgramsCompile(t *testing.T) {
+	path := strings.TrimSpace(os.Getenv("FIVEGPN_JQ_PROGRAMS"))
+	if path == "" {
+		t.Skip("FIVEGPN_JQ_PROGRAMS is unset; this gate runs from the catalogue's CI")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var programs []struct {
+		Extension string `json:"extension"`
+		Action    string `json:"action"`
+		Program   string `json:"program"`
+	}
+	if err := json.Unmarshal(body, &programs); err != nil {
+		t.Fatal(err)
+	}
+	if len(programs) == 0 {
+		t.Fatal("no jq programs were extracted; the gate would pass vacuously")
+	}
+	for _, entry := range programs {
+		if _, err := compileJQProgram(entry.Program); err != nil {
+			t.Errorf("%s/%s does not compile: %v", entry.Extension, entry.Action, err)
+		}
+	}
+	t.Logf("compiled %d jq programs", len(programs))
 }
