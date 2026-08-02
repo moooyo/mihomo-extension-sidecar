@@ -853,6 +853,11 @@ func mappedInterceptTarget(cfg Config, host string) string {
 			continue
 		}
 		for _, mapping := range module.HostMappings {
+			// See HostMapping.resolverForm: it names nameservers, not a
+			// destination, so it must not become one here either.
+			if mapping.resolverForm() {
+				continue
+			}
 			if !matchHostPattern(mapping.Pattern, host) {
 				continue
 			}
@@ -1452,17 +1457,22 @@ func validateHostMappings(captureHosts []string, mappings []HostMapping) error {
 
 // validHostTarget accepts the three forms of a Loon [Host] target.
 //
-// The sidecar does not act on a mapping — it dials every origin by name through
-// the authenticated egress and lets the gateway's resolver decide the address,
-// which is exactly where a mapping takes effect. But it does validate the
-// document it is handed, so a form it does not recognise is a form the operator
-// cannot deploy: refusing "server:1.1.1.1" here rejected the whole
-// configuration, one layer below anything that could explain why.
+// Two of the three change where the sidecar dials. The address and alias forms
+// replace the SOCKS target for a captured host, which is what a mapping is for.
+// The resolver form does not and cannot: it names nameservers for 5gpn-dns to
+// query, not a destination, and the sidecar skips it everywhere a mapping
+// becomes a dial target (see HostMapping.resolverForm).
 //
-// So the vocabulary is shared even though the behaviour is not. The address
-// form's scope refusal is duplicated rather than delegated for the same reason
-// the gateway has it: a mapping is the one way an extension could aim origin
-// traffic at a private address, and both sides validate what they accept.
+// This comment used to say the sidecar acted on no mapping at all. It does, and
+// believing otherwise is what let the resolver form through to the dialler,
+// where "server:1.1.1.1" was written out as a SOCKS domain name and refused by
+// the egress terminator -- a mapping that was 100% broken while every surface
+// reported the extension healthy.
+//
+// The address form's scope refusal is duplicated rather than delegated, for the
+// same reason the gateway has it: a mapping is the one way an extension could
+// aim origin traffic at a private address, and both sides validate what they
+// accept.
 func validHostTarget(value string) bool {
 	// Before canonicalHost, which splits host:port and would read
 	// "server:1.1.1.1" as the host "server" on the port "1.1.1.1".
@@ -1476,6 +1486,20 @@ func validHostTarget(value string) bool {
 	return !strings.HasPrefix(value, "*.") && value != "localhost" && !strings.HasSuffix(value, ".local") && validHostPattern(value)
 }
 
+// resolverForm reports whether this mapping names nameservers rather than a
+// destination.
+//
+// It is the one form the sidecar must not act on. 5gpn-dns dials those servers
+// itself; the extension's egress never reaches them, and substituting one as a
+// dial target produces a SOCKS request for a domain literally named
+// "server:1.1.1.1" -- which no egress binding names, so it is refused by the
+// interception listener's terminator before mihomo ever resolves anything. The
+// control plane already excludes the form for the same reason when it builds
+// egress selectors.
+func (m HostMapping) resolverForm() bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(m.Target)), hostTargetServerPrefix)
+}
+
 // hostTargetServerPrefix marks the resolver form. Loon's spelling, not ours.
 const hostTargetServerPrefix = "server:"
 
@@ -1484,15 +1508,58 @@ const hostTargetServerPrefix = "server:"
 // function exists to prevent.
 const maxHostTargetServers = 4
 
+// validHostTargetServers checks the resolver form's specs.
+//
+// The count bound alone let anything through, which mattered because the
+// gateway's own check had the same hole from the other direction. Each part's
+// dial address is now range-checked exactly like the address form: these become
+// live resolver groups inside 5gpn-dns, dialled verbatim on every resolution of
+// the mapped name, so a private or link-local address here is the same capability
+// the address form is refused for.
 func validHostTargetServers(rest string) bool {
-	count := 0
+	parts := make([]string, 0, maxHostTargetServers)
 	for _, part := range strings.Split(rest, ",") {
-		if strings.TrimSpace(part) == "" {
-			continue
+		if part = strings.TrimSpace(part); part != "" {
+			parts = append(parts, part)
 		}
-		count++
 	}
-	return count > 0 && count <= maxHostTargetServers
+	if len(parts) == 0 || len(parts) > maxHostTargetServers {
+		return false
+	}
+	for _, part := range parts {
+		dial, ok := hostTargetServerDialAddress(part)
+		if !ok {
+			return false
+		}
+		ip := net.ParseIP(dial)
+		if ip == nil || ip.To4() == nil || !hostTargetAddressAllowed(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+// hostTargetServerDialAddress extracts the address a resolver spec dials.
+//
+// Only that address is ever contacted. A DoH endpoint's hostname is never
+// resolved -- the pinned suffix is what gets dialled -- so it is the only part
+// the scope check applies to.
+func hostTargetServerDialAddress(spec string) (string, bool) {
+	dial := spec
+	if at := strings.LastIndex(spec, "@"); at > 0 {
+		dial = spec[at+1:]
+	} else if strings.Contains(spec, "://") {
+		// A URL form with no pinned address would have to be resolved, and this
+		// daemon is what would resolve it.
+		return "", false
+	}
+	if dial == "" {
+		return "", false
+	}
+	if bare, _, err := net.SplitHostPort(dial); err == nil {
+		dial = bare
+	}
+	return dial, true
 }
 
 // hostTargetAddressAllowed refuses every address the gateway must never be

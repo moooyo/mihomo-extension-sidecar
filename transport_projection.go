@@ -82,6 +82,13 @@ func newUpstreamTransportProjection(cfg Config) upstreamTransportProjection {
 			writeFingerprintField(digest, host)
 		}
 		for _, mapping := range module.HostMappings {
+			// The resolver form names nameservers for 5gpn-dns, not a
+			// destination. Keeping it out of the projection is what stops it
+			// reaching the dialler, and it covers the HTTP/3 path with the
+			// same edit.
+			if mapping.resolverForm() {
+				continue
+			}
 			projectedModule.mappings = append(projectedModule.mappings, HostMapping{
 				Pattern: mapping.Pattern,
 				Target:  mapping.Target,
