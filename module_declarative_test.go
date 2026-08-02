@@ -288,3 +288,49 @@ func TestSettingsTemplateTreatsAValueAsDataNotTemplate(t *testing.T) {
 		})
 	}
 }
+
+// A substituted value reaches Go's regexp expansion, where `$` names a capture
+// group. An operator-typed setting is ordinary data and must not acquire that
+// meaning: `p$ssw0rd` expanded to `p` and `$100` to nothing at all, silently,
+// because both name groups the pattern does not have.
+//
+// The author's own `$1` keeps working, which is the half that makes this an
+// escape of the value rather than of the template.
+func TestASettingValueContainingADollarIsSubstitutedLiterally(t *testing.T) {
+	t.Parallel()
+	t.Run("body replacement keeps the value byte for byte", func(t *testing.T) {
+		t.Parallel()
+		rule := baseRule("request")
+		rule.settings = map[string]any{"tier": "p$ssw0rd$100"}
+		rule.ReplaceBody = &BodyReplace{
+			Pattern: `"other":"[^"]*"`,
+			To:      `"other":"{{settings.tier}}"`,
+		}
+		result, err := runDeclarative(t, rule, declarativeRequest(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `{"storefrontId":"000000-00,00","other":"p$ssw0rd$100"}`
+		if string(result.Body) != want {
+			t.Fatalf("body = %s, want %s", result.Body, want)
+		}
+	})
+
+	t.Run("a rewrite target keeps the value and still expands the author's capture", func(t *testing.T) {
+		t.Parallel()
+		rule := baseRule("request")
+		rule.settings = map[string]any{"Endpoint": "host$1.example.net"}
+		rule.Rewrite = &URLRewrite{
+			Pattern: `^https://api\.example\.com/v1/(.*)$`,
+			To:      "https://{{settings.Endpoint}}/v1/$1",
+		}
+		result, err := runDeclarative(t, rule, declarativeRequest(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const want = "https://host$1.example.net/v1/thing?a=1"
+		if !result.ChangedURL || result.URL != want {
+			t.Fatalf("target = %q, want %q", result.URL, want)
+		}
+	})
+}
