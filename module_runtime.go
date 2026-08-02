@@ -155,6 +155,35 @@ func (r *scriptRuntime) execute(ctx context.Context, cfg Config, roots *x509.Cer
 		}
 		r.logs.Publish(event)
 	}()
+	// goja's Export and Get panic with *Exception when a script's accessor
+	// throws, and with *InterruptedError when the action deadline lands inside a
+	// getter Export is already running. Every value a script hands back is
+	// consumed after the JS call returned -- parseNativeScriptResult,
+	// parseCompatScriptResult, promiseValue, promiseRejectionError -- where no
+	// goja frame is left to catch them. Without this the panic reached net/http,
+	// which tore the exchange down and logged a goroutine stack (through the TLS
+	// error writer, as a handshake error for the captured host) instead of
+	// failing the action and writing the engine-log line the operator is told to
+	// read.
+	//
+	// One defer rather than Runtime.Try at each of the six call sites: Try
+	// catches only catchable exceptions, so it would leave the deadline case
+	// crashing. Anything else re-panics, so http.ErrAbortHandler and genuine Go
+	// runtime failures keep propagating.
+	//
+	// Declared after the engine-log defer so it runs first and that defer
+	// observes the error. result is reset because a nested getter can throw
+	// after the patch is partly applied.
+	defer func() {
+		switch recovered := recover().(type) {
+		case nil:
+		case *goja.Exception, *goja.InterruptedError, *goja.StackOverflowError:
+			result = scriptResult{}
+			err = fmt.Errorf("extension %s action %s: %v", module.ID, rule.ID, recovered)
+		default:
+			panic(recovered)
+		}
+	}()
 	// Six declarative kinds, none of which reaches the JavaScript runtime: no
 	// VM, no event loop, no proxy-client globals. Dispatch happens before the
 	// script is compiled, because a declarative action carries none.
