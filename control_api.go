@@ -141,6 +141,13 @@ func (c *controlServer) writeError(w http.ResponseWriter, err error) {
 		code, status = "wrong_state", http.StatusConflict
 	case errors.Is(err, errBundleSchema):
 		code, status = "unsupported_schema", http.StatusBadRequest
+	case errors.Is(err, errBundleInvalidDocument):
+		// 400, and a code of its own. As an unclassified error this reported
+		// "internal"/500, which the gateway's classifier reads as retryable --
+		// so a document this build will never accept was retried instead of
+		// surfaced, with the message that explains it sitting in the body under
+		// the wrong category.
+		code, status = "invalid_document", http.StatusBadRequest
 	case errors.Is(err, errBundleCorrupt):
 		code, status = "store_corrupt", http.StatusInternalServerError
 	}

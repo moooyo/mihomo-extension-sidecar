@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 )
 
 const maxModuleHTTPBody = int64(64 << 20)
@@ -165,8 +167,22 @@ func (p *interceptProxy) prepareModuleRequestWithRules(
 	bodyChanged := false
 
 	for _, matched := range requestRules {
-		if err := authorizeModuleRequestActionURL(cfg, matched.Module, message.URL); err != nil {
-			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
+		// Only once the URL has actually moved.
+		//
+		// On the probe's own URL this check is provably redundant: the rule only
+		// matched because compiledModule.hosts matched the same canonicalised
+		// host that moduleCapturesHost looks up, and the URL parsed upstream
+		// already, so neither half can fail. It costs three url.Parse calls, a
+		// net.ParseIP, a validHostTarget and two canonicalHost passes -- 741ns
+		// and 9 allocations measured -- for an answer that cannot be no.
+		//
+		// After a rewrite it is load-bearing and still runs: that is the case it
+		// was written for, and the rewrite itself is separately authorised by
+		// authorizeModuleRequestURLRewriteConfig below.
+		if urlChanged {
+			if err := authorizeModuleRequestActionURL(cfg, matched.Module, message.URL); err != nil {
+				return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request action: %w", matched.Module.ID, err)
+			}
 		}
 		if matched.Rule.BodyMode != "none" && int64(len(message.Body)) > matched.Rule.MaxBodyBytes {
 			return preparedModuleRequest{bodyBufferRetained: bodyBufferRetained}, fmt.Errorf("extension %s request body exceeds action limit", matched.Module.ID)
@@ -264,7 +280,7 @@ func streamingModuleRequest(w http.ResponseWriter, incoming *http.Request, cfg C
 	if err != nil {
 		return nil, nil, err
 	}
-	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
+	responseCandidates := matchingScriptRulesParsed(cfg, "response", message, false, parsedURL)
 	outbound := outboundModuleRequest(incoming, parsedURL, forwardRequestHeaders(message, responseCandidates))
 	if requestHasBodySection(incoming) {
 		outbound.Body = &requestTrailerBody{
@@ -326,7 +342,7 @@ func bufferedModuleRequest(incoming *http.Request, cfg Config, message scriptMes
 	if err != nil {
 		return nil, nil, err
 	}
-	responseCandidates := matchingScriptRulesWithStatus(cfg, "response", message, false)
+	responseCandidates := matchingScriptRulesParsed(cfg, "response", message, false, parsedURL)
 	outbound := outboundModuleRequest(incoming, parsedURL, forwardRequestHeaders(message, responseCandidates))
 	outbound.Body = io.NopCloser(bytes.NewReader(message.Body))
 	outbound.ContentLength = int64(len(message.Body))
@@ -593,4 +609,225 @@ func writeBufferedModuleResponse(w http.ResponseWriter, method string, status in
 	}
 	publishResponseTrailers(w.Header(), trailers, declared)
 	return nil
+}
+
+// responseRulesStreamable reports whether every matched response rule can run
+// without the body being read.
+//
+// The response path buffers unconditionally, and moduleBodyReadLimit
+// deliberately skips "none" mode rules -- so when every matched rule is "none"
+// the limit falls back to the process-wide 64 MiB and the whole response is
+// held in memory. A single response-phase header edit scoped `^/` therefore
+// turned every large download on that host into a buffered transfer with no
+// first byte until the origin finished, holding one of the two process body
+// slots for the duration, and a hard 502 above 64 MiB on an exchange the
+// upstream had already completed.
+//
+// The subset is deliberately narrow: header edits only. That is the kind the
+// harm above was reported against, and it is the one that provably reads
+// neither the body nor the trailers -- executeHeaderEdits takes the message's
+// header map and returns an edited copy. A script action declaring "none" still
+// receives context.response.trailers, which are only known after the body
+// reaches EOF, so streaming one would silently change what it sees; a mock
+// replaces the body; jq and replaceBody need it.
+func responseRulesStreamable(rules []matchedScriptRule) bool {
+	if len(rules) == 0 {
+		return false
+	}
+	for _, matched := range rules {
+		if matched.Rule.Headers == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// applyStreamingResponseHeaderEdits runs a streamable rule set against the
+// upstream response's own header map, leaving the body untouched.
+//
+// It goes through scripts.execute like every other action, so the per-action
+// deadline, the enabledWhen gate and the completion logging all behave exactly
+// as they do on the buffered path.
+func (p *interceptProxy) applyStreamingResponseHeaderEdits(
+	request *http.Request,
+	response *http.Response,
+	cfg Config,
+	rules []matchedScriptRule,
+) error {
+	requestMessage := scriptMessage{
+		URL: request.URL.String(), Method: request.Method, Headers: wireHeaders(request.Header),
+	}
+	responseMessage := scriptMessage{
+		URL: request.URL.String(), Method: request.Method, StatusCode: response.StatusCode,
+		Headers: wireHeaders(response.Header),
+	}
+	changed := false
+	for _, matched := range rules {
+		result, err := p.scripts.execute(request.Context(), cfg, p.upstreamRoots, matched.Module, matched.Rule, requestMessage, &responseMessage)
+		if err != nil {
+			return err
+		}
+		if result.Abort {
+			panic(http.ErrAbortHandler)
+		}
+		if result.ChangedHeaders {
+			responseMessage.Headers = result.Headers
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	removeHopByHopHeaders(responseMessage.Headers)
+	// Framing stays the upstream's. This path does not touch the body, so the
+	// original Content-Length and Content-Encoding remain correct -- which is
+	// the opposite of the buffered path, where they must be dropped because the
+	// body was decoded.
+	responseMessage.Headers.Del("Content-Length")
+	responseMessage.Headers.Del("Content-Encoding")
+	responseMessage.Headers.Del("Transfer-Encoding")
+	for name := range response.Header {
+		switch http.CanonicalHeaderKey(name) {
+		case "Content-Length", "Content-Encoding", "Transfer-Encoding":
+			continue
+		}
+		response.Header.Del(name)
+	}
+	for name, values := range responseMessage.Headers {
+		for _, value := range values {
+			response.Header.Add(name, value)
+		}
+	}
+	return nil
+}
+
+// maxModuleBodyBudgetBytes is the resident body memory the whole process will
+// commit to interception at once.
+//
+// It replaces a two-slot semaphore. That semaphore counted streams, not bytes,
+// so a bodyMode "none" proxy-compat action and a 16 MiB buffered response cost
+// the same unit of a capacity of two -- and because the slot is taken before
+// prepareModuleRequestWithRules runs the whole action loop, and held across the
+// upstream round trip whenever the body buffer is retained, "two streams"
+// meant "two extensions executing anywhere in this process". One slow
+// extension starved every other extension's captured traffic, request-phase
+// with a hard 503 and response-phase with a 502 on an exchange the origin had
+// already answered.
+//
+// 64 MiB is the same figure as maxModuleHTTPBody: one maximal body may be in
+// flight, or many ordinary ones. The invariant the count was there for survives
+// -- admission is still taken before any action can produce a side effect,
+// including for a bodyless request, because a script can synthesise a body from
+// nothing.
+const maxModuleBodyBudgetBytes = int64(maxModuleHTTPBody)
+
+// moduleBodyBudget admits resident body bytes rather than streams.
+type moduleBodyBudget struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	limit int64
+	used  int64
+}
+
+func newModuleBodyBudget(limit int64) *moduleBodyBudget {
+	budget := &moduleBodyBudget{limit: limit}
+	budget.cond = sync.NewCond(&budget.mu)
+	return budget
+}
+
+// acquire reserves want bytes, waiting up to wait for room.
+//
+// A reservation larger than the whole budget is clamped to it rather than
+// refused: the caller has already been bounded by maxModuleHTTPBody, and
+// refusing outright would make the largest legal body permanently unservable.
+func (b *moduleBodyBudget) acquire(ctx context.Context, want int64, wait time.Duration) bool {
+	if b == nil {
+		return true
+	}
+	if want < 0 {
+		want = 0
+	}
+	if want > b.limit {
+		want = b.limit
+	}
+	deadline := time.Now().Add(wait)
+
+	// A waiter that stops waiting has to be woken, and sync.Cond has no
+	// deadline. One timer per waiter broadcasts at the deadline; ctx
+	// cancellation is folded in the same way.
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { b.cond.Broadcast() })
+	defer stop()
+	timer := time.AfterFunc(wait, func() {
+		close(done)
+		b.cond.Broadcast()
+	})
+	defer timer.Stop()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for b.used+want > b.limit {
+		select {
+		case <-done:
+			return false
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		b.cond.Wait()
+	}
+	b.used += want
+	return true
+}
+
+func (b *moduleBodyBudget) release(want int64) {
+	if b == nil {
+		return
+	}
+	if want < 0 {
+		want = 0
+	}
+	if want > b.limit {
+		want = b.limit
+	}
+	b.mu.Lock()
+	b.used -= want
+	if b.used < 0 {
+		b.used = 0
+	}
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
+
+// moduleBodyReservation is what a request is expected to hold resident.
+//
+// A declared length is the honest figure, capped by what the matched rules are
+// allowed to read. An undeclared one, and a bodyless request whose actions may
+// still synthesise a response, reserve the largest limit any matched rule
+// carries -- which is what those actions are permitted to hand back.
+func moduleBodyReservation(incoming *http.Request, rules []matchedScriptRule) int64 {
+	limit := moduleBodyReadLimit(rules)
+	widest := int64(0)
+	for _, matched := range rules {
+		if matched.Rule.MaxBodyBytes > widest {
+			widest = matched.Rule.MaxBodyBytes
+		}
+	}
+	if widest == 0 {
+		widest = limit
+	}
+	if incoming != nil && incoming.ContentLength > 0 {
+		declared := incoming.ContentLength
+		if declared > limit {
+			declared = limit
+		}
+		if declared > widest {
+			return declared
+		}
+		return widest
+	}
+	return widest
 }

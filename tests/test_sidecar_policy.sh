@@ -40,7 +40,7 @@ grep -Fq 'brotli.NewReader' "$ROOT/content_encoding.go" \
     || fail "bounded Brotli decoding is missing"
 grep -Fq 'transform(context)' "$ROOT/module_runtime.go" \
     || fail "native transform entry point is missing"
-grep -Fq 'compiledRule.hosts.Match' "$ROOT/module_runtime.go" \
+grep -Fq 'compiledRule.hosts.matchCanonical' "$ROOT/module_runtime.go" \
     || fail "native actions do not use the per-snapshot capture-host matcher"
 grep -Fq 'contextObject["network"]' "$ROOT/module_runtime.go" \
     || fail "declared origin permissions do not expose the bounded network capability"

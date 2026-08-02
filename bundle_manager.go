@@ -158,7 +158,7 @@ func (m *bundleManager) Stage(id string, document []byte) (string, error) {
 	}
 	cfg, err := decodeConfig(document)
 	if err != nil {
-		return "", fmt.Errorf("bundle %s is not a valid configuration: %w", id, err)
+		return "", fmt.Errorf("%w: bundle %s: %v", errBundleInvalidDocument, id, err)
 	}
 	sum := sha256.Sum256(document)
 	digest := hex.EncodeToString(sum[:])
@@ -225,7 +225,7 @@ func (m *bundleManager) Commit(id, expectedActive string) (string, error) {
 	// decoded Config per abandoned stage.
 	cfg, err := decodeConfig(rec.Document)
 	if err != nil {
-		return "", fmt.Errorf("bundle %s no longer decodes: %w", id, err)
+		return "", fmt.Errorf("%w: bundle %s no longer decodes: %v", errBundleInvalidDocument, id, err)
 	}
 
 	rec.State = bundleActive

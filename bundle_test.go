@@ -714,3 +714,27 @@ func TestWithdrawingEveryBundleServesNothingRatherThanTheFile(t *testing.T) {
 		t.Fatalf("editing the file after a purge resurrected it: err=%v", err)
 	}
 }
+
+// A document this build cannot accept is terminal, not retryable.
+//
+// A decode failure used to be an unclassified error, so the control API
+// reported "internal"/500 and the gateway's classifier read that as retryable.
+// Repeating a document the sidecar will never accept is a loop, not a recovery,
+// and the message that explains it was already in the body under the wrong
+// category. The realistic producer is the two hand-maintained validators
+// disagreeing about one document inside the same negotiated schema.
+func TestUnacceptableDocumentIsTerminal(t *testing.T) {
+	t.Parallel()
+	store, err := openBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newBundleManager(store, nil)
+	_, err = manager.Stage("b-unacceptable", []byte(`{"version":999}`))
+	if err == nil {
+		t.Fatal("an undecodable document was staged")
+	}
+	if !errors.Is(err, errBundleInvalidDocument) {
+		t.Fatalf("error = %v, want errBundleInvalidDocument so the API reports it as terminal", err)
+	}
+}

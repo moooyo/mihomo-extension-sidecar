@@ -1216,11 +1216,26 @@ func newCompiledHostMatcher(patterns []string) *compiledHostMatcher {
 	return matcher
 }
 
+// Match canonicalises value first. Use it for a host that has not already been
+// through canonicalHost.
 func (m *compiledHostMatcher) Match(value string) bool {
 	if m == nil {
 		return false
 	}
-	host := canonicalHost(value)
+	return m.matchCanonical(canonicalHost(value))
+}
+
+// matchCanonical is Match for a host the caller has already canonicalised.
+//
+// The rule walk canonicalises once and then called Match, which canonicalised
+// again -- once per module and again per rule that passed the phase test. On a
+// module set the size of a real catalogue that is around twenty redundant
+// ToLower/TrimSpace/Contains/TrimSuffix passes over the same string per
+// request, which is the same order as everything else the walk costs.
+func (m *compiledHostMatcher) matchCanonical(host string) bool {
+	if m == nil {
+		return false
+	}
 	if _, exists := m.exact[host]; exists {
 		return true
 	}
@@ -1349,6 +1364,14 @@ func matchingScriptRulesWithStatus(cfg Config, phase string, message scriptMessa
 	if err != nil {
 		return nil
 	}
+	return matchingScriptRulesParsed(cfg, phase, message, matchStatus, parsed)
+}
+
+// matchingScriptRulesParsed is matchingScriptRulesWithStatus for a caller that
+// has already parsed message.URL. Both request paths had, and then this parsed
+// it again.
+func matchingScriptRulesParsed(cfg Config, phase string, message scriptMessage, matchStatus bool, parsed *url.URL) []matchedScriptRule {
+	var err error
 	host := canonicalHost(parsed.Hostname())
 	scheme := strings.ToLower(parsed.Scheme)
 	path := parsed.EscapedPath()
@@ -1368,12 +1391,12 @@ func matchingScriptRulesWithStatus(cfg Config, phase string, message scriptMessa
 	var matched []matchedScriptRule
 	for _, compiledModule := range runtime.modules {
 		module := compiledModule.module
-		if !compiledModule.hosts.Match(host) {
+		if !compiledModule.hosts.matchCanonical(host) {
 			continue
 		}
 		for _, compiledRule := range compiledModule.rules {
 			rule := compiledRule.rule
-			if rule.Phase != phase || !compiledRule.hosts.Match(host) || !containsString(rule.Match.Schemes, scheme) {
+			if rule.Phase != phase || !compiledRule.hosts.matchCanonical(host) || !containsString(rule.Match.Schemes, scheme) {
 				continue
 			}
 			if len(rule.Match.Methods) > 0 && !containsString(rule.Match.Methods, message.Method) {
