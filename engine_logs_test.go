@@ -219,8 +219,13 @@ func TestEngineLogTruncationBoundsInvalidUTF8Processing(t *testing.T) {
 }
 
 type recordingEngineLogPublisher struct {
-	mu     sync.Mutex
-	events []EngineLog
+	mu      sync.Mutex
+	events  []EngineLog
+	dropped atomic.Uint64
+}
+
+func (p *recordingEngineLogPublisher) Dropped() uint64 {
+	return p.dropped.Load()
 }
 
 func (p *recordingEngineLogPublisher) Enabled() bool {
@@ -873,4 +878,57 @@ func readServerWebSocketFrame(reader *bufio.Reader) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	return first & 0x0f, payload, nil
+}
+
+// A producer and the validator disagreeing about a field is not a runtime
+// condition, it is a build mistake -- and it used to be completely silent.
+// bundle_manager published its eight lifecycle messages with Source "bundle",
+// normalizeEngineLog accepts only "script" and "engine", and Publish returns
+// nothing. That file imports no logging package either, so the messages were
+// not falling back to stderr. They went nowhere, and nothing reported it.
+func TestEngineLogHubCountsWhatItRefuses(t *testing.T) {
+	t.Parallel()
+	hub := newEngineLogHub(16)
+	defer hub.Close()
+	subscription, err := hub.Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+
+	hub.Publish(EngineLog{Level: "info", Source: "bundle", Message: "committed"})
+	if hub.Dropped() != 1 {
+		t.Fatalf("dropped = %d, want 1: a refused event has to be countable", hub.Dropped())
+	}
+	hub.Publish(EngineLog{Level: "info", Source: "engine", Message: "committed"})
+	if hub.Dropped() != 1 {
+		t.Fatalf("dropped = %d, want 1: an accepted event must not count", hub.Dropped())
+	}
+}
+
+// The lifecycle messages have to survive the validator now, and the hub stamps
+// the time, so the producer must not.
+func TestBundleLifecycleMessagesReachTheStream(t *testing.T) {
+	t.Parallel()
+	hub := newEngineLogHub(16)
+	defer hub.Close()
+	subscription, err := hub.Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+
+	store, err := openBundleStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newBundleManager(store, hub)
+	manager.publish("info", "bundle b-test committed")
+
+	if hub.Dropped() != 0 {
+		t.Fatalf("a bundle lifecycle message was refused; dropped = %d", hub.Dropped())
+	}
+	if got := manager.Readback("test").DroppedLogs; got != 0 {
+		t.Fatalf("readback reports %d dropped", got)
+	}
 }

@@ -56,6 +56,16 @@ type EngineLog struct {
 type engineLogPublisher interface {
 	Enabled() bool
 	Publish(EngineLog)
+	// Dropped counts events this publisher refused.
+	//
+	// Publish returns nothing, so a producer and the validator disagreeing about
+	// a field is indistinguishable from an idle engine. That is not
+	// hypothetical: bundle_manager's eight lifecycle messages declared a source
+	// the validator does not accept and were discarded, and since that file
+	// imports no logging package they were not going to stderr either. A
+	// non-zero count here is always a build-time mistake, never a runtime
+	// condition.
+	Dropped() uint64
 }
 
 func engineLogPublishingEnabled(publisher engineLogPublisher) bool {
@@ -70,7 +80,11 @@ type engineLogHub struct {
 	now         func() time.Time
 	readers     map[*engineLogSubscription]struct{}
 	subscribers atomic.Int32
+	dropped     atomic.Uint64
 }
+
+// Dropped reports how many events this hub refused.
+func (h *engineLogHub) Dropped() uint64 { return h.dropped.Load() }
 
 type engineLogSubscription struct {
 	hub    *engineLogHub
@@ -112,10 +126,12 @@ func (h *engineLogHub) Publish(event EngineLog) {
 
 	normalized, err := normalizeEngineLog(event, now().UTC())
 	if err != nil {
+		h.dropped.Add(1)
 		return
 	}
 	payload, err := json.Marshal(normalized)
 	if err != nil || len(payload) > maxEngineLogJSONBytes {
+		h.dropped.Add(1)
 		return
 	}
 
